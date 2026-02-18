@@ -6,4 +6,5 @@ urlpatterns = [
     path('api/auth/', include('rest_framework.urls')),
     path('api/contacts/', include('contacts.urls')),
     path('api/accounting/', include('accounting.urls')),
+    path('api/inventory/', include('inventory.urls')),
 ]
