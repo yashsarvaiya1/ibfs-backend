@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+/staticfiles/
+/mediafiles/
+/static/
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# Google Cloud
+gcs-key.json
+*.json
+!package.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Docker
+*.env.local
+
+# Migrations (optional - some teams commit these)
+# */migrations/*.py
+# !*/migrations/__init__.py
+
+# Coverage
+.coverage
+htmlcov/
