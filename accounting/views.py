@@ -1,15 +1,16 @@
 import decimal
 from django.db import transaction as db_transaction
 from django.db.models import F
-from rest_framework import viewsets
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 
 from .models import Document, FinancialTransaction, PaymentAccount
 from .serializers import DocumentSerializer, FinancialTransactionSerializer, PaymentAccountSerializer
 
 
 # ── Document types that auto-create a Record transaction on create ─────────────
-# Sign: Negative = we owe | Positive = they owe us
 RECORD_SIGN = {
     'bill':           decimal.Decimal('-1'),
     'invoice':        decimal.Decimal('1'),
@@ -19,19 +20,18 @@ RECORD_SIGN = {
     'income_voucher': decimal.Decimal('1'),
 }
 
-# ── Stock direction per document type (used by inventory app) ──────────────────
+# ── Stock direction per document type ─────────────────────────────────────────
 STOCK_DIRECTION = {
-    'bill':    decimal.Decimal('1'),   # IN
-    'invoice': decimal.Decimal('-1'),  # OUT
-    'cn':      decimal.Decimal('-1'),  # OUT (return to vendor)
-    'dn':      decimal.Decimal('1'),   # IN  (return from customer)
+    'bill':    decimal.Decimal('1'),
+    'invoice': decimal.Decimal('-1'),
+    'cn':      decimal.Decimal('-1'),
+    'dn':      decimal.Decimal('1'),
 }
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def calculate_document_total(document):
-    """Sum line_item amounts + charges + tax - discount"""
     line_items = document.line_items or []
     charges    = document.charges or []
     taxes      = document.taxes or []
@@ -53,10 +53,6 @@ def calculate_document_total(document):
 
 
 def get_monthly_delta(contact, date, amount, txn_type):
-    """
-    Calculate monthly_cumulative_delta for a new transaction.
-    Only applies to record/payment types (not contra).
-    """
     if not contact or txn_type not in ('record', 'payment'):
         return amount
 
@@ -73,8 +69,9 @@ def get_monthly_delta(contact, date, amount, txn_type):
 
 def recalculate_monthly_deltas(contact, year, month, from_date):
     """
-    After update/delete: recalculate deltas for all subsequent
-    transactions in the same month. Future months are NOT touched.
+    Recalculate monthly_cumulative_delta for all record/payment transactions
+    from from_date onwards within the same month only.
+    Future months are NOT touched — they recalculate independently.
     """
     if not contact:
         return
@@ -113,9 +110,27 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
 
 
 class DocumentViewSet(viewsets.ModelViewSet):
-    queryset = Document.objects.all()
     serializer_class = DocumentSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        # Default: active documents only
+        # Pass ?include_inactive=true to see soft-deleted ones
+        qs = Document.objects.all()
+        if self.request.query_params.get('include_inactive', 'false').lower() != 'true':
+            qs = qs.filter(is_active=True)
+
+        # Optional filter by document_type
+        doc_type = self.request.query_params.get('type')
+        if doc_type:
+            qs = qs.filter(document_type=doc_type)
+
+        # Optional filter by contact
+        contact_id = self.request.query_params.get('contact')
+        if contact_id:
+            qs = qs.filter(contact_id=contact_id)
+
+        return qs
 
     @db_transaction.atomic
     def perform_create(self, serializer):
@@ -125,14 +140,170 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     @db_transaction.atomic
     def perform_update(self, serializer):
-        old_line_items = self.get_object().line_items or []
+        old_doc        = self.get_object()
+        old_line_items = old_doc.line_items or []
+        old_total      = calculate_document_total(old_doc)
+        old_date       = old_doc.document_date
+
         document = serializer.save()
+
+        # Update the linked record transaction if total or date changed
+        self._update_record_transaction(document, old_total, old_date)
+
+        # Handle stock quantity adjustments
         self._handle_stock_update(document, old_line_items)
 
-    # ── Private helpers ──
+    def destroy(self, request, *args, **kwargs):
+        """
+        Soft delete — use delete_with_resolution for documents
+        that have linked transactions and stock entries.
+        Simple soft delete for documents with no linked entries.
+        """
+        document = self.get_object()
+
+        has_payment_txns = document.transactions.filter(
+            transaction_type__in=['payment', 'contra']
+        ).exists()
+        has_stock_txns = document.stock_transactions.exists()
+
+        if has_payment_txns or has_stock_txns:
+            return Response(
+                {
+                    'error': 'This document has linked transactions.',
+                    'detail': 'Use /delete_with_resolution/ to handle linked entries.',
+                    'has_payment_transactions': has_payment_txns,
+                    'has_stock_transactions': has_stock_txns,
+                },
+                status=status.HTTP_409_CONFLICT
+            )
+
+        # No linked payment/stock entries — safe to soft delete directly
+        # Auto-delete the record transaction (no user choice needed)
+        record_txn = document.transactions.filter(transaction_type='record').first()
+        if record_txn:
+            contact  = record_txn.contact
+            date     = record_txn.transaction_date
+            record_txn.delete()
+            recalculate_monthly_deltas(contact, date.year, date.month, date)
+
+        document.is_active = False
+        document.save()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['post'], url_path='delete_with_resolution')
+    @db_transaction.atomic
+    def delete_with_resolution(self, request, pk=None):
+        """
+        Full deletion flow for documents with linked transactions/stock.
+
+        POST /api/accounting/documents/{id}/delete_with_resolution/
+        {
+            "payment_transaction_actions": {
+                "15": "revert",   // delete txn + reverse account balance
+                "16": "keep"      // set document FK to null, keep as orphan
+            },
+            "stock_transaction_actions": {
+                "8": "revert",    // delete stock txn + reverse product stock
+                "9": "keep"       // set document FK to null, keep as orphan
+            }
+        }
+        """
+        document = self.get_object()
+
+        payment_actions = request.data.get('payment_transaction_actions', {})
+        stock_actions   = request.data.get('stock_transaction_actions', {})
+
+        # ── Step 1: Always delete record transactions + recalculate delta ──────
+        record_txns = document.transactions.filter(transaction_type='record')
+        contact     = None
+        earliest_date = None
+
+        for txn in record_txns:
+            if contact is None:
+                contact = txn.contact
+            if earliest_date is None or txn.transaction_date < earliest_date:
+                earliest_date = txn.transaction_date
+            txn.delete()
+
+        # Recalculate monthly delta once after all record txns are deleted
+        if contact and earliest_date:
+            recalculate_monthly_deltas(
+                contact,
+                earliest_date.year,
+                earliest_date.month,
+                earliest_date
+            )
+
+        # ── Step 2: Handle payment/contra transactions ────────────────────────
+        payment_txns = document.transactions.filter(
+            transaction_type__in=['payment', 'contra']
+        )
+
+        payment_contact     = None
+        payment_earliest    = None
+
+        for txn in payment_txns:
+            action_choice = payment_actions.get(str(txn.pk), 'keep')
+
+            if action_choice == 'revert':
+                # Reverse the payment account balance
+                if txn.payment_account and txn.transaction_type in ('payment', 'contra'):
+                    PaymentAccount.objects.filter(pk=txn.payment_account.pk).update(
+                        current_balance=F('current_balance') - txn.amount
+                    )
+
+                # Track earliest date for delta recalculation
+                if txn.contact:
+                    if payment_contact is None:
+                        payment_contact = txn.contact
+                    if payment_earliest is None or txn.transaction_date < payment_earliest:
+                        payment_earliest = txn.transaction_date
+
+                txn.delete()
+
+            else:
+                # Keep — orphan the transaction (unlink from document)
+                txn.document = None
+                txn.save(update_fields=['document'])
+
+        # Recalculate delta once for payment transactions after all are processed
+        if payment_contact and payment_earliest:
+            recalculate_monthly_deltas(
+                payment_contact,
+                payment_earliest.year,
+                payment_earliest.month,
+                payment_earliest
+            )
+
+        # ── Step 3: Handle stock transactions ─────────────────────────────────
+        from inventory.models import StockTransaction, Product
+
+        stock_txns = document.stock_transactions.all()
+
+        for stk in stock_txns:
+            action_choice = stock_actions.get(str(stk.pk), 'keep')
+
+            if action_choice == 'revert':
+                # Reverse product stock by calling model delete()
+                # which handles the stock reversal automatically
+                stk.delete()
+            else:
+                # Keep — orphan the stock transaction
+                stk.document = None
+                stk.save(update_fields=['document'])
+
+        # ── Step 4: Soft delete the document ──────────────────────────────────
+        document.is_active = False
+        document.save()
+
+        return Response(
+            {'status': 'deleted', 'document_id': document.pk},
+            status=status.HTTP_200_OK
+        )
+
+    # ── Private helpers ────────────────────────────────────────────────────────
 
     def _create_record_transaction(self, document):
-        """Auto-create record transaction for financial document types"""
         if document.document_type not in RECORD_SIGN:
             return
         if not document.document_date:
@@ -150,11 +321,42 @@ class DocumentViewSet(viewsets.ModelViewSet):
             monthly_cumulative_delta=delta,
         )
 
+    def _update_record_transaction(self, document, old_total, old_date):
+        """
+        When a document is edited, update the linked record transaction
+        amount and recalculate monthly deltas if amount or date changed.
+        """
+        if document.document_type not in RECORD_SIGN:
+            return
+        if not document.document_date:
+            return
+
+        record_txn = document.transactions.filter(transaction_type='record').first()
+        if not record_txn:
+            # Was missing — create it now
+            self._create_record_transaction(document)
+            return
+
+        new_total  = calculate_document_total(document)
+        new_amount = RECORD_SIGN[document.document_type] * new_total
+
+        if record_txn.amount == new_amount and record_txn.transaction_date == document.document_date:
+            return  # Nothing changed — skip
+
+        record_txn.amount           = new_amount
+        record_txn.transaction_date = document.document_date
+        record_txn.save(update_fields=['amount', 'transaction_date'])
+
+        # Recalculate from the earlier of old/new date
+        recalc_from = min(old_date, document.document_date) if old_date else document.document_date
+        recalculate_monthly_deltas(
+            document.contact,
+            recalc_from.year,
+            recalc_from.month,
+            recalc_from
+        )
+
     def _create_stock_transactions(self, document):
-        """
-        Auto-create StockTransaction for each line_item with a product_id.
-        Skipped silently if inventory app not in use (no product_id in items).
-        """
         if document.document_type not in STOCK_DIRECTION:
             return
         if not document.document_date:
@@ -168,8 +370,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         for item in line_items:
             product_id = item.get('product_id')
             if not product_id:
-                continue                          # No product selected → skip
-
+                continue
             try:
                 product = Product.objects.get(pk=product_id)
             except Product.DoesNotExist:
@@ -184,10 +385,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
             )
 
     def _handle_stock_update(self, document, old_line_items):
-        """
-        On document update: calculate qty diff per product
-        and create adjustment StockTransactions for the difference only.
-        """
         if document.document_type not in STOCK_DIRECTION:
             return
         if not document.document_date:
@@ -226,9 +423,36 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
 
 class FinancialTransactionViewSet(viewsets.ModelViewSet):
-    queryset = FinancialTransaction.objects.all()
     serializer_class = FinancialTransactionSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = FinancialTransaction.objects.all()
+
+        # Filter by contact
+        contact_id = self.request.query_params.get('contact')
+        if contact_id:
+            qs = qs.filter(contact_id=contact_id)
+
+        # Filter by type
+        txn_type = self.request.query_params.get('type')
+        if txn_type:
+            qs = qs.filter(transaction_type=txn_type)
+
+        # Filter by payment account
+        account_id = self.request.query_params.get('account')
+        if account_id:
+            qs = qs.filter(payment_account_id=account_id)
+
+        # Filter by date range
+        date_from = self.request.query_params.get('date_from')
+        date_to   = self.request.query_params.get('date_to')
+        if date_from:
+            qs = qs.filter(transaction_date__gte=date_from)
+        if date_to:
+            qs = qs.filter(transaction_date__lte=date_to)
+
+        return qs
 
     @db_transaction.atomic
     def perform_create(self, serializer):
@@ -242,7 +466,6 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         delta = get_monthly_delta(contact, date, amount, txn_type)
         serializer.save(monthly_cumulative_delta=delta)
 
-        # Update payment account balance for payment/contra
         if account and txn_type in ('payment', 'contra'):
             PaymentAccount.objects.filter(pk=account.pk).update(
                 current_balance=F('current_balance') + amount
@@ -254,10 +477,11 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         old_amount  = old.amount
         old_account = old.payment_account
         old_type    = old.transaction_type
+        old_date    = old.transaction_date
 
         txn = serializer.save()
 
-        # Reverse old account effect → apply new account effect
+        # Reverse old → apply new account balance
         if old_account and old_type in ('payment', 'contra'):
             PaymentAccount.objects.filter(pk=old_account.pk).update(
                 current_balance=F('current_balance') - old_amount
@@ -267,13 +491,14 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 current_balance=F('current_balance') + txn.amount
             )
 
-        # Recalculate monthly delta (same month only, future months untouched)
+        # Recalculate from the earlier of old/new date in same month
         if txn.contact and txn.transaction_type in ('record', 'payment'):
+            recalc_from = min(old_date, txn.transaction_date)
             recalculate_monthly_deltas(
                 txn.contact,
-                txn.transaction_date.year,
-                txn.transaction_date.month,
-                txn.transaction_date,
+                recalc_from.year,
+                recalc_from.month,
+                recalc_from
             )
 
     @db_transaction.atomic
@@ -286,13 +511,11 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
 
         instance.delete()
 
-        # Reverse account balance
         if account and txn_type in ('payment', 'contra'):
             PaymentAccount.objects.filter(pk=account.pk).update(
                 current_balance=F('current_balance') - amount
             )
 
-        # Recalculate monthly delta
         if contact and txn_type in ('record', 'payment'):
             recalculate_monthly_deltas(
                 contact, date.year, date.month, date

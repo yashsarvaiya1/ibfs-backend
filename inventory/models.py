@@ -30,6 +30,7 @@ class Product(models.Model):
         max_length=20, blank=True, null=True,
         help_text='kg, pcs, liters, etc.'
     )
+    is_active = models.BooleanField(default=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -48,7 +49,7 @@ class StockTransaction(models.Model):
     # null=True: allows manual adjustments without a document
     document = models.ForeignKey(
         'accounting.Document',
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='stock_transactions'
     )
