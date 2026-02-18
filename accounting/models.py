@@ -1,3 +1,5 @@
+# accounting/models.py
+
 from django.db import models
 
 
@@ -15,7 +17,6 @@ class PaymentAccount(models.Model):
     upi_id = models.CharField(max_length=100, blank=True, null=True)
 
     # Editable directly by user OR auto-updated via payment/contra transactions
-    # Both methods coexist — no conflict
     current_balance = models.DecimalField(
         max_digits=15, decimal_places=2, default=0
     )
@@ -93,7 +94,7 @@ class Document(models.Model):
     header_image_url = models.URLField(max_length=500, blank=True, null=True)
     signature_image_url = models.URLField(max_length=500, blank=True, null=True)
 
-    # Array of GCS file URLs: ["https://storage.googleapis.com/..."]
+    # Array of GCS file URLs
     attachment_urls = models.JSONField(default=list, blank=True, null=True)
 
     notes = models.TextField(blank=True, null=True)
@@ -119,7 +120,6 @@ class FinancialTransaction(models.Model):
     transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPE_CHOICES)
     transaction_date = models.DateField()
 
-    # DecimalField natively stores + and - values
     # Negative (-) = we owe / paying out
     # Positive (+) = they owe us / receiving money
     amount = models.DecimalField(max_digits=15, decimal_places=2)
@@ -146,11 +146,16 @@ class FinancialTransaction(models.Model):
     notes = models.TextField(blank=True, null=True)
 
     # Running total within the month for this contact
-    # Enables Cash Flow lookup in max 12 DB reads/year
+    # Enables cash flow lookup in max 12 DB reads/year
     # Negative = net payable | Positive = net receivable
     monthly_cumulative_delta = models.DecimalField(
         max_digits=15, decimal_places=2, default=0
     )
+
+    # True when the linked document has been soft-deleted
+    # Shown to user as reference info only — "payment was for Bill #101 (deleted)"
+    # User can re-link to a new document freely anytime
+    is_document_deleted = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

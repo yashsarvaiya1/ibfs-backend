@@ -1,3 +1,5 @@
+# inventory/models.py
+
 from django.db import models
 from django.db import transaction as db_transaction
 
@@ -14,7 +16,6 @@ class Product(models.Model):
     )
 
     # Editable directly by user OR auto-updated via StockTransactions
-    # Both methods coexist — no conflict
     current_stock = models.DecimalField(
         max_digits=15, decimal_places=3, default=0
     )
@@ -43,10 +44,6 @@ class Product(models.Model):
 
 
 class StockTransaction(models.Model):
-
-    # CASCADE: when document deleted → stock transactions deleted too
-    # BUT stock is NOT auto-reversed (user must fix manually)
-    # null=True: allows manual adjustments without a document
     document = models.ForeignKey(
         'accounting.Document',
         on_delete=models.SET_NULL,
@@ -59,8 +56,8 @@ class StockTransaction(models.Model):
         related_name='stock_transactions'
     )
 
-    # Positive (+) = Stock IN  (bill, dn, challan-from-bill)
-    # Negative (-) = Stock OUT (invoice, cn, challan-from-invoice)
+    # Positive (+) = Stock IN  (bill, dn)
+    # Negative (-) = Stock OUT (invoice, cn)
     quantity = models.DecimalField(max_digits=15, decimal_places=3)
 
     transaction_date = models.DateField()
@@ -71,6 +68,11 @@ class StockTransaction(models.Model):
         null=True, blank=True
     )
     notes = models.TextField(blank=True, null=True)
+
+    # True when the linked document has been soft-deleted
+    # Shown to user as reference info only — "stock came from deleted Bill #101"
+    # User can freely re-link to a new document anytime
+    is_document_deleted = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -100,10 +102,8 @@ class StockTransaction(models.Model):
 
     def delete(self, *args, **kwargs):
         with db_transaction.atomic():
-            # Reverse stock on delete
-            # Note: when document is deleted → CASCADE deletes this
-            # BUT current_stock is NOT auto-reversed (by design)
-            # This delete() only runs on MANUAL deletion by user
+            # Reverses stock only on MANUAL deletion
+            # (called by delete_with_resolution when user picks "revert")
             Product.objects.filter(pk=self.product_id).update(
                 current_stock=models.F('current_stock') - self.quantity
             )

@@ -1,3 +1,5 @@
+# accounting/views.py
+
 import decimal
 from django.db import transaction as db_transaction
 from django.db.models import F
@@ -10,7 +12,8 @@ from .models import Document, FinancialTransaction, PaymentAccount
 from .serializers import DocumentSerializer, FinancialTransactionSerializer, PaymentAccountSerializer
 
 
-# ── Document types that auto-create a Record transaction on create ─────────────
+# ── Document types that auto-create a Record transaction ──────────────────────
+# Sign: Negative = we owe | Positive = they owe us
 RECORD_SIGN = {
     'bill':           decimal.Decimal('-1'),
     'invoice':        decimal.Decimal('1'),
@@ -22,16 +25,17 @@ RECORD_SIGN = {
 
 # ── Stock direction per document type ─────────────────────────────────────────
 STOCK_DIRECTION = {
-    'bill':    decimal.Decimal('1'),
-    'invoice': decimal.Decimal('-1'),
-    'cn':      decimal.Decimal('-1'),
-    'dn':      decimal.Decimal('1'),
+    'bill':    decimal.Decimal('1'),   # IN
+    'invoice': decimal.Decimal('-1'),  # OUT
+    'cn':      decimal.Decimal('-1'),  # OUT (return to vendor)
+    'dn':      decimal.Decimal('1'),   # IN  (return from customer)
 }
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def calculate_document_total(document):
+    """Sum line_item amounts + charges + taxes - discount"""
     line_items = document.line_items or []
     charges    = document.charges or []
     taxes      = document.taxes or []
@@ -53,6 +57,7 @@ def calculate_document_total(document):
 
 
 def get_monthly_delta(contact, date, amount, txn_type):
+    """Calculate monthly_cumulative_delta for a new transaction."""
     if not contact or txn_type not in ('record', 'payment'):
         return amount
 
@@ -69,8 +74,8 @@ def get_monthly_delta(contact, date, amount, txn_type):
 
 def recalculate_monthly_deltas(contact, year, month, from_date):
     """
-    Recalculate monthly_cumulative_delta for all record/payment transactions
-    from from_date onwards within the same month only.
+    Recalculate monthly_cumulative_delta for all record/payment
+    transactions from from_date onwards within the same month only.
     Future months are NOT touched — they recalculate independently.
     """
     if not contact:
@@ -114,18 +119,15 @@ class DocumentViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        # Default: active documents only
-        # Pass ?include_inactive=true to see soft-deleted ones
         qs = Document.objects.all()
+
         if self.request.query_params.get('include_inactive', 'false').lower() != 'true':
             qs = qs.filter(is_active=True)
 
-        # Optional filter by document_type
         doc_type = self.request.query_params.get('type')
         if doc_type:
             qs = qs.filter(document_type=doc_type)
 
-        # Optional filter by contact
         contact_id = self.request.query_params.get('contact')
         if contact_id:
             qs = qs.filter(contact_id=contact_id)
@@ -147,75 +149,95 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         document = serializer.save()
 
-        # Update the linked record transaction if total or date changed
         self._update_record_transaction(document, old_total, old_date)
-
-        # Handle stock quantity adjustments
         self._handle_stock_update(document, old_line_items)
 
     def destroy(self, request, *args, **kwargs):
         """
-        Soft delete — use delete_with_resolution for documents
-        that have linked transactions and stock entries.
-        Simple soft delete for documents with no linked entries.
+        Simple destroy for documents with no stock transactions.
+        Documents with stock transactions must use delete_with_resolution.
+        Payment transactions are ALWAYS kept — document FK cleared + flagged.
+        Record transactions are ALWAYS deleted.
         """
         document = self.get_object()
 
-        has_payment_txns = document.transactions.filter(
-            transaction_type__in=['payment', 'contra']
-        ).exists()
         has_stock_txns = document.stock_transactions.exists()
 
-        if has_payment_txns or has_stock_txns:
+        if has_stock_txns:
             return Response(
                 {
-                    'error': 'This document has linked transactions.',
-                    'detail': 'Use /delete_with_resolution/ to handle linked entries.',
-                    'has_payment_transactions': has_payment_txns,
-                    'has_stock_transactions': has_stock_txns,
+                    'error': 'This document has linked stock transactions.',
+                    'detail': 'Use /delete_with_resolution/ to handle stock entries.',
+                    'has_stock_transactions': True,
+                    'stock_transactions': list(
+                        document.stock_transactions.values(
+                            'id', 'product_id', 'quantity',
+                            'transaction_date', 'notes'
+                        )
+                    ),
                 },
                 status=status.HTTP_409_CONFLICT
             )
 
-        # No linked payment/stock entries — safe to soft delete directly
-        # Auto-delete the record transaction (no user choice needed)
-        record_txn = document.transactions.filter(transaction_type='record').first()
-        if record_txn:
-            contact  = record_txn.contact
-            date     = record_txn.transaction_date
-            record_txn.delete()
-            recalculate_monthly_deltas(contact, date.year, date.month, date)
-
-        document.is_active = False
-        document.save()
+        self._delete_document_core(document)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'], url_path='delete_with_resolution')
     @db_transaction.atomic
     def delete_with_resolution(self, request, pk=None):
         """
-        Full deletion flow for documents with linked transactions/stock.
+        Deletion flow for documents with linked stock transactions.
+
+        Payment transactions are ALWAYS kept (document FK cleared + flagged).
+        Record transactions are ALWAYS deleted.
+        Only stock transactions need user resolution.
 
         POST /api/accounting/documents/{id}/delete_with_resolution/
         {
-            "payment_transaction_actions": {
-                "15": "revert",   // delete txn + reverse account balance
-                "16": "keep"      // set document FK to null, keep as orphan
-            },
             "stock_transaction_actions": {
-                "8": "revert",    // delete stock txn + reverse product stock
-                "9": "keep"       // set document FK to null, keep as orphan
+                "8": "revert",   // delete + reverse product stock
+                "9": "keep"      // unlink + flag is_document_deleted=True
             }
         }
         """
-        document = self.get_object()
+        document     = self.get_object()
+        stock_actions = request.data.get('stock_transaction_actions', {})
 
-        payment_actions = request.data.get('payment_transaction_actions', {})
-        stock_actions   = request.data.get('stock_transaction_actions', {})
+        # ── Handle stock transactions (user choice) ────────────────────────
+        from inventory.models import StockTransaction
 
-        # ── Step 1: Always delete record transactions + recalculate delta ──────
-        record_txns = document.transactions.filter(transaction_type='record')
-        contact     = None
+        for stk in document.stock_transactions.all():
+            action_choice = stock_actions.get(str(stk.pk), 'keep')
+
+            if action_choice == 'revert':
+                # model delete() auto-reverses product.current_stock
+                stk.delete()
+            else:
+                # Keep — unlink + flag for user reference
+                stk.document            = None
+                stk.is_document_deleted = True
+                stk.save(update_fields=['document', 'is_document_deleted'])
+
+        # ── Core deletion (record + payment handling + soft delete) ────────
+        self._delete_document_core(document)
+
+        return Response(
+            {'status': 'deleted', 'document_id': document.pk},
+            status=status.HTTP_200_OK
+        )
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _delete_document_core(self, document):
+        """
+        Shared logic for all deletion paths:
+        1. Delete record transactions + recalculate monthly delta
+        2. Keep payment/contra transactions — clear FK + flag is_document_deleted
+        3. Soft delete the document
+        """
+        # ── Step 1: Delete record transactions + recalculate delta ────────
+        record_txns   = list(document.transactions.filter(transaction_type='record'))
+        contact       = None
         earliest_date = None
 
         for txn in record_txns:
@@ -225,7 +247,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 earliest_date = txn.transaction_date
             txn.delete()
 
-        # Recalculate monthly delta once after all record txns are deleted
         if contact and earliest_date:
             recalculate_monthly_deltas(
                 contact,
@@ -234,74 +255,19 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 earliest_date
             )
 
-        # ── Step 2: Handle payment/contra transactions ────────────────────────
-        payment_txns = document.transactions.filter(
+        # ── Step 2: Keep payment/contra — unlink + flag ───────────────────
+        # User sees "this payment was for Bill #101 (deleted)"
+        # User can freely re-link to any new document anytime
+        document.transactions.filter(
             transaction_type__in=['payment', 'contra']
+        ).update(
+            document=None,
+            is_document_deleted=True
         )
 
-        payment_contact     = None
-        payment_earliest    = None
-
-        for txn in payment_txns:
-            action_choice = payment_actions.get(str(txn.pk), 'keep')
-
-            if action_choice == 'revert':
-                # Reverse the payment account balance
-                if txn.payment_account and txn.transaction_type in ('payment', 'contra'):
-                    PaymentAccount.objects.filter(pk=txn.payment_account.pk).update(
-                        current_balance=F('current_balance') - txn.amount
-                    )
-
-                # Track earliest date for delta recalculation
-                if txn.contact:
-                    if payment_contact is None:
-                        payment_contact = txn.contact
-                    if payment_earliest is None or txn.transaction_date < payment_earliest:
-                        payment_earliest = txn.transaction_date
-
-                txn.delete()
-
-            else:
-                # Keep — orphan the transaction (unlink from document)
-                txn.document = None
-                txn.save(update_fields=['document'])
-
-        # Recalculate delta once for payment transactions after all are processed
-        if payment_contact and payment_earliest:
-            recalculate_monthly_deltas(
-                payment_contact,
-                payment_earliest.year,
-                payment_earliest.month,
-                payment_earliest
-            )
-
-        # ── Step 3: Handle stock transactions ─────────────────────────────────
-        from inventory.models import StockTransaction, Product
-
-        stock_txns = document.stock_transactions.all()
-
-        for stk in stock_txns:
-            action_choice = stock_actions.get(str(stk.pk), 'keep')
-
-            if action_choice == 'revert':
-                # Reverse product stock by calling model delete()
-                # which handles the stock reversal automatically
-                stk.delete()
-            else:
-                # Keep — orphan the stock transaction
-                stk.document = None
-                stk.save(update_fields=['document'])
-
-        # ── Step 4: Soft delete the document ──────────────────────────────────
+        # ── Step 3: Soft delete ────────────────────────────────────────────
         document.is_active = False
         document.save()
-
-        return Response(
-            {'status': 'deleted', 'document_id': document.pk},
-            status=status.HTTP_200_OK
-        )
-
-    # ── Private helpers ────────────────────────────────────────────────────────
 
     def _create_record_transaction(self, document):
         if document.document_type not in RECORD_SIGN:
@@ -322,10 +288,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         )
 
     def _update_record_transaction(self, document, old_total, old_date):
-        """
-        When a document is edited, update the linked record transaction
-        amount and recalculate monthly deltas if amount or date changed.
-        """
+        """Update linked record transaction when document is edited."""
         if document.document_type not in RECORD_SIGN:
             return
         if not document.document_date:
@@ -333,7 +296,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         record_txn = document.transactions.filter(transaction_type='record').first()
         if not record_txn:
-            # Was missing — create it now
             self._create_record_transaction(document)
             return
 
@@ -341,13 +303,12 @@ class DocumentViewSet(viewsets.ModelViewSet):
         new_amount = RECORD_SIGN[document.document_type] * new_total
 
         if record_txn.amount == new_amount and record_txn.transaction_date == document.document_date:
-            return  # Nothing changed — skip
+            return  # Nothing changed
 
         record_txn.amount           = new_amount
         record_txn.transaction_date = document.document_date
         record_txn.save(update_fields=['amount', 'transaction_date'])
 
-        # Recalculate from the earlier of old/new date
         recalc_from = min(old_date, document.document_date) if old_date else document.document_date
         recalculate_monthly_deltas(
             document.contact,
@@ -407,7 +368,10 @@ class DocumentViewSet(viewsets.ModelViewSet):
         from inventory.models import Product, StockTransaction
 
         for pid in all_pids:
-            diff = (new_map.get(pid, decimal.Decimal('0')) - old_map.get(pid, decimal.Decimal('0'))) * direction
+            diff = (
+                new_map.get(pid, decimal.Decimal('0')) -
+                old_map.get(pid, decimal.Decimal('0'))
+            ) * direction
             if diff == 0:
                 continue
             try:
@@ -429,22 +393,18 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = FinancialTransaction.objects.all()
 
-        # Filter by contact
         contact_id = self.request.query_params.get('contact')
         if contact_id:
             qs = qs.filter(contact_id=contact_id)
 
-        # Filter by type
         txn_type = self.request.query_params.get('type')
         if txn_type:
             qs = qs.filter(transaction_type=txn_type)
 
-        # Filter by payment account
         account_id = self.request.query_params.get('account')
         if account_id:
             qs = qs.filter(payment_account_id=account_id)
 
-        # Filter by date range
         date_from = self.request.query_params.get('date_from')
         date_to   = self.request.query_params.get('date_to')
         if date_from:
@@ -481,7 +441,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
 
         txn = serializer.save()
 
-        # Reverse old → apply new account balance
+        # Reverse old balance → apply new balance
         if old_account and old_type in ('payment', 'contra'):
             PaymentAccount.objects.filter(pk=old_account.pk).update(
                 current_balance=F('current_balance') - old_amount
@@ -491,7 +451,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 current_balance=F('current_balance') + txn.amount
             )
 
-        # Recalculate from the earlier of old/new date in same month
+        # Recalculate from the earlier of old/new date within same month
         if txn.contact and txn.transaction_type in ('record', 'payment'):
             recalc_from = min(old_date, txn.transaction_date)
             recalculate_monthly_deltas(
