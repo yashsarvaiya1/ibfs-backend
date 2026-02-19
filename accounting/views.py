@@ -1,5 +1,3 @@
-# accounting/views.py
-
 import decimal
 from django.db import transaction as db_transaction
 from django.db.models import F
@@ -112,11 +110,13 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
     queryset = PaymentAccount.objects.all()
     serializer_class = PaymentAccountSerializer
     permission_classes = [IsAuthenticated]
+    search_fields = ['name', 'account_number', 'upi_id']
 
 
 class DocumentViewSet(viewsets.ModelViewSet):
     serializer_class = DocumentSerializer
     permission_classes = [IsAuthenticated]
+    search_fields = ['document_number', 'notes', 'contact__company_name', 'contact__contact_name']
 
     def get_queryset(self):
         qs = Document.objects.all()
@@ -200,10 +200,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
             }
         }
         """
-        document     = self.get_object()
+        document      = self.get_object()
         stock_actions = request.data.get('stock_transaction_actions', {})
 
-        # ── Handle stock transactions (user choice) ────────────────────────
         from inventory.models import StockTransaction
 
         for stk in document.stock_transactions.all():
@@ -218,7 +217,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 stk.is_document_deleted = True
                 stk.save(update_fields=['document', 'is_document_deleted'])
 
-        # ── Core deletion (record + payment handling + soft delete) ────────
         self._delete_document_core(document)
 
         return Response(
@@ -235,7 +233,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
         2. Keep payment/contra transactions — clear FK + flag is_document_deleted
         3. Soft delete the document
         """
-        # ── Step 1: Delete record transactions + recalculate delta ────────
         record_txns   = list(document.transactions.filter(transaction_type='record'))
         contact       = None
         earliest_date = None
@@ -255,7 +252,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 earliest_date
             )
 
-        # ── Step 2: Keep payment/contra — unlink + flag ───────────────────
         # User sees "this payment was for Bill #101 (deleted)"
         # User can freely re-link to any new document anytime
         document.transactions.filter(
@@ -265,9 +261,24 @@ class DocumentViewSet(viewsets.ModelViewSet):
             is_document_deleted=True
         )
 
-        # ── Step 3: Soft delete ────────────────────────────────────────────
         document.is_active = False
         document.save()
+
+    def _get_challan_direction(self, document):
+        """
+        Returns stock direction for Challan based on reference document type.
+        Bill reference  → +1 (IN)
+        Invoice reference → -1 (OUT)
+        No reference or unrecognized type → None (no auto stock)
+        """
+        if not document.reference:
+            return None
+        ref_type = document.reference.document_type
+        if ref_type == 'bill':
+            return decimal.Decimal('1')
+        if ref_type == 'invoice':
+            return decimal.Decimal('-1')
+        return None
 
     def _create_record_transaction(self, document):
         if document.document_type not in RECORD_SIGN:
@@ -309,24 +320,55 @@ class DocumentViewSet(viewsets.ModelViewSet):
         record_txn.transaction_date = document.document_date
         record_txn.save(update_fields=['amount', 'transaction_date'])
 
-        recalc_from = min(old_date, document.document_date) if old_date else document.document_date
-        recalculate_monthly_deltas(
-            document.contact,
-            recalc_from.year,
-            recalc_from.month,
-            recalc_from
-        )
+        # ── FIX: cross-month date change requires both months recalculated ─
+        if old_date:
+            old_month = (old_date.year, old_date.month)
+            new_month = (document.document_date.year, document.document_date.month)
+
+            if old_month != new_month:
+                # Transaction moved to a different month — recalculate BOTH
+                recalculate_monthly_deltas(
+                    document.contact, old_date.year, old_date.month, old_date
+                )
+                recalculate_monthly_deltas(
+                    document.contact,
+                    document.document_date.year,
+                    document.document_date.month,
+                    document.document_date
+                )
+            else:
+                # Same month — recalculate from the earlier of the two dates
+                recalc_from = min(old_date, document.document_date)
+                recalculate_monthly_deltas(
+                    document.contact,
+                    recalc_from.year,
+                    recalc_from.month,
+                    recalc_from
+                )
+        else:
+            recalculate_monthly_deltas(
+                document.contact,
+                document.document_date.year,
+                document.document_date.month,
+                document.document_date
+            )
 
     def _create_stock_transactions(self, document):
-        if document.document_type not in STOCK_DIRECTION:
-            return
         if not document.document_date:
             return
 
-        direction  = STOCK_DIRECTION[document.document_type]
-        line_items = document.line_items or []
+        # ── FIX: Challan direction comes from reference, not STOCK_DIRECTION ─
+        if document.document_type == 'challan':
+            direction = self._get_challan_direction(document)
+            if direction is None:
+                return  # No reference = no auto stock (frontend handles manual)
+        elif document.document_type in STOCK_DIRECTION:
+            direction = STOCK_DIRECTION[document.document_type]
+        else:
+            return
 
         from inventory.models import Product, StockTransaction
+        line_items = document.line_items or []
 
         for item in line_items:
             product_id = item.get('product_id')
@@ -346,12 +388,18 @@ class DocumentViewSet(viewsets.ModelViewSet):
             )
 
     def _handle_stock_update(self, document, old_line_items):
-        if document.document_type not in STOCK_DIRECTION:
-            return
         if not document.document_date:
             return
 
-        direction = STOCK_DIRECTION[document.document_type]
+        # ── FIX: Challan direction comes from reference, not STOCK_DIRECTION ─
+        if document.document_type == 'challan':
+            direction = self._get_challan_direction(document)
+            if direction is None:
+                return
+        elif document.document_type in STOCK_DIRECTION:
+            direction = STOCK_DIRECTION[document.document_type]
+        else:
+            return
 
         def build_map(items):
             qty_map = {}
@@ -389,6 +437,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
 class FinancialTransactionViewSet(viewsets.ModelViewSet):
     serializer_class = FinancialTransactionSerializer
     permission_classes = [IsAuthenticated]
+    search_fields = ['notes', 'contact__company_name', 'contact__contact_name']
 
     def get_queryset(self):
         qs = FinancialTransaction.objects.all()
@@ -451,15 +500,28 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 current_balance=F('current_balance') + txn.amount
             )
 
-        # Recalculate from the earlier of old/new date within same month
+        # ── FIX: cross-month date change requires both months recalculated ─
         if txn.contact and txn.transaction_type in ('record', 'payment'):
-            recalc_from = min(old_date, txn.transaction_date)
-            recalculate_monthly_deltas(
-                txn.contact,
-                recalc_from.year,
-                recalc_from.month,
-                recalc_from
-            )
+            old_month = (old_date.year, old_date.month)
+            new_month = (txn.transaction_date.year, txn.transaction_date.month)
+
+            if old_month != new_month:
+                # Transaction moved to a different month — recalculate BOTH
+                recalculate_monthly_deltas(
+                    txn.contact, old_date.year, old_date.month, old_date
+                )
+                recalculate_monthly_deltas(
+                    txn.contact,
+                    txn.transaction_date.year,
+                    txn.transaction_date.month,
+                    txn.transaction_date
+                )
+            else:
+                # Same month — recalculate from the earlier of the two dates
+                recalc_from = min(old_date, txn.transaction_date)
+                recalculate_monthly_deltas(
+                    txn.contact, recalc_from.year, recalc_from.month, recalc_from
+                )
 
     @db_transaction.atomic
     def perform_destroy(self, instance):

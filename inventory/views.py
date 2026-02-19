@@ -1,6 +1,7 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework import status
 from .models import Product, StockTransaction
 from .serializers import ProductSerializer, StockTransactionSerializer
 
@@ -8,6 +9,7 @@ from .serializers import ProductSerializer, StockTransactionSerializer
 class ProductViewSet(viewsets.ModelViewSet):
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
+    search_fields = ['name', 'hsn_code', 'description']
 
     def get_queryset(self):
         # Default: only active products
@@ -26,7 +28,20 @@ class ProductViewSet(viewsets.ModelViewSet):
 
 
 class StockTransactionViewSet(viewsets.ModelViewSet):
-    queryset = StockTransaction.objects.all()
     serializer_class = StockTransactionSerializer
     permission_classes = [IsAuthenticated]
+    search_fields = ['product__name', 'notes']
     # Stock updates handled entirely by model's save() and delete()
+
+    def get_queryset(self):
+        qs = StockTransaction.objects.all()
+
+        product_id = self.request.query_params.get('product')
+        if product_id:
+            qs = qs.filter(product_id=product_id)
+
+        document_id = self.request.query_params.get('document')
+        if document_id:
+            qs = qs.filter(document_id=document_id)
+
+        return qs

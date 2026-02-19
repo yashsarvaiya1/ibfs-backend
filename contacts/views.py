@@ -9,6 +9,7 @@ from .serializers import ContactSerializer
 class ContactViewSet(viewsets.ModelViewSet):
     serializer_class = ContactSerializer
     permission_classes = [IsAuthenticated]
+    search_fields = ['company_name', 'contact_name', 'phone', 'gstin']
 
     def get_queryset(self):
         # Default: only active contacts
