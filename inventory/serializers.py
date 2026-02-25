@@ -1,5 +1,12 @@
+# inventory/serializers.py
 from rest_framework import serializers
 from .models import Product, StockTransaction
+
+
+class StockTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StockTransaction
+        fields = '__all__'
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -8,7 +15,7 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
-class StockTransactionSerializer(serializers.ModelSerializer):
+class ProductListSerializer(serializers.ModelSerializer):
     class Meta:
-        model = StockTransaction
-        fields = '__all__'
+        model = Product
+        fields = ['id', 'name', 'rate', 'current_stock', 'min_stock', 'unit', 'is_active']
