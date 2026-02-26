@@ -7,7 +7,7 @@ from .models import Document, FinancialTransaction
 from shared.models import PaymentAccount, Settings
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _parse_date(val):
     if not val:
@@ -25,19 +25,15 @@ def _next_doc_id(doc_type):
         'interest': 'INT', 'expense': 'EXP',
     }
     prefix = prefix_map.get(doc_type, 'DOC')
-    count = Document.objects.filter(type=doc_type).count() + 1
+    count  = Document.objects.filter(type=doc_type).count() + 1
     return f"{prefix}-{count:04d}"
 
 
 def _recalculate_mcd(contact, date):
     """
-    Recalculate MCD for all txns in same month/year for contact.
-
-    RULES:
-    - Expense txns (document__type='expense') always keep MCD = 0 — they
-      don't affect contact CF. We include them in the loop but don't add
-      their amount to the running total, and force their MCD back to 0.
-    - All other txn types contribute normally to the running total.
+    Recalculates MCD for all txns in the same month/year for a contact.
+    Expense txns always keep MCD = 0 — they never affect contact CF.
+    Contra txns have no contact so they never reach here.
     """
     if not contact:
         return
@@ -50,11 +46,8 @@ def _recalculate_mcd(contact, date):
 
     running = Decimal('0')
     for t in txns:
-        is_expense = (
-            t.document is not None and t.document.type == 'expense'
-        )
+        is_expense = t.document is not None and t.document.type == 'expense'
         if is_expense:
-            # Expense never contributes to CF — force MCD = 0
             if t.monthly_cumulative_delta != Decimal('0'):
                 t.monthly_cumulative_delta = Decimal('0')
                 t.save(update_fields=['monthly_cumulative_delta'])
@@ -68,7 +61,7 @@ def _recalculate_mcd(contact, date):
 def _create_ftxn(
     type, amount, contact=None, account=None,
     document=None, date=None, notes=None,
-    force_mcd_zero=False   # ← used for expense txns
+    force_mcd_zero=False,
 ):
     date = _parse_date(date)
     ftxn = FinancialTransaction.objects.create(
@@ -82,14 +75,12 @@ def _create_ftxn(
         monthly_cumulative_delta=Decimal('0'),
     )
     if force_mcd_zero:
-        # Expense: don't recalculate — MCD stays 0 permanently
-        # Still update account balance
+        # Expense: MCD stays 0, still update account balance
         if account:
             account.current_balance += amount
             account.save(update_fields=['current_balance'])
         return ftxn
 
-    # Normal txn: recalculate MCD for the whole month
     _recalculate_mcd(contact, date)
     if account:
         account.current_balance += amount
@@ -115,146 +106,170 @@ def _create_stxn(type, quantity, product, document=None, date=None, rate=None, n
     return stxn
 
 
-# ─── Document Create ──────────────────────────────────────────────────────────
+def _resolve_total(data):
+    """Compute total_amount from line_items + charges - discount + taxes if not provided."""
+    line_items = data.get('line_items', [])
+    subtotal   = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
+    charges    = sum(Decimal(str(c.get('amount', 0))) for c in data.get('charges', []))
+    discount   = Decimal(str(data.get('discount', 0)))
+    tax_amount = Decimal('0')
+    for tax in data.get('taxes', []):
+        tax_amount += (subtotal + charges - discount) * Decimal(str(tax['percentage'])) / 100
+    return subtotal + charges - discount + tax_amount
+
+
+# ─── Document Signs ────────────────────────────────────────────────────────────
+
+# f.txn record sign per doc type
+FTXN_RECORD_SIGN = {
+    'bill': Decimal('1'), 'invoice': Decimal('-1'),
+    'cn':   Decimal('1'), 'dn':      Decimal('-1'),
+}
+
+# s.txn sign per doc type (challan derives from reference, handled separately)
+STXN_SIGN = {
+    'bill': Decimal('1'), 'invoice': Decimal('-1'),
+    'cn':   Decimal('1'), 'dn':      Decimal('-1'),
+}
+
+# Challan s.txn sign derives from its referenced document type
+CHALLAN_STXN_SIGN = {
+    'bill': Decimal('1'), 'invoice': Decimal('-1'),
+    'cn':   Decimal('1'), 'dn':      Decimal('-1'),
+}
+
+# These doc types generate ZERO f.txns and ZERO s.txns
+NO_TXN_TYPES = {'po', 'pi', 'quotation'}
+
+
+# ─── Document Create ───────────────────────────────────────────────────────────
 
 @transaction.atomic
 def process_document_create(doc_type, data, contact=None):
-    settings = Settings.get()
-    date = _parse_date(data.get('date'))
-    line_items = data.get('line_items', [])
+    settings    = Settings.get()
+    date        = _parse_date(data.get('date'))
+    line_items  = data.get('line_items', [])
     total_amount = data.get('total_amount')
 
     if not total_amount and line_items:
-        subtotal = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
-        charges  = sum(Decimal(str(c.get('amount', 0))) for c in data.get('charges', []))
-        discount = Decimal(str(data.get('discount', 0)))
-        tax_amount = Decimal('0')
-        for tax in data.get('taxes', []):
-            tax_amount += (subtotal + charges - discount) * Decimal(str(tax['percentage'])) / 100
-        total_amount = subtotal + charges - discount + tax_amount
+        total_amount = _resolve_total(data)
 
     doc = Document.objects.create(
-        type=doc_type,
-        doc_id=data.get('doc_id') or _next_doc_id(doc_type),
-        contact=contact,
-        consignee_id=data.get('consignee'),
-        reference_id=data.get('reference'),
-        line_items=line_items,
-        total_amount=total_amount,
-        discount=data.get('discount', 0),
-        charges=data.get('charges', []),
-        taxes=data.get('taxes', []),
-        date=date,
-        due_date=_parse_date(data.get('due_date')) if data.get('due_date') else None,
-        payment_terms=data.get('payment_terms'),
-        attachment_urls=data.get('attachment_urls', []),
-        notes=data.get('notes'),
+        type            = doc_type,
+        doc_id          = data.get('doc_id') or _next_doc_id(doc_type),
+        contact         = contact,
+        consignee_id    = data.get('consignee'),
+        reference_id    = data.get('reference'),
+        line_items      = line_items,
+        total_amount    = total_amount,
+        discount        = data.get('discount', 0),
+        charges         = data.get('charges', []),
+        taxes           = data.get('taxes', []),
+        date            = date,
+        due_date        = _parse_date(data.get('due_date')) if data.get('due_date') else None,
+        payment_terms   = data.get('payment_terms'),
+        attachment_urls = data.get('attachment_urls', []),
+        notes           = data.get('notes'),
     )
 
-    ftxn_signs = {
-        'bill':    Decimal('1'),  'invoice': Decimal('-1'),
-        'cn':      Decimal('1'),  'dn':      Decimal('-1'),
-    }
-    stxn_signs = {
-        'bill':    Decimal('1'),  'invoice': Decimal('-1'),
-        'cn':      Decimal('1'),  'dn':      Decimal('-1'),
-    }
+    # ── No txns for PO / PI / Quotation ───────────────────────────────────────
+    if doc_type in NO_TXN_TYPES:
+        return doc
 
-    if doc_type in ftxn_signs and total_amount:
-        ftxn_sign     = ftxn_signs[doc_type]
-        record_amount = ftxn_sign * Decimal(str(total_amount))
+    # ── Challan — s.txn only, sign from reference doc ─────────────────────────
+    if doc_type == 'challan':
+        ref = doc.reference
+        if ref and ref.type in CHALLAN_STXN_SIGN:
+            sign = CHALLAN_STXN_SIGN[ref.type]
+            _handle_stxns(doc, line_items, sign, settings, date)
+        return doc
+
+    # ── Financial txns for bill / invoice / cn / dn ───────────────────────────
+    if doc_type in FTXN_RECORD_SIGN and total_amount:
+        record_amount = FTXN_RECORD_SIGN[doc_type] * Decimal(str(total_amount))
         account_id    = data.get('payment_account')
         account       = PaymentAccount.objects.get(pk=account_id) if account_id else None
 
         if settings.auto_transaction:
-            # ✅ ALWAYS create record first — preserves MCD history per spec
-            # "silently creates record f.txn AND immediately creates actual"
+            # Always create record first (preserves MCD history), then actual
             _create_ftxn('record', record_amount, contact, None, doc, date)
             if account:
-                # Actual is opposite sign of record — they cancel out → CF net 0
-                actual_amount = -record_amount
-                _create_ftxn('actual', actual_amount, contact, account, doc, date)
-            # If no account → only record exists, CF changes (user pays later)
+                _create_ftxn('actual', -record_amount, contact, account, doc, date)
         else:
-            # Auto OFF → record only, user pays later manually
             _create_ftxn('record', record_amount, contact, None, doc, date)
 
-    if doc_type in stxn_signs and not settings.enable_challan:
-        stxn_sign = stxn_signs[doc_type]
-        from inventory.models import Product
-        for item in line_items:
-            pid = item.get('product_id')
-            if not pid:
-                continue
-            try:
-                product = Product.objects.get(pk=pid)
-            except Product.DoesNotExist:
-                continue
-            qty  = stxn_sign * Decimal(str(item.get('quantity', 0)))
-            rate = item.get('rate')
-            if settings.auto_stock:
-                _create_stxn('actual', qty, product, doc, date, rate)
-            else:
-                _create_stxn('record', qty, product, doc, date, rate)
+    # ── Stock txns — skipped entirely if challan is enabled ───────────────────
+    if doc_type in STXN_SIGN and not settings.enable_challan:
+        sign = STXN_SIGN[doc_type]
+        _handle_stxns(doc, line_items, sign, settings, date)
 
     return doc
 
 
-# ─── Send / Receive ───────────────────────────────────────────────────────────
+def _handle_stxns(doc, line_items, sign, settings, date):
+    """Creates record or actual s.txns for all line_items with a product_id."""
+    from inventory.models import Product
+    for item in line_items:
+        pid = item.get('product_id')
+        if not pid:
+            continue
+        try:
+            product = Product.objects.get(pk=pid)
+        except Product.DoesNotExist:
+            continue
+        qty      = sign * Decimal(str(item.get('quantity', 0)))
+        txn_type = 'actual' if settings.auto_stock else 'record'
+        _create_stxn(txn_type, qty, product, doc, date, item.get('rate'))
+
+
+# ─── Send / Receive ────────────────────────────────────────────────────────────
 
 @transaction.atomic
 def process_send_receive(contact, data, direction):
-    settings       = Settings.get()
-    amount_raw     = Decimal(str(data['amount']))
-    actual_amount  = amount_raw if direction == 'receive' else -amount_raw
-    account_id     = data.get('payment_account')
-    account        = PaymentAccount.objects.get(pk=account_id) if account_id else None
-    date           = _parse_date(data.get('date'))
-    doc_ref_id     = data.get('document')
-    doc_ref        = Document.objects.get(pk=doc_ref_id) if doc_ref_id else None
-    is_expense     = data.get('is_expense', False)
+    settings      = Settings.get()
+    amount_raw    = Decimal(str(data['amount']))
+    actual_amount = amount_raw if direction == 'receive' else -amount_raw
+    account_id    = data.get('payment_account')
+    account       = PaymentAccount.objects.get(pk=account_id) if account_id else None
+    date          = _parse_date(data.get('date'))
+    doc_ref_id    = data.get('document')
+    doc_ref       = Document.objects.get(pk=doc_ref_id) if doc_ref_id else None
+    is_expense    = data.get('is_expense', False)
     interest_lines = data.get('interest_lines', [])
+    result        = {}
 
-    result = {}
-
-    # ── Expense ───────────────────────────────────────────────────────────────
+    # ── Expense ────────────────────────────────────────────────────────────────
     if is_expense:
-        line_items  = data.get('line_items', [])
         expense_doc = Document.objects.create(
-            type='expense',
-            doc_id=_next_doc_id('expense'),
-            contact=contact,
-            line_items=line_items,
-            total_amount=abs(actual_amount),
-            date=date,
+            type         = 'expense',
+            doc_id       = _next_doc_id('expense'),
+            contact      = contact,
+            line_items   = data.get('line_items', []),
+            total_amount = abs(actual_amount),
+            date         = date,
         )
         ftxn = _create_ftxn(
             'actual', actual_amount, contact, account,
-            expense_doc, date,
-            force_mcd_zero=True
+            expense_doc, date, force_mcd_zero=True,
         )
         result['expense_doc'] = expense_doc.pk
         result['ftxn']        = ftxn.pk
         return result
 
-    # ── Cash voucher doc (created first — no f.txn yet) ───────────────────────
+    # ── Cash Voucher doc created first ─────────────────────────────────────────
     voucher_doc = None
     if settings.enable_vouchers and account and account.type == 'cash':
         v_type      = 'cash_payment_voucher' if direction == 'send' else 'cash_receipt_voucher'
         voucher_doc = Document.objects.create(
-            type=v_type,
-            doc_id=_next_doc_id(v_type),
-            contact=contact,
-            line_items=data.get('line_items', []),
-            total_amount=abs(actual_amount),
-            date=date,
+            type         = v_type,
+            doc_id       = _next_doc_id(v_type),
+            contact      = contact,
+            line_items   = data.get('line_items', []),
+            total_amount = abs(actual_amount),
+            date         = date,
         )
 
-    # ── ✅ Interest record FIRST ───────────────────────────────────────────────
-    # Must be created before actual so created_at order is:
-    # 1. interest_doc  (Document)
-    # 2. interest_ftxn (record)   ← lowest created_at → appears before actual in ledger
-    # 3. main_ftxn     (actual)   ← highest created_at
+    # ── Interest record FIRST (lower created_at → appears before actual in ledger)
     if interest_lines:
         net = sum(
             Decimal(str(l['amount'])) if l.get('type') == 'charge'
@@ -265,100 +280,111 @@ def process_send_receive(contact, data, direction):
             Decimal('-1') if direction == 'receive' else Decimal('1')
         )
         interest_doc = Document.objects.create(
-            type='interest',
-            doc_id=_next_doc_id('interest'),
-            contact=contact,
-            line_items=interest_lines,
-            total_amount=abs(net),
-            date=date,
-            reference=doc_ref,
+            type         = 'interest',
+            doc_id       = _next_doc_id('interest'),
+            contact      = contact,
+            line_items   = interest_lines,
+            total_amount = abs(net),
+            date         = date,
+            reference    = doc_ref,
         )
         interest_ftxn = _create_ftxn(
-            'record', interest_record_amount, contact, None, interest_doc, date
+            'record', interest_record_amount, contact, None, interest_doc, date,
         )
         result['interest_doc']  = interest_doc.pk
         result['interest_ftxn'] = interest_ftxn.pk
 
-    # ── ✅ Main actual SECOND ─────────────────────────────────────────────────
+    # ── Main actual SECOND ─────────────────────────────────────────────────────
     main_ftxn      = _create_ftxn(
         'actual', actual_amount, contact, account,
-        voucher_doc or doc_ref, date, data.get('notes')
+        voucher_doc or doc_ref, date, data.get('notes'),
     )
     result['ftxn'] = main_ftxn.pk
-
     return result
 
-# ─── Transfer ────────────────────────────────────────────────────────────────
+
+# ─── Transfer ──────────────────────────────────────────────────────────────────
 
 @transaction.atomic
 def process_transfer(data):
-    from_id  = data['from_account']
-    to_id    = data['to_account']
     amount   = Decimal(str(data['amount']))
     date     = _parse_date(data.get('date'))
-    from_acc = PaymentAccount.objects.get(pk=from_id)
-    to_acc   = PaymentAccount.objects.get(pk=to_id)
+    from_acc = PaymentAccount.objects.get(pk=data['from_account'])
+    to_acc   = PaymentAccount.objects.get(pk=data['to_account'])
     _create_ftxn('contra', -amount, None, from_acc, None, date)
     _create_ftxn('contra',  amount, None, to_acc,   None, date)
-    return {'from': from_id, 'to': to_id, 'amount': str(amount)}
+    return {'from': data['from_account'], 'to': data['to_account'], 'amount': str(amount)}
 
 
-# ─── Adjust Balance ───────────────────────────────────────────────────────────
+# ─── Adjust Balance ────────────────────────────────────────────────────────────
 
 @transaction.atomic
 def process_adjust_balance(account, data):
     amount = Decimal(str(data['amount']))
     date   = _parse_date(data.get('date'))
-    notes  = data.get('notes')
-    ftxn   = _create_ftxn('actual', amount, None, account, None, date, notes)
+    ftxn   = _create_ftxn('actual', amount, None, account, None, date, data.get('notes'))
     return {'ftxn': ftxn.pk, 'new_balance': str(account.current_balance)}
 
 
-# ─── Move Stock ───────────────────────────────────────────────────────────────
+# ─── Move Stock ────────────────────────────────────────────────────────────────
 
 @transaction.atomic
 def process_move_stock(document, data):
-    from inventory.models import Product, StockTransaction
-    date     = _parse_date(data.get('date'))
-    items    = data.get('items', [])
-    sign_map = {
-        'bill': 1, 'challan_bill': 1, 'invoice': -1,
-        'challan_invoice': -1, 'cn': 1, 'dn': -1,
-    }
-    doc_sign = Decimal(str(sign_map.get(document.type, 1)))
+    """
+    Moves stock for a document. Sign is derived from document type.
+    For challan: sign comes from its reference doc type.
+    Overshoot protection: actual can never exceed record for same doc+product.
+    """
+    from inventory.models import StockTransaction
+
+    date  = _parse_date(data.get('date'))
+    items = data.get('items', [])
+
+    # Derive sign
+    if document.type == 'challan' and document.reference:
+        sign = CHALLAN_STXN_SIGN.get(document.reference.type, Decimal('1'))
+    else:
+        sign = STXN_SIGN.get(document.type, Decimal('1'))
 
     created = []
     for item in items:
+        from inventory.models import Product
         pid           = item['product_id']
         requested_qty = Decimal(str(item['quantity']))
         product       = Product.objects.get(pk=pid)
 
-        record_qty = sum(
-            abs(t.quantity) for t in StockTransaction.objects.filter(
+        record_qty = abs(sum(
+            t.quantity for t in StockTransaction.objects.filter(
                 document=document, product=product, type='record'
             )
-        )
-        actual_qty = sum(
-            abs(t.quantity) for t in StockTransaction.objects.filter(
+        ))
+        actual_qty = abs(sum(
+            t.quantity for t in StockTransaction.objects.filter(
                 document=document, product=product, type='actual'
             )
-        )
+        ))
         remaining   = record_qty - actual_qty
         qty_to_move = min(requested_qty, remaining)
         if qty_to_move <= 0:
             continue
-        stxn = _create_stxn('actual', doc_sign * qty_to_move, product, document, date)
-        created.append({'product': pid, 'quantity': str(qty_to_move), 'stxn': stxn.pk})
+
+        stxn = _create_stxn('actual', sign * qty_to_move, product, document, date)
+        created.append({
+            'product':  pid,
+            'quantity': str(qty_to_move),
+            'stxn':     stxn.pk,
+        })
 
     return {'moved': created}
 
 
-# ─── Document Delete ──────────────────────────────────────────────────────────
+# ─── Document Delete ───────────────────────────────────────────────────────────
 
 @transaction.atomic
 def process_document_delete(document, strategy):
     from inventory.models import StockTransaction
 
+    # Record f.txns are always hard deleted
     document.transactions.filter(type='record').delete()
 
     actual_ftxns = document.transactions.filter(type='actual')
@@ -369,15 +395,20 @@ def process_document_delete(document, strategy):
             if ftxn.payment_account:
                 ftxn.payment_account.current_balance -= ftxn.amount
                 ftxn.payment_account.save(update_fields=['current_balance'])
+            _recalculate_mcd(ftxn.contact, ftxn.date)
             ftxn.delete()
         for stxn in actual_stxns:
             stxn.product.current_stock -= stxn.quantity
             stxn.product.save(update_fields=['current_stock'])
             stxn.delete()
+
     elif strategy == 'manual':
+        # Untether from document — becomes standalone advance payment / stock entry
         actual_ftxns.update(document=None, is_doc_deleted=True)
         actual_stxns.update(document=None, is_doc_deleted=True)
+
     elif strategy == 'orphan':
+        # Flag only — no balance or stock reversal
         actual_ftxns.update(is_doc_deleted=True)
         actual_stxns.update(is_doc_deleted=True)
 

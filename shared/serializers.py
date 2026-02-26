@@ -5,17 +5,17 @@ from .models import Settings, Contact, PaymentAccount
 
 class SettingsSerializer(serializers.ModelSerializer):
     class Meta:
-        model = Settings
+        model  = Settings
         fields = '__all__'
 
 
 class ContactSerializer(serializers.ModelSerializer):
     class Meta:
-        model = Contact
+        model  = Contact
         fields = '__all__'
 
 
 class PaymentAccountSerializer(serializers.ModelSerializer):
     class Meta:
-        model = PaymentAccount
+        model  = PaymentAccount
         fields = '__all__'

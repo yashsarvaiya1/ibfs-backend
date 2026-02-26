@@ -4,7 +4,6 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import Settings, Contact, PaymentAccount
 from .serializers import SettingsSerializer, ContactSerializer, PaymentAccountSerializer
-from accounting.models import FinancialTransaction
 
 
 class SettingsViewSet(viewsets.ModelViewSet):
@@ -13,11 +12,10 @@ class SettingsViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return Settings.objects.all()
 
-    def list(self, request):
-        instance = Settings.get()
-        return Response(SettingsSerializer(instance).data)
+    def list(self, request, *args, **kwargs):
+        return Response(SettingsSerializer(Settings.get()).data)
 
-    def create(self, request):
+    def create(self, request, *args, **kwargs):
         instance = Settings.get()
         serializer = SettingsSerializer(instance, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -27,9 +25,9 @@ class SettingsViewSet(viewsets.ModelViewSet):
 
 class ContactViewSet(viewsets.ModelViewSet):
     serializer_class = ContactSerializer
-    search_fields = ['contact_name', 'company_name', 'phone']
-    ordering_fields = ['contact_name', 'company_name', 'created_at']
-    ordering = ['contact_name']
+    search_fields    = ['contact_name', 'company_name', 'phone']
+    ordering_fields  = ['contact_name', 'company_name', 'created_at']
+    ordering         = ['contact_name']
 
     def get_queryset(self):
         qs = Contact.objects.all()
@@ -41,10 +39,11 @@ class ContactViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def ledger(self, request, pk=None):
         contact = self.get_object()
+        from accounting.models import FinancialTransaction
+        from accounting.serializers import FinancialTransactionSerializer
         txns = FinancialTransaction.objects.filter(
             contact=contact
         ).order_by('date', 'created_at')
-        from accounting.serializers import FinancialTransactionSerializer
         return Response(FinancialTransactionSerializer(txns, many=True).data)
 
     @action(detail=True, methods=['post'])
@@ -64,7 +63,7 @@ class ContactViewSet(viewsets.ModelViewSet):
 
 class PaymentAccountViewSet(viewsets.ModelViewSet):
     serializer_class = PaymentAccountSerializer
-    ordering = ['name']
+    ordering         = ['name']
 
     def get_queryset(self):
         qs = PaymentAccount.objects.all()
@@ -88,11 +87,10 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def set_balance(self, request, pk=None):
-        # Direct balance edit — no f.txn created
         account = self.get_object()
         balance = request.data.get('current_balance')
         if balance is None:
-            return Response({'error': 'current_balance required'}, status=400)
+            return Response({'error': 'current_balance required.'}, status=status.HTTP_400_BAD_REQUEST)
         account.current_balance = balance
-        account.save()
+        account.save(update_fields=['current_balance', 'updated_at'])
         return Response(PaymentAccountSerializer(account).data)
