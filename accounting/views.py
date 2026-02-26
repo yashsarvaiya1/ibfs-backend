@@ -5,14 +5,21 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import Document, FinancialTransaction
-from .serializers import DocumentSerializer, DocumentListSerializer, FinancialTransactionSerializer
+from .serializers import (
+    DocumentSerializer, DocumentListSerializer,
+    FinancialTransactionSerializer,
+)
 from .services import (
     _create_ftxn, _create_stxn, _next_doc_id,
     _parse_date, _recalculate_mcd,
     process_document_create, process_document_delete, process_move_stock,
+    STXN_SIGN, CHALLAN_STXN_SIGN,
 )
 from shared.models import Contact, PaymentAccount, Settings
+from inventory.models import StockTransaction, Product
 
+
+# ─── Document ViewSet ──────────────────────────────────────────────────────────
 
 class DocumentViewSet(viewsets.ModelViewSet):
     search_fields   = ['doc_id', 'contact__contact_name', 'contact__company_name']
@@ -20,11 +27,18 @@ class DocumentViewSet(viewsets.ModelViewSet):
     ordering        = ['-date']
 
     def get_queryset(self):
-        qs = Document.objects.filter(is_active=True)
-        if t := self.request.query_params.get('type'):
-            qs = qs.filter(type=t)
-        if c := self.request.query_params.get('contact'):
-            qs = qs.filter(contact_id=c)
+        qs     = Document.objects.filter(is_active=True).prefetch_related('transactions')
+        params = self.request.query_params
+        if params.get('type'):
+            qs = qs.filter(type=params['type'])
+        if params.get('contact'):
+            qs = qs.filter(contact_id=params['contact'])
+        if params.get('date_from'):
+            qs = qs.filter(date__gte=params['date_from'])
+        if params.get('date_to'):
+            qs = qs.filter(date__lte=params['date_to'])
+        if params.get('reference'):
+            qs = qs.filter(reference_id=params['reference'])
         return qs
 
     def get_serializer_class(self):
@@ -37,30 +51,61 @@ class DocumentViewSet(viewsets.ModelViewSet):
         doc        = process_document_create(doc_type, request.data, contact)
         return Response(DocumentSerializer(doc).data, status=status.HTTP_201_CREATED)
 
+    def update(self, request, *args, **kwargs):
+        """
+        Document edit:
+        - Updates doc fields (notes, date, attachment_urls, etc.)
+        - If line_items changed → updates existing record s.txns to match
+          (does NOT touch actual s.txns — those are already moved)
+        - total_amount change does NOT auto-adjust f.txns (user records payment
+          separately — remaining is computed from record vs actual)
+        """
+        doc        = self.get_object()
+        safe_fields = [
+            'notes', 'date', 'due_date', 'payment_terms',
+            'attachment_urls', 'charges', 'taxes', 'discount',
+            'total_amount', 'consignee', 'reference',
+        ]
+        for field in safe_fields:
+            if field in request.data:
+                setattr(doc, field, request.data[field])
+
+        new_line_items = request.data.get('line_items')
+        if new_line_items is not None:
+            doc.line_items = new_line_items
+            _sync_record_stxns(doc, new_line_items)
+
+        doc.save()
+        return Response(DocumentSerializer(doc).data)
+
+    # ── Record Payment ─────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def record_payment(self, request, pk=None):
         """
         Records an actual f.txn against a document.
-        Derives direction from doc type — user always passes positive amount.
+        Blocked for: challan, po, pi, quotation, interest, expense.
         Supports optional interest_lines.
         """
-        doc        = self.get_object()
-        amount_raw = Decimal(str(request.data['amount']))
-        account_id = request.data.get('payment_account')
-        account    = PaymentAccount.objects.get(pk=account_id) if account_id else None
-        date       = _parse_date(request.data.get('date'))
-        notes      = request.data.get('notes')
+        doc = self.get_object()
+        BLOCKED = {'challan', 'po', 'pi', 'quotation', 'interest', 'expense'}
+        if doc.type in BLOCKED:
+            return Response(
+                {'error': f'record_payment not allowed for {doc.type}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        amount_raw     = Decimal(str(request.data['amount']))
+        account_id     = request.data.get('payment_account')
+        account        = PaymentAccount.objects.get(pk=account_id) if account_id else None
+        date           = _parse_date(request.data.get('date'))
+        notes          = request.data.get('notes')
         interest_lines = request.data.get('interest_lines', [])
 
-        # bill/cn → we pay out → actual negative
-        # invoice/dn → we receive → actual positive
-        outgoing  = {'bill', 'cn', 'cash_payment_voucher'}
-        direction = 'send' if doc.type in outgoing else 'receive'
+        outgoing   = {'bill', 'cn', 'cash_payment_voucher'}
+        direction  = 'send' if doc.type in outgoing else 'receive'
         actual_amt = -amount_raw if direction == 'send' else amount_raw
+        result     = {}
 
-        result = {}
-
-        # Interest record FIRST — lower created_at ensures correct ledger order
         if interest_lines:
             net = sum(
                 Decimal(str(l['amount'])) if l.get('type') == 'charge'
@@ -90,15 +135,25 @@ class DocumentViewSet(viewsets.ModelViewSet):
         result['ftxn'] = ftxn.pk
         return Response(result, status=status.HTTP_201_CREATED)
 
+    # ── Move Stock ─────────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def move_stock(self, request, pk=None):
-        doc    = self.get_object()
+        """
+        Only valid for: bill, invoice, cn, dn, challan.
+        """
+        doc = self.get_object()
+        ALLOWED = {'bill', 'invoice', 'cn', 'dn', 'challan'}
+        if doc.type not in ALLOWED:
+            return Response(
+                {'error': f'move_stock not allowed for {doc.type}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         result = process_move_stock(doc, request.data)
         return Response(result, status=status.HTTP_201_CREATED)
 
+    # ── Stock Preview ──────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
     def stock_preview(self, request, pk=None):
-        from inventory.models import StockTransaction
         doc     = self.get_object()
         records = StockTransaction.objects.filter(
             document=doc, type='record'
@@ -120,13 +175,13 @@ class DocumentViewSet(viewsets.ModelViewSet):
             })
         return Response(preview)
 
+    # ── Add Details (Fast Bill) ────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def add_details(self, request, pk=None):
         """
-        Adds line_items to a Fast Bill after creation.
-        Safe to call once — checks for existing s.txns to avoid duplicates.
+        Adds line_items to a fast-created doc.
+        Guard: skips products that already have s.txns on this doc.
         """
-        from inventory.models import Product, StockTransaction
         doc        = self.get_object()
         settings   = Settings.get()
         line_items = request.data.get('line_items', [])
@@ -136,7 +191,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
             doc.total_amount = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
         doc.save(update_fields=['line_items', 'total_amount', 'updated_at'])
 
-        from .services import STXN_SIGN, CHALLAN_STXN_SIGN
         if doc.type == 'challan' and doc.reference:
             sign = CHALLAN_STXN_SIGN.get(doc.reference.type, Decimal('1'))
         else:
@@ -150,20 +204,15 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 product = Product.objects.get(pk=pid)
             except Product.DoesNotExist:
                 continue
-
-            # Guard: skip if a s.txn already exists for this product+doc
-            already_exists = StockTransaction.objects.filter(
-                document=doc, product=product
-            ).exists()
-            if already_exists:
+            if StockTransaction.objects.filter(document=doc, product=product).exists():
                 continue
-
             qty      = sign * Decimal(str(item.get('quantity', 0)))
             txn_type = 'actual' if settings.auto_stock else 'record'
             _create_stxn(txn_type, qty, product, doc, doc.date, item.get('rate'))
 
         return Response(DocumentSerializer(doc).data)
 
+    # ── Delete Document ────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def delete_document(self, request, pk=None):
         doc      = self.get_object()
@@ -172,15 +221,69 @@ class DocumentViewSet(viewsets.ModelViewSet):
         return Response(result)
 
 
+def _sync_record_stxns(doc, new_line_items):
+    """
+    When line_items are edited on a doc, sync the record s.txns.
+    - Deletes record s.txns for products removed from line_items
+    - Creates record s.txns for newly added products
+    - Updates quantity on existing record s.txns
+    - Never touches actual s.txns
+    """
+    if doc.type == 'challan' and doc.reference:
+        sign = CHALLAN_STXN_SIGN.get(doc.reference.type, Decimal('1'))
+    else:
+        sign = STXN_SIGN.get(doc.type, Decimal('1'))
+
+    settings = Settings.get()
+
+    # Build map of product_id → qty from new line_items
+    new_map = {}
+    for item in new_line_items:
+        pid = item.get('product_id')
+        if pid:
+            new_map[int(pid)] = Decimal(str(item.get('quantity', 0)))
+
+    existing_records = StockTransaction.objects.filter(document=doc, type='record')
+    existing_map     = {r.product_id: r for r in existing_records}
+
+    # Remove records for products no longer in line_items
+    for pid, stxn in existing_map.items():
+        if pid not in new_map:
+            stxn.delete()
+
+    # Add or update
+    for pid, qty in new_map.items():
+        signed_qty = sign * qty
+        if pid in existing_map:
+            stxn = existing_map[pid]
+            if stxn.quantity != signed_qty:
+                stxn.quantity = signed_qty
+                stxn.save(update_fields=['quantity'])
+        else:
+            try:
+                product = Product.objects.get(pk=pid)
+            except Product.DoesNotExist:
+                continue
+            _create_stxn('record', signed_qty, product, doc, doc.date)
+
+
+# ─── FinancialTransaction ViewSet ──────────────────────────────────────────────
+
 class FinancialTransactionViewSet(viewsets.ModelViewSet):
     serializer_class = FinancialTransactionSerializer
     search_fields    = ['contact__contact_name', 'contact__company_name', 'notes']
     ordering_fields  = ['date', 'amount', 'created_at']
-    ordering         = ['date', 'created_at']  # ascending — MCD depends on order
+    ordering         = ['date', 'created_at']
 
     def get_queryset(self):
         qs     = FinancialTransaction.objects.all()
         params = self.request.query_params
+        settings = Settings.get()
+
+        # Auto-mode ON → hide record txns (user never sees them)
+        if settings.auto_transaction and not params.get('include_records'):
+            qs = qs.exclude(type='record')
+
         if params.get('contact'):
             qs = qs.filter(contact_id=params['contact'])
         if params.get('account'):
@@ -189,10 +292,26 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(type=params['type'])
         if params.get('document'):
             qs = qs.filter(document_id=params['document'])
+        if params.get('date_from'):
+            qs = qs.filter(date__gte=params['date_from'])
+        if params.get('date_to'):
+            qs = qs.filter(date__lte=params['date_to'])
+        if params.get('is_doc_deleted') is not None:
+            qs = qs.filter(is_doc_deleted=params['is_doc_deleted'].lower() == 'true')
         return qs
 
     def update(self, request, *args, **kwargs):
-        ftxn     = self.get_object()
+        """
+        Only actual type transactions can be edited.
+        Record txns are managed via document edit.
+        Contra txns are managed via transfer endpoint.
+        """
+        ftxn = self.get_object()
+        if ftxn.type != 'actual':
+            return Response(
+                {'error': 'Only actual transactions can be edited directly.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         old_date = ftxn.date
 
         if 'amount' in request.data:
@@ -228,7 +347,17 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         return Response(FinancialTransactionSerializer(ftxn).data)
 
     def destroy(self, request, *args, **kwargs):
+        """
+        Only actual transactions can be deleted directly.
+        Record txns are deleted via document deletion flow.
+        """
         ftxn = self.get_object()
+        if ftxn.type == 'record':
+            return Response(
+                {'error': 'Record transactions are managed via document deletion.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         date    = ftxn.date
         contact = ftxn.contact
 
