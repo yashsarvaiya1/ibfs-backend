@@ -5,12 +5,13 @@ from rest_framework.response import Response
 from .models import Document, FinancialTransaction
 from .serializers import (
     DocumentSerializer, DocumentListSerializer,
-    FinancialTransactionSerializer
+    FinancialTransactionSerializer,
 )
 from .services import (
     process_document_create, process_document_delete,
     process_move_stock, process_send_receive,
-    _create_ftxn, _recalculate_mcd, _parse_date
+    process_expense, process_standalone_interest,
+    _create_ftxn, _recalculate_mcd, _parse_date, _next_doc_id,
 )
 from shared.models import Contact, PaymentAccount, Settings
 from decimal import Decimal
@@ -24,11 +25,22 @@ class DocumentViewSet(viewsets.ModelViewSet):
     ordering        = ['-date']
 
     def get_queryset(self):
-        qs = Document.objects.filter(is_active=True)
+        qs = Document.objects.filter(is_active=True).select_related('contact')
         if t := self.request.query_params.get('type'):
             qs = qs.filter(type=t)
         if c := self.request.query_params.get('contact'):
             qs = qs.filter(contact_id=c)
+        if date_from := self.request.query_params.get('date_from'):
+            qs = qs.filter(date__gte=date_from)
+        if date_to := self.request.query_params.get('date_to'):
+            qs = qs.filter(date__lte=date_to)
+        if self.request.query_params.get('pending_stock') == 'true':
+            from inventory.models import StockTransaction
+            from django.db.models import Exists, OuterRef
+            has_record = StockTransaction.objects.filter(
+                document=OuterRef('pk'), type='record'
+            )
+            qs = qs.filter(Exists(has_record))
         return qs
 
     def get_serializer_class(self):
@@ -41,36 +53,29 @@ class DocumentViewSet(viewsets.ModelViewSet):
         doc        = process_document_create(doc_type, request.data, contact)
         return Response(DocumentSerializer(doc).data, status=status.HTTP_201_CREATED)
 
-    # ── Record Payment ────────────────────────────────────────────────────────
+    # ── Record Payment ─────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def record_payment(self, request, pk=None):
         """
-        Record a payment (actual f.txn) against a document.
-        Sign is derived from doc type — user always enters a positive amount.
-
-        Bill / CN  → money goes OUT → actual = −amount
-        Invoice / DN → money comes IN → actual = +amount
-
-        Supports optional interest lines (same formula as send/receive).
+        Bill/CN  → money OUT → actual = −amount
+        Invoice/DN → money IN → actual = +amount
+        Supports optional interest lines.
         """
-        doc        = self.get_object()
-        amount_raw = Decimal(str(request.data['amount']))
-        account_id = request.data.get('payment_account')
-        account    = PaymentAccount.objects.get(pk=account_id) if account_id else None
-        date       = _parse_date(request.data.get('date'))
-        notes      = request.data.get('notes')
+        doc            = self.get_object()
+        amount_raw     = Decimal(str(request.data['amount']))
+        account_id     = request.data.get('payment_account')
+        account        = PaymentAccount.objects.get(pk=account_id) if account_id else None
+        date           = _parse_date(request.data.get('date'))
+        notes          = request.data.get('notes')
         interest_lines = request.data.get('interest_lines', [])
 
-        # Derive direction from document type
-        # Bill / CN  = we owe them = we PAY = send = actual negative
-        # Invoice/DN = they owe us = we RECEIVE = actual positive
         outgoing_types = {'bill', 'cn', 'cash_payment_voucher'}
         direction  = 'send' if doc.type in outgoing_types else 'receive'
         actual_amt = -amount_raw if direction == 'send' else amount_raw
 
         result = {}
 
-        # ── Interest record FIRST, then actual ───────────────────────────────
+        # Interest record FIRST, then actual
         if interest_lines:
             net = sum(
                 Decimal(str(l['amount'])) if l.get('type') == 'charge'
@@ -82,42 +87,42 @@ class DocumentViewSet(viewsets.ModelViewSet):
             )
             interest_doc = Document.objects.create(
                 type='interest',
-                doc_id=_next_doc_id_local('interest'),
+                doc_id=_next_doc_id('interest'),
                 contact=doc.contact,
                 line_items=interest_lines,
                 total_amount=abs(net),
                 date=date,
-                reference=doc,   # interest doc references the original bill/invoice
+                reference=doc,
             )
             int_ftxn = _create_ftxn(
                 'record', interest_record_amount,
                 doc.contact, None, interest_doc, date,
-                'Interest/penalty on payment'
+                'Interest/penalty on payment',
             )
             result['interest_doc']  = interest_doc.pk
             result['interest_ftxn'] = int_ftxn.pk
 
-        # ── Actual payment ────────────────────────────────────────────────────
-        ftxn = _create_ftxn(
+        ftxn           = _create_ftxn(
             'actual', actual_amt, doc.contact, account, doc, date, notes
         )
         result['ftxn'] = ftxn.pk
-
         return Response(result, status=status.HTTP_201_CREATED)
 
-    # ── Move Stock ────────────────────────────────────────────────────────────
+    # ── Move Stock ─────────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def move_stock(self, request, pk=None):
         doc    = self.get_object()
         result = process_move_stock(doc, request.data)
         return Response(result, status=status.HTTP_201_CREATED)
 
-    # ── Stock Preview ─────────────────────────────────────────────────────────
+    # ── Stock Preview ──────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
     def stock_preview(self, request, pk=None):
         from inventory.models import StockTransaction
         doc     = self.get_object()
-        records = StockTransaction.objects.filter(document=doc, type='record')
+        records = StockTransaction.objects.filter(
+            document=doc, type='record'
+        ).select_related('product')
         preview = []
         for r in records:
             actuals_sum = sum(
@@ -125,16 +130,19 @@ class DocumentViewSet(viewsets.ModelViewSet):
                     document=doc, product=r.product, type='actual'
                 )
             )
+            remaining = r.quantity - actuals_sum
             preview.append({
                 'product_id':    r.product_id,
                 'product_name':  r.product.name,
+                'unit':          r.product.unit,
                 'record_qty':    str(r.quantity),
                 'moved_qty':     str(actuals_sum),
-                'remaining_qty': str(r.quantity - actuals_sum),
+                'remaining_qty': str(remaining),
+                'is_complete':   remaining == 0,
             })
         return Response(preview)
 
-    # ── Add Details ───────────────────────────────────────────────────────────
+    # ── Add Details ────────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def add_details(self, request, pk=None):
         from inventory.models import Product
@@ -166,7 +174,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         return Response(DocumentSerializer(doc).data)
 
-    # ── Delete Document ───────────────────────────────────────────────────────
+    # ── Delete Document ────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def delete_document(self, request, pk=None):
         doc      = self.get_object()
@@ -175,24 +183,19 @@ class DocumentViewSet(viewsets.ModelViewSet):
         return Response(result)
 
 
-def _next_doc_id_local(doc_type):
-    """Local helper to avoid circular import with services."""
-    from .services import _next_doc_id
-    return _next_doc_id(doc_type)
-
-
 # ─── FinancialTransaction ViewSet ─────────────────────────────────────────────
 
 class FinancialTransactionViewSet(viewsets.ModelViewSet):
     serializer_class = FinancialTransactionSerializer
     search_fields    = ['contact__contact_name', 'contact__company_name', 'notes']
     ordering_fields  = ['date', 'amount', 'created_at']
-    # ✅ CRITICAL: must be ascending for MCD recalculation to be correct
-    # Frontend reverses for display — backend always serves oldest→newest
+    # CRITICAL: ascending for correct MCD. Frontend reverses for display.
     ordering         = ['date', 'created_at']
 
     def get_queryset(self):
-        qs     = FinancialTransaction.objects.all()
+        qs     = FinancialTransaction.objects.all().select_related(
+            'contact', 'payment_account', 'document'
+        )
         params = self.request.query_params
         if params.get('contact'):
             qs = qs.filter(contact_id=params['contact'])
@@ -202,85 +205,87 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(type=params['type'])
         if params.get('document'):
             qs = qs.filter(document_id=params['document'])
+        if params.get('exclude_type'):
+            qs = qs.exclude(type=params['exclude_type'])
         return qs
 
-    # ── Edit Transaction ──────────────────────────────────────────────────────
     def update(self, request, *args, **kwargs):
-        """
-        Allow editing amount, date, notes, payment_account on a transaction.
-        After edit, recalculate MCD for the affected month.
-        If date changed, recalculate BOTH old and new month.
-        """
         ftxn     = self.get_object()
         old_date = ftxn.date
-        old_amt  = ftxn.amount
 
-        # Only allow safe field edits
         allowed = ['amount', 'date', 'notes', 'payment_account']
         for field in allowed:
-            if field in request.data:
-                if field == 'amount':
-                    new_amt = Decimal(str(request.data['amount']))
-                    # Adjust account balance: reverse old, apply new
-                    if ftxn.payment_account:
-                        ftxn.payment_account.current_balance -= ftxn.amount
-                        ftxn.payment_account.current_balance += new_amt
-                        ftxn.payment_account.save(update_fields=['current_balance'])
-                    ftxn.amount = new_amt
-                elif field == 'date':
-                    ftxn.date = _parse_date(request.data['date'])
-                elif field == 'payment_account':
-                    acct_id = request.data['payment_account']
-                    # Reverse old account balance
-                    if ftxn.payment_account:
-                        ftxn.payment_account.current_balance -= ftxn.amount
-                        ftxn.payment_account.save(update_fields=['current_balance'])
-                    # Apply to new account
-                    new_acct = PaymentAccount.objects.get(pk=acct_id) if acct_id else None
-                    if new_acct:
-                        new_acct.current_balance += ftxn.amount
-                        new_acct.save(update_fields=['current_balance'])
-                    ftxn.payment_account = new_acct
-                else:
-                    setattr(ftxn, field, request.data[field])
+            if field not in request.data:
+                continue
+            if field == 'amount':
+                new_amt = Decimal(str(request.data['amount']))
+                if ftxn.payment_account:
+                    ftxn.payment_account.current_balance -= ftxn.amount
+                    ftxn.payment_account.current_balance += new_amt
+                    ftxn.payment_account.save(update_fields=['current_balance'])
+                ftxn.amount = new_amt
+            elif field == 'date':
+                ftxn.date = _parse_date(request.data['date'])
+            elif field == 'payment_account':
+                acct_id = request.data['payment_account']
+                if ftxn.payment_account:
+                    ftxn.payment_account.current_balance -= ftxn.amount
+                    ftxn.payment_account.save(update_fields=['current_balance'])
+                new_acct = PaymentAccount.objects.get(pk=acct_id) if acct_id else None
+                if new_acct:
+                    new_acct.current_balance += ftxn.amount
+                    new_acct.save(update_fields=['current_balance'])
+                ftxn.payment_account = new_acct
+            else:
+                setattr(ftxn, field, request.data[field])
 
         ftxn.save()
-
-        # Recalculate MCD — if date changed, recalculate old month too
         _recalculate_mcd(ftxn.contact, ftxn.date)
         if old_date.month != ftxn.date.month or old_date.year != ftxn.date.year:
             _recalculate_mcd(ftxn.contact, old_date)
 
         return Response(FinancialTransactionSerializer(ftxn).data)
 
-    # ── Delete Transaction ────────────────────────────────────────────────────
     def destroy(self, request, *args, **kwargs):
-        """
-        Delete a transaction.
-        - Reverse account balance if actual type.
-        - Recalculate MCD for the month.
-        - If it's a record type on an active document, warn but allow.
-        """
-        ftxn = self.get_object()
-        date = ftxn.date
+        ftxn    = self.get_object()
+        date    = ftxn.date
+        contact = ftxn.contact
 
-        # Reverse account balance for actual txns
         if ftxn.type == 'actual' and ftxn.payment_account:
             ftxn.payment_account.current_balance -= ftxn.amount
             ftxn.payment_account.save(update_fields=['current_balance'])
 
-        contact = ftxn.contact
         ftxn.delete()
-
-        # Recalculate MCD after deletion
         _recalculate_mcd(contact, date)
-
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-    # ── Link Document ─────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def link_document(self, request, pk=None):
-        ftxn            = self.get_object()
+        ftxn             = self.get_object()
         ftxn.document_id = request.data.get('document')
         ftxn.save(update_fields=['document'])
         return Response(FinancialTransactionSerializer(ftxn).data)
+
+
+# ─── Quick Action ViewSet ─────────────────────────────────────────────────────
+
+class QuickActionViewSet(viewsets.ViewSet):
+    """
+    Global Quick Actions — no document context required.
+
+    POST /api/quick-actions/expense/
+         { contact(opt), payment_account, date, line_items, notes }
+
+    POST /api/quick-actions/interest/
+         { contact(required), date, line_items, action: 'charge'|'credit', notes }
+    """
+
+    @action(detail=False, methods=['post'], url_path='expense')
+    def create_expense(self, request):
+        result = process_expense(request.data)
+        return Response(result, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'], url_path='interest')
+    def create_interest(self, request):
+        result = process_standalone_interest(request.data)
+        return Response(result, status=status.HTTP_201_CREATED)
