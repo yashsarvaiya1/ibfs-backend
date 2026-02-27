@@ -12,15 +12,30 @@ class SettingsViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return Settings.objects.all()
 
+    def get_object(self):
+        # Singleton — always return the one instance
+        return Settings.get()
+
     def list(self, request, *args, **kwargs):
-        return Response(SettingsSerializer(Settings.get()).data)
+        return Response(SettingsSerializer(self.get_object()).data)
 
     def create(self, request, *args, **kwargs):
-        instance = Settings.get()
+        return self._upsert(request)
+
+    def update(self, request, *args, **kwargs):
+        return self._upsert(request)
+
+    def partial_update(self, request, *args, **kwargs):
+        return self._upsert(request)
+
+    def _upsert(self, request):
+        instance = self.get_object()
         serializer = SettingsSerializer(instance, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+
 
 
 class ContactViewSet(viewsets.ModelViewSet):
