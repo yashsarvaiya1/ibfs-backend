@@ -30,7 +30,6 @@ class StockTransaction(BaseModel):
     date         = models.DateField()
     rate         = models.DecimalField(max_digits=15, decimal_places=2, blank=True, null=True)
     notes        = models.TextField(blank=True, null=True)
-    is_doc_deleted = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['-date', '-created_at']

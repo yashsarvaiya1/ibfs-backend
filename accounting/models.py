@@ -91,7 +91,6 @@ class FinancialTransaction(BaseModel):
     monthly_cumulative_delta = models.DecimalField(
         max_digits=15, decimal_places=2, default=0
     )
-    is_doc_deleted = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["date", "created_at"]

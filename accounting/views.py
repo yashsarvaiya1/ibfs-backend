@@ -1,6 +1,5 @@
-# accounting/views.py
 from decimal import Decimal
-from django.utils import timezone
+from django.db import models as django_models
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -27,7 +26,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
     ordering        = ['-date']
 
     def get_queryset(self):
-        qs     = Document.objects.filter(is_active=True).prefetch_related('transactions')
+        qs     = Document.objects.filter(is_active=True).prefetch_related(
+            'transactions', 'transactions__document'
+        )
         params = self.request.query_params
         if params.get('type'):
             qs = qs.filter(type=params['type'])
@@ -44,23 +45,34 @@ class DocumentViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         return DocumentListSerializer if self.action == 'list' else DocumentSerializer
 
+    def get_serializer_context(self):
+        # Pass request so attachment_urls_full can build absolute URLs
+        return {'request': self.request}
+
     def create(self, request, *args, **kwargs):
-        doc_type   = request.data.get('type')
+        doc_type = request.data.get('type')
+        BLOCKED_DIRECT = {'cash_payment_voucher', 'cash_receipt_voucher'}
+        if doc_type in BLOCKED_DIRECT:
+            return Response(
+                {'error': f'{doc_type} can only be created via Send/Receive flow.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         contact_id = request.data.get('contact')
         contact    = Contact.objects.get(pk=contact_id) if contact_id else None
         doc        = process_document_create(doc_type, request.data, contact)
-        return Response(DocumentSerializer(doc).data, status=status.HTTP_201_CREATED)
+        return Response(
+            DocumentSerializer(doc, context={'request': request}).data,
+            status=status.HTTP_201_CREATED
+        )
+
 
     def update(self, request, *args, **kwargs):
         """
-        Document edit:
-        - Updates doc fields (notes, date, attachment_urls, etc.)
-        - If line_items changed → updates existing record s.txns to match
-          (does NOT touch actual s.txns — those are already moved)
-        - total_amount change does NOT auto-adjust f.txns (user records payment
-          separately — remaining is computed from record vs actual)
+        Document edit — updates safe fields only.
+        If line_items changed → syncs record s.txns to match new line_items.
+        total_amount change does NOT auto-adjust f.txns.
         """
-        doc        = self.get_object()
+        doc         = self.get_object()
         safe_fields = [
             'notes', 'date', 'due_date', 'payment_terms',
             'attachment_urls', 'charges', 'taxes', 'discount',
@@ -76,15 +88,15 @@ class DocumentViewSet(viewsets.ModelViewSet):
             _sync_record_stxns(doc, new_line_items)
 
         doc.save()
-        return Response(DocumentSerializer(doc).data)
+        return Response(DocumentSerializer(doc, context={'request': request}).data)
 
     # ── Record Payment ─────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def record_payment(self, request, pk=None):
         """
-        Records an actual f.txn against a document.
-        Blocked for: challan, po, pi, quotation, interest, expense.
+        Records an actual f.txn against a document (Path B in spec).
         Supports optional interest_lines.
+        Per spec: always available for bill/invoice/cn/dn regardless of auto_transaction setting.
         """
         doc = self.get_object()
         BLOCKED = {'challan', 'po', 'pi', 'quotation', 'interest', 'expense'}
@@ -101,20 +113,23 @@ class DocumentViewSet(viewsets.ModelViewSet):
         notes          = request.data.get('notes')
         interest_lines = request.data.get('interest_lines', [])
 
-        outgoing   = {'bill', 'cn', 'cash_payment_voucher'}
-        direction  = 'send' if doc.type in outgoing else 'receive'
-        actual_amt = -amount_raw if direction == 'send' else amount_raw
-        result     = {}
+        # Determine direction from document type
+        # Outgoing (we pay): bill, dn, cash_payment_voucher → actual is negative
+        # Incoming (we receive): invoice, cn, cash_receipt_voucher → actual is positive
+        outgoing      = {'bill', 'dn', 'cash_payment_voucher'}
+        direction     = 'send' if doc.type in outgoing else 'receive'
+        actual_amt    = -amount_raw if direction == 'send' else amount_raw
+        result        = {}
 
+        # ── Interest record FIRST (same pattern as process_send_receive) ──────
         if interest_lines:
             net = sum(
                 Decimal(str(l['amount'])) if l.get('type') == 'charge'
                 else -Decimal(str(l['amount']))
                 for l in interest_lines
             )
-            interest_record_amount = net * (
-                Decimal('-1') if direction == 'receive' else Decimal('1')
-            )
+            # Per spec Part 4: interest record = OPPOSITE of actual
+            interest_record_amount = -net if direction == 'receive' else net
             interest_doc = Document.objects.create(
                 type         = 'interest',
                 doc_id       = _next_doc_id('interest'),
@@ -122,7 +137,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 line_items   = interest_lines,
                 total_amount = abs(net),
                 date         = date,
-                reference    = doc,
+                reference    = doc,  # interest doc inherits reference to this document
             )
             int_ftxn = _create_ftxn(
                 'record', interest_record_amount,
@@ -131,6 +146,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             result['interest_doc']  = interest_doc.pk
             result['interest_ftxn'] = int_ftxn.pk
 
+        # ── Main actual SECOND ────────────────────────────────────────────────
         ftxn = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes)
         result['ftxn'] = ftxn.pk
         return Response(result, status=status.HTTP_201_CREATED)
@@ -139,7 +155,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def move_stock(self, request, pk=None):
         """
-        Only valid for: bill, invoice, cn, dn, challan.
+        Creates actual s.txns for a document.
+        Per spec 6.1 — from Document Page Move Stock button.
         """
         doc = self.get_object()
         ALLOWED = {'bill', 'invoice', 'cn', 'dn', 'challan'}
@@ -154,6 +171,10 @@ class DocumentViewSet(viewsets.ModelViewSet):
     # ── Stock Preview ──────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
     def stock_preview(self, request, pk=None):
+        """
+        Per spec 6.1: Stock Preview Panel shows only product_id items.
+        Manual/service items (product_id=null) are completely hidden.
+        """
         doc     = self.get_object()
         records = StockTransaction.objects.filter(
             document=doc, type='record'
@@ -175,12 +196,13 @@ class DocumentViewSet(viewsets.ModelViewSet):
             })
         return Response(preview)
 
-    # ── Add Details (Fast Bill) ────────────────────────────────────────────────
+    # ── Add Details (Fast Bill / Fast Invoice) ─────────────────────────────────
     @action(detail=True, methods=['post'])
     def add_details(self, request, pk=None):
         """
-        Adds line_items to a fast-created doc.
-        Guard: skips products that already have s.txns on this doc.
+        Per spec G3: Adds line_items to a fast-created doc.
+        Silently creates record s.txns for product_id items — makes Move Stock appear.
+        Guard: skips products that already have s.txns on this doc (idempotent).
         """
         doc        = self.get_object()
         settings   = Settings.get()
@@ -204,30 +226,102 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 product = Product.objects.get(pk=pid)
             except Product.DoesNotExist:
                 continue
+            # Guard: skip if s.txns already exist for this product on this doc
             if StockTransaction.objects.filter(document=doc, product=product).exists():
                 continue
-            qty      = sign * Decimal(str(item.get('quantity', 0)))
-            txn_type = 'actual' if settings.auto_stock else 'record'
-            _create_stxn(txn_type, qty, product, doc, doc.date, item.get('rate'))
+            qty = sign * Decimal(str(item.get('quantity', 0)))
+            # add_details always creates record s.txns (user moves stock later)
+            # Per spec G3: "silently generates record s.txns... making Move Stock button appear"
+            _create_stxn('record', qty, product, doc, doc.date, item.get('rate'))
 
-        return Response(DocumentSerializer(doc).data)
+        return Response(DocumentSerializer(doc, context={'request': request}).data)
+
+    # ── Get Reference Data (for auto-copy on new document creation) ────────────
+    @action(detail=True, methods=['get'])
+    def reference_data(self, request, pk=None):
+        """
+        Returns the fields that get auto-copied when this document is selected as reference.
+        Per spec Part 2: line_items, charges, taxes, consignee, discount, payment_terms, notes.
+        contact is NOT returned — user selects independently.
+        """
+        doc = self.get_object()
+        return Response({
+            'line_items':    doc.line_items,
+            'charges':       doc.charges,
+            'taxes':         doc.taxes,
+            'consignee':     doc.consignee_id,
+            'discount':      str(doc.discount),
+            'payment_terms': doc.payment_terms,
+            'notes':         doc.notes,
+        })
 
     # ── Delete Document ────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def delete_document(self, request, pk=None):
+        """
+        Per spec Part 5 — exactly 2 strategies:
+          'revert' → hard delete all txns, reverse balances and stock
+          'manual' → keep actual txns intact with FK pointing to soft-deleted doc
+        No third option exists.
+        """
         doc      = self.get_object()
-        strategy = request.data.get('strategy', 'orphan')
-        result   = process_document_delete(doc, strategy)
+        strategy = request.data.get('strategy', 'revert')
+        if strategy not in ('revert', 'manual'):
+            return Response(
+                {'error': "strategy must be 'revert' or 'manual'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        result = process_document_delete(doc, strategy)
         return Response(result)
+
+    # ── Standalone Interest (Path C) ───────────────────────────────────────────
+    @action(detail=False, methods=['post'])
+    def standalone_interest(self, request):
+        """
+        Quick Action → Interest (Path C).
+        Requires enable_interest = True.
+        Creates Interest Document + record f.txn only. No actual. No s.txn.
+        Per spec: Charge → − (they owe us more). Credit → + (we owe them / waiving debt).
+        """
+        settings = Settings.get()
+        if not settings.enable_interest:
+            return Response(
+                {'error': 'enable_interest is disabled.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        contact_id     = request.data.get('contact')
+        contact        = Contact.objects.get(pk=contact_id) if contact_id else None
+        date           = _parse_date(request.data.get('date'))
+        interest_lines = request.data.get('line_items', [])
+        toggle         = request.data.get('toggle', 'charge')  # 'charge' or 'credit'
+
+        net = sum(Decimal(str(l['amount'])) for l in interest_lines)
+        # Charge → − (they owe us more — negative per sign convention)
+        # Credit → + (we owe them — positive per sign convention)
+        record_amount = -net if toggle == 'charge' else net
+
+        interest_doc = Document.objects.create(
+            type         = 'interest',
+            doc_id       = _next_doc_id('interest'),
+            contact      = contact,
+            line_items   = interest_lines,
+            total_amount = net,
+            date         = date,
+        )
+        ftxn = _create_ftxn('record', record_amount, contact, None, interest_doc, date)
+        return Response({
+            'interest_doc': interest_doc.pk,
+            'ftxn':         ftxn.pk,
+        }, status=status.HTTP_201_CREATED)
 
 
 def _sync_record_stxns(doc, new_line_items):
     """
-    When line_items are edited on a doc, sync the record s.txns.
+    When line_items are edited on a doc, sync the record s.txns to match.
     - Deletes record s.txns for products removed from line_items
     - Creates record s.txns for newly added products
-    - Updates quantity on existing record s.txns
-    - Never touches actual s.txns
+    - Updates quantity on existing record s.txns if quantity changed
+    - NEVER touches actual s.txns
     """
     if doc.type == 'challan' and doc.reference:
         sign = CHALLAN_STXN_SIGN.get(doc.reference.type, Decimal('1'))
@@ -258,7 +352,7 @@ def _sync_record_stxns(doc, new_line_items):
             stxn = existing_map[pid]
             if stxn.quantity != signed_qty:
                 stxn.quantity = signed_qty
-                stxn.save(update_fields=['quantity'])
+                stxn.save(update_fields=['quantity', 'updated_at'])
         else:
             try:
                 product = Product.objects.get(pk=pid)
@@ -275,12 +369,16 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
     ordering_fields  = ['date', 'amount', 'created_at']
     ordering         = ['date', 'created_at']
 
+    def get_serializer_context(self):
+        return {'request': self.request}
+
     def get_queryset(self):
-        qs     = FinancialTransaction.objects.all()
-        params = self.request.query_params
+        qs       = FinancialTransaction.objects.select_related('document', 'contact', 'payment_account').all()
+        params   = self.request.query_params
         settings = Settings.get()
 
-        # Auto-mode ON → hide record txns (user never sees them)
+        # Auto-mode ON → hide record txns from normal listing (user never sees them)
+        # Pass ?include_records=true to see them (admin/debug use)
         if settings.auto_transaction and not params.get('include_records'):
             qs = qs.exclude(type='record')
 
@@ -296,15 +394,28 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(date__gte=params['date_from'])
         if params.get('date_to'):
             qs = qs.filter(date__lte=params['date_to'])
-        if params.get('is_doc_deleted') is not None:
-            qs = qs.filter(is_doc_deleted=params['is_doc_deleted'].lower() == 'true')
+
+        # Derived filter — no DB field, computed from document.is_active
+        # ?is_document_deleted=true  → txns where document exists but is soft-deleted
+        # ?is_document_deleted=false → txns where document is active or null
+        is_doc_deleted = params.get('is_document_deleted')
+        if is_doc_deleted is not None:
+            if is_doc_deleted.lower() == 'true':
+                qs = qs.filter(document__isnull=False, document__is_active=False)
+            else:
+                qs = qs.filter(
+                    django_models.Q(document__isnull=True) | django_models.Q(document__is_active=True)
+                )
+
         return qs
 
     def update(self, request, *args, **kwargs):
         """
-        Only actual type transactions can be edited.
-        Record txns are managed via document edit.
+        Only actual type transactions can be edited directly.
+        Record txns are managed via document edit → _sync_record_stxns.
         Contra txns are managed via transfer endpoint.
+        On amount change: reverses old account balance, applies new.
+        On date change: recalculates MCD for both old and new month if they differ.
         """
         ftxn = self.get_object()
         if ftxn.type != 'actual':
@@ -317,9 +428,10 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         if 'amount' in request.data:
             new_amt = Decimal(str(request.data['amount']))
             if ftxn.payment_account:
+                # Reverse old amount, apply new amount
                 ftxn.payment_account.current_balance -= ftxn.amount
                 ftxn.payment_account.current_balance += new_amt
-                ftxn.payment_account.save(update_fields=['current_balance'])
+                ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
             ftxn.amount = new_amt
 
         if 'date' in request.data:
@@ -329,27 +441,32 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             acct_id = request.data['payment_account']
             if ftxn.payment_account:
                 ftxn.payment_account.current_balance -= ftxn.amount
-                ftxn.payment_account.save(update_fields=['current_balance'])
+                ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
             new_acct = PaymentAccount.objects.get(pk=acct_id) if acct_id else None
             if new_acct:
                 new_acct.current_balance += ftxn.amount
-                new_acct.save(update_fields=['current_balance'])
+                new_acct.save(update_fields=['current_balance', 'updated_at'])
             ftxn.payment_account = new_acct
 
         if 'notes' in request.data:
             ftxn.notes = request.data['notes']
 
         ftxn.save()
+
+        # Recalculate MCD for new date's month
         _recalculate_mcd(ftxn.contact, ftxn.date)
+        # If date changed to a different month, also recalculate old month
         if old_date.month != ftxn.date.month or old_date.year != ftxn.date.year:
             _recalculate_mcd(ftxn.contact, old_date)
 
-        return Response(FinancialTransactionSerializer(ftxn).data)
+        return Response(FinancialTransactionSerializer(ftxn, context={'request': request}).data)
 
     def destroy(self, request, *args, **kwargs):
         """
         Only actual transactions can be deleted directly.
-        Record txns are deleted via document deletion flow.
+        Record txns are deleted via document deletion flow only.
+        Contra txns should not be deleted directly.
+        Reverses PaymentAccount balance and recalculates MCD.
         """
         ftxn = self.get_object()
         if ftxn.type == 'record':
@@ -357,13 +474,18 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 {'error': 'Record transactions are managed via document deletion.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if ftxn.type == 'contra':
+            return Response(
+                {'error': 'Contra transactions are managed via transfer operations.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         date    = ftxn.date
         contact = ftxn.contact
 
-        if ftxn.type == 'actual' and ftxn.payment_account:
+        if ftxn.payment_account:
             ftxn.payment_account.current_balance -= ftxn.amount
-            ftxn.payment_account.save(update_fields=['current_balance'])
+            ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
 
         ftxn.delete()
         _recalculate_mcd(contact, date)
@@ -371,7 +493,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def link_document(self, request, pk=None):
+        """Allows user to manually link/unlink a document reference on a transaction."""
         ftxn             = self.get_object()
         ftxn.document_id = request.data.get('document')
-        ftxn.save(update_fields=['document'])
-        return Response(FinancialTransactionSerializer(ftxn).data)
+        ftxn.save(update_fields=['document', 'updated_at'])
+        return Response(FinancialTransactionSerializer(ftxn, context={'request': request}).data)

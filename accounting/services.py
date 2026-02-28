@@ -1,4 +1,3 @@
-# accounting/services.py
 from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
@@ -31,10 +30,12 @@ def _next_doc_id(doc_type):
 
 def _recalculate_mcd(contact, date):
     """
-    Recalculates MCD for all txns in the same month/year for a contact.
-    - Expense txns: MCD always forced to 0 (never affect contact CF).
-    - Contra txns: no contact, never reach here.
-    - All others: running cumulative sum within the month.
+    Recalculates MCD for all f.txns in the same month/year for a contact.
+    Per spec Part 11:
+    - expense f.txns → MCD forced to 0 (never affect contact CF)
+    - contra f.txns  → no contact, never reach here
+    - all others     → running cumulative sum within the month, ordered by date + created_at
+    Called after any f.txn create/edit/delete that affects a contact.
     """
     if not contact:
         return
@@ -64,6 +65,13 @@ def _create_ftxn(
     document=None, date=None, notes=None,
     force_mcd_zero=False,
 ):
+    """
+    Creates a FinancialTransaction and handles all side effects:
+    - Updates PaymentAccount.current_balance (for actual/contra with account)
+    - Recalculates MCD for the contact's month (unless force_mcd_zero)
+    force_mcd_zero=True is used for expense f.txns — account still updated,
+    but MCD stays 0 so contact CF is never affected.
+    """
     date = _parse_date(date)
     ftxn = FinancialTransaction.objects.create(
         type=type,
@@ -75,21 +83,28 @@ def _create_ftxn(
         notes=notes,
         monthly_cumulative_delta=Decimal('0'),
     )
+
     if force_mcd_zero:
-        # Expense: MCD stays 0, but account balance still updated
+        # Expense: MCD stays 0, account balance still updated
         if account:
             account.current_balance += amount
-            account.save(update_fields=['current_balance'])
+            account.save(update_fields=['current_balance', 'updated_at'])
         return ftxn
 
+    # Normal path: recalculate MCD, then update account balance
     _recalculate_mcd(contact, date)
     if account:
         account.current_balance += amount
-        account.save(update_fields=['current_balance'])
+        account.save(update_fields=['current_balance', 'updated_at'])
     return ftxn
 
 
 def _create_stxn(type, quantity, product, document=None, date=None, rate=None, notes=None):
+    """
+    Creates a StockTransaction.
+    For actual s.txns: updates product.current_stock immediately.
+    For record s.txns: current_stock is unchanged (moved later via Move Stock).
+    """
     from inventory.models import StockTransaction
     date = _parse_date(date)
     stxn = StockTransaction.objects.create(
@@ -103,7 +118,7 @@ def _create_stxn(type, quantity, product, document=None, date=None, rate=None, n
     )
     if type == 'actual':
         product.current_stock += quantity
-        product.save(update_fields=['current_stock'])
+        product.save(update_fields=['current_stock', 'updated_at'])
     return stxn
 
 
@@ -120,7 +135,11 @@ def _resolve_total(data):
 
 
 def _handle_stxns(doc, line_items, sign, settings, date):
-    """Creates record or actual s.txns for all line_items that have a product_id."""
+    """
+    Creates record or actual s.txns for all line_items that have a product_id.
+    product_id=null items are completely ignored — they never generate s.txns.
+    Per spec: "product_id is a plain integer snapshot (not a FK), null for manual/service items"
+    """
     from inventory.models import Product
     for item in line_items:
         pid = item.get('product_id')
@@ -137,15 +156,19 @@ def _handle_stxns(doc, line_items, sign, settings, date):
 
 # ─── Document Signs ────────────────────────────────────────────────────────────
 
-# f.txn record sign — positive = we owe them, negative = they owe us
+# f.txn record sign — per spec Part 2 sign convention:
+# + positive = we owe them (money coming IN to them / obligation on us)
+# − negative = they owe us
 FTXN_RECORD_SIGN = {
-    'bill':    Decimal('1'),   # we owe vendor
-    'invoice': Decimal('-1'),  # customer owes us
+    'bill':    Decimal('1'),   # we owe vendor (+ we owe them)
+    'invoice': Decimal('-1'),  # customer owes us (− they owe us)
     'cn':      Decimal('1'),   # we owe customer refund
     'dn':      Decimal('-1'),  # vendor owes us refund
 }
 
-# s.txn sign — positive = stock IN, negative = stock OUT
+# s.txn sign — per spec Part 2:
+# + positive = stock IN
+# − negative = stock OUT
 STXN_SIGN = {
     'bill':    Decimal('1'),   # stock IN from purchase
     'invoice': Decimal('-1'),  # stock OUT from sale
@@ -153,12 +176,12 @@ STXN_SIGN = {
     'dn':      Decimal('-1'),  # stock OUT from return of purchase
 }
 
-# Challan s.txn sign derives from its referenced document type
+# Challan s.txn sign derives from referenced document type
 CHALLAN_STXN_SIGN = {
-    'bill':    Decimal('1'),
-    'invoice': Decimal('-1'),
-    'cn':      Decimal('1'),
-    'dn':      Decimal('-1'),
+    'bill':    Decimal('1'),   # Bill → stock IN
+    'invoice': Decimal('-1'),  # Invoice → stock OUT
+    'cn':      Decimal('1'),   # CN → stock IN (return of sale)
+    'dn':      Decimal('-1'),  # DN → stock OUT (return of purchase)
 }
 
 # Doc types that generate zero f.txns and zero s.txns
@@ -195,8 +218,11 @@ def process_document_create(doc_type, data, contact=None):
         notes           = data.get('notes'),
     )
 
-    # ── PO / PI / Quotation — zero txns ───────────────────────────────────────
-    if doc_type in NO_TXN_TYPES:
+    # ── PO / PI / Quotation / Cash Vouchers — handled by send_receive flow ─────
+    # Cash vouchers are ONLY created via process_send_receive, never directly.
+    # Per spec: voucher doc is always created inside the Send/Receive flow.
+    NO_DIRECT_TXN_TYPES = NO_TXN_TYPES | {'cash_payment_voucher', 'cash_receipt_voucher'}
+    if doc_type in NO_DIRECT_TXN_TYPES:
         return doc
 
     # ── Challan — s.txn only, sign from reference doc type ────────────────────
@@ -206,6 +232,18 @@ def process_document_create(doc_type, data, contact=None):
             _handle_stxns(doc, line_items, CHALLAN_STXN_SIGN[ref.type], settings, date)
         return doc
 
+    # ── Expense — actual f.txn only, MCD forced to 0 ──────────────────────────
+    if doc_type == 'expense':
+        account_id = data.get('payment_account')
+        account    = PaymentAccount.objects.get(pk=account_id) if account_id else None
+        if total_amount and account:
+            _create_ftxn(
+                'actual', -Decimal(str(total_amount)),
+                contact, account, doc, date,
+                force_mcd_zero=True,
+            )
+        return doc
+
     # ── Financial txns — bill / invoice / cn / dn ─────────────────────────────
     if doc_type in FTXN_RECORD_SIGN and total_amount:
         record_amount = FTXN_RECORD_SIGN[doc_type] * Decimal(str(total_amount))
@@ -213,23 +251,22 @@ def process_document_create(doc_type, data, contact=None):
         account       = PaymentAccount.objects.get(pk=account_id) if account_id else None
 
         if settings.auto_transaction:
-            # Auto ON + account provided:
-            #   1. Silently create record (preserves MCD history + payment comparison)
-            #   2. Immediately create actual (full payment assumed)
-            # Auto ON + no account:
-            #   → No f.txn at all. User records payment later via record_payment action.
             if account:
                 _create_ftxn('record', record_amount, contact, None, doc, date)
                 _create_ftxn('actual', -record_amount, contact, account, doc, date)
+            else:
+                # Auto ON + no account → record only
+                _create_ftxn('record', record_amount, contact, None, doc, date)
         else:
-            # Auto OFF → record only. No account touched. User pays later.
+            # Auto OFF → record only
             _create_ftxn('record', record_amount, contact, None, doc, date)
 
-    # ── Stock txns — skipped entirely when challan mode is enabled ─────────────
+    # ── Stock txns ─────────────────────────────────────────────────────────────
     if doc_type in STXN_SIGN and not settings.enable_challan:
         _handle_stxns(doc, line_items, STXN_SIGN[doc_type], settings, date)
 
     return doc
+
 
 
 # ─── Send / Receive ────────────────────────────────────────────────────────────
@@ -238,11 +275,16 @@ def process_document_create(doc_type, data, contact=None):
 def process_send_receive(contact, data, direction):
     """
     Handles Send / Receive actions from a contact's ledger page.
+
     Flows:
-      - Plain send/receive → actual f.txn
-      - With interest      → interest record FIRST, then actual
-      - With expense flag  → expense doc + actual (MCD=0)
-      - With cash account + enable_vouchers → voucher doc created first
+      - Plain send/receive          → actual f.txn only
+      - With interest_lines         → interest doc + record f.txn (opposite sign), then actual
+      - With is_expense flag        → expense doc + actual f.txn (MCD=0)
+      - With cash + enable_vouchers → voucher doc created first, actual f.txn linked to it
+
+    Per spec Part 4:
+      Receiving (+) → interest record = −net_interest
+      Sending   (−) → interest record = +net_interest
     """
     settings       = Settings.get()
     amount_raw     = Decimal(str(data['amount']))
@@ -257,6 +299,7 @@ def process_send_receive(contact, data, direction):
     result         = {}
 
     # ── Expense flow ───────────────────────────────────────────────────────────
+    # Per spec: expense f.txn MCD=0, contact CF never affected
     if is_expense:
         expense_doc = Document.objects.create(
             type         = 'expense',
@@ -275,6 +318,7 @@ def process_send_receive(contact, data, direction):
         return result
 
     # ── Cash voucher doc created BEFORE any f.txn ─────────────────────────────
+    # Per spec: "Voucher document created first → then f.txn created."
     voucher_doc = None
     if settings.enable_vouchers and account and account.type == 'cash':
         v_type      = 'cash_payment_voucher' if direction == 'send' else 'cash_receipt_voucher'
@@ -287,20 +331,18 @@ def process_send_receive(contact, data, direction):
             date         = date,
         )
 
-    # ── Interest record FIRST ─────────────────────────────────────────────────
-    # Must be created before actual so it appears earlier in the ledger
-    # (lower created_at → correct MCD order)
+    # ── Interest record FIRST (before actual) ─────────────────────────────────
+    # Per spec Part 4: "Interest record sign is always the OPPOSITE of the main actual payment sign."
+    # Creating record first ensures lower created_at → correct MCD ordering.
     if interest_lines:
         net = sum(
             Decimal(str(l['amount'])) if l.get('type') == 'charge'
             else -Decimal(str(l['amount']))
             for l in interest_lines
         )
-        # Interest record sign = opposite of actual direction
-        # Receiving (+) → interest record (−) | Sending (−) → interest record (+)
-        interest_record_amount = net * (
-            Decimal('-1') if direction == 'receive' else Decimal('1')
-        )
+        # Receiving (+actual) → interest record = −net
+        # Sending   (−actual) → interest record = +net
+        interest_record_amount = -net if direction == 'receive' else net
         interest_doc = Document.objects.create(
             type         = 'interest',
             doc_id       = _next_doc_id('interest'),
@@ -308,7 +350,7 @@ def process_send_receive(contact, data, direction):
             line_items   = interest_lines,
             total_amount = abs(net),
             date         = date,
-            reference    = doc_ref,
+            reference    = doc_ref,  # inherits same reference as payment doc per spec
         )
         interest_ftxn = _create_ftxn(
             'record', interest_record_amount, contact, None, interest_doc, date,
@@ -317,7 +359,7 @@ def process_send_receive(contact, data, direction):
         result['interest_ftxn'] = interest_ftxn.pk
 
     # ── Main actual SECOND ────────────────────────────────────────────────────
-    main_ftxn      = _create_ftxn(
+    main_ftxn = _create_ftxn(
         'actual', actual_amount, contact, account,
         voucher_doc or doc_ref, date, data.get('notes'),
     )
@@ -331,7 +373,8 @@ def process_send_receive(contact, data, direction):
 def process_transfer(data):
     """
     Contra transfer between two payment accounts.
-    No contact. No document. Two contra f.txns.
+    Per spec B2: No contact. No document. Two contra f.txns.
+    contra f.txns never affect any contact → MCD = 0 (no contact to recalculate).
     """
     amount   = Decimal(str(data['amount']))
     date     = _parse_date(data.get('date'))
@@ -348,7 +391,8 @@ def process_transfer(data):
 def process_adjust_balance(account, data):
     """
     Actual f.txn with no contact and no document.
-    Used for bank interest credits, corrections etc.
+    Per spec B3: used for bank interest credits, corrections, etc.
+    No contact → no MCD recalculation needed.
     """
     amount = Decimal(str(data['amount']))
     date   = _parse_date(data.get('date'))
@@ -361,10 +405,12 @@ def process_adjust_balance(account, data):
 @transaction.atomic
 def process_move_stock(document, data):
     """
-    Creates actual s.txns for a document.
-    - Sign from document type (or challan's reference doc type).
-    - Overshoot protection: qty_to_move capped at remaining (record − actuals).
-    - Partial moves supported — remaining recalculated each call.
+    Creates actual s.txns for a document's pending record s.txns.
+    Per spec 6.1 / 6.2:
+    - Sign from document type (or challan's reference doc type)
+    - Overshoot protection: qty_to_move hard-capped at remaining (record − actuals)
+      Stock actual can NEVER exceed record quantity for a given document.
+    - Partial moves supported — remaining auto-recalculated each call
     """
     from inventory.models import StockTransaction, Product
 
@@ -393,7 +439,7 @@ def process_move_stock(document, data):
             )
         ))
         remaining   = record_qty - actual_qty
-        qty_to_move = min(requested_qty, remaining)
+        qty_to_move = min(requested_qty, remaining)  # overshoot cap
         if qty_to_move <= 0:
             continue
 
@@ -412,40 +458,59 @@ def process_move_stock(document, data):
 @transaction.atomic
 def process_document_delete(document, strategy):
     """
-    Three deletion strategies:
-      revert  → hard delete actuals, reverse account balance + stock
-      manual  → untether actuals from doc (standalone advance payment / stock entry)
-      orphan  → flag is_doc_deleted only, no reversal
-    Record txns are always hard deleted regardless of strategy.
+    Per spec Part 5 — EXACTLY 2 options, no third option exists:
+
+    Option 1 — 'revert':
+      - All record f.txns: hard deleted
+      - All actual f.txns: hard deleted + PaymentAccount.current_balance reversed
+      - All record s.txns: hard deleted
+      - All actual s.txns: hard deleted + Product.current_stock reversed
+      - Document: is_active = False
+      - MCD recalculated for affected contacts/months
+
+    Option 2 — 'manual':
+      - All record f.txns: hard deleted
+      - All actual f.txns: remain intact — FK document reference STAYS as-is
+        (system NEVER auto-nulls FK — is_active=False on doc drives ⚠️ UI warning)
+      - All record s.txns: hard deleted
+      - All actual s.txns: remain intact — same FK behavior
+      - Document: is_active = False
+
+    ⛔ CRITICAL: The system NEVER auto-nulls any FK reference on any transaction.
     """
     from inventory.models import StockTransaction
 
-    # Record f.txns always hard deleted
+    # ── Step 1: Always hard-delete all record f.txns ──────────────────────────
     document.transactions.filter(type='record').delete()
 
-    actual_ftxns = document.transactions.filter(type='actual')
-    actual_stxns = StockTransaction.objects.filter(document=document, type='actual')
+    actual_ftxns = list(document.transactions.filter(type='actual'))
+    actual_stxns = list(StockTransaction.objects.filter(document=document, type='actual'))
 
     if strategy == 'revert':
+        # Hard delete actuals + reverse all side effects
         for ftxn in actual_ftxns:
             if ftxn.payment_account:
                 ftxn.payment_account.current_balance -= ftxn.amount
-                ftxn.payment_account.save(update_fields=['current_balance'])
-            _recalculate_mcd(ftxn.contact, ftxn.date)
+                ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
+            contact = ftxn.contact
+            date    = ftxn.date
             ftxn.delete()
+            # Recalculate MCD after deletion so running sums are correct
+            _recalculate_mcd(contact, date)
+
         for stxn in actual_stxns:
             stxn.product.current_stock -= stxn.quantity
-            stxn.product.save(update_fields=['current_stock'])
+            stxn.product.save(update_fields=['current_stock', 'updated_at'])
             stxn.delete()
 
     elif strategy == 'manual':
-        actual_ftxns.update(document=None, is_doc_deleted=True)
-        actual_stxns.update(document=None, is_doc_deleted=True)
+        # Keep actual f.txns and s.txns completely intact — FK stays pointing to this doc
+        # Per spec: "FK document reference stays as-is. Since document.is_active = false,
+        # the UI renders a ⚠️ 'Document Deleted' warning badge."
+        # Do absolutely nothing to actuals — they stay as-is with their document FK.
+        pass
 
-    elif strategy == 'orphan':
-        actual_ftxns.update(is_doc_deleted=True)
-        actual_stxns.update(is_doc_deleted=True)
-
+    # ── Final: soft-delete the document ───────────────────────────────────────
     document.is_active = False
-    document.save(update_fields=['is_active'])
+    document.save(update_fields=['is_active', 'updated_at'])
     return {'status': 'deleted', 'strategy': strategy}

@@ -1,4 +1,3 @@
-# config/settings.py
 from pathlib import Path
 from dotenv import load_dotenv
 import os
@@ -116,7 +115,7 @@ CORS_ALLOWED_ORIGINS = os.getenv(
 ).split(',')
 CORS_ALLOW_CREDENTIALS = True
 
-# Weekly orphan cleanup — every Sunday at 2:00 AM
+# Daily orphan cleanup — every day at 2:00 AM  ← spec says daily, not weekly
 CRONJOBS = [
-    ('0 2 * * 0', 'upload.cron.cleanup_orphaned_uploads')
+    ('0 2 * * *', 'upload.cron.cleanup_orphaned_uploads'),
 ]
