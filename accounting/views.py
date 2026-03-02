@@ -1,5 +1,6 @@
 from decimal import Decimal
 from django.db import models as django_models
+from django.http import HttpResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -12,6 +13,7 @@ from .services import (
     _create_ftxn, _create_stxn, _next_doc_id,
     _parse_date, _recalculate_mcd,
     process_document_create, process_document_delete, process_move_stock,
+    generate_document_pdf, generate_transactions_pdf,
     STXN_SIGN, CHALLAN_STXN_SIGN,
 )
 from shared.models import Contact, PaymentAccount, Settings
@@ -46,7 +48,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
         return DocumentListSerializer if self.action == 'list' else DocumentSerializer
 
     def get_serializer_context(self):
-        # Pass request so attachment_urls_full can build absolute URLs
         return {'request': self.request}
 
     def create(self, request, *args, **kwargs):
@@ -62,9 +63,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
         doc        = process_document_create(doc_type, request.data, contact)
         return Response(
             DocumentSerializer(doc, context={'request': request}).data,
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
-
 
     def update(self, request, *args, **kwargs):
         """
@@ -113,22 +113,18 @@ class DocumentViewSet(viewsets.ModelViewSet):
         notes          = request.data.get('notes')
         interest_lines = request.data.get('interest_lines', [])
 
-        # Determine direction from document type
-        # Outgoing (we pay): bill, dn, cash_payment_voucher → actual is negative
-        # Incoming (we receive): invoice, cn, cash_receipt_voucher → actual is positive
-        outgoing      = {'bill', 'dn', 'cash_payment_voucher'}
-        direction     = 'send' if doc.type in outgoing else 'receive'
-        actual_amt    = -amount_raw if direction == 'send' else amount_raw
-        result        = {}
+        outgoing   = {'bill', 'dn', 'cash_payment_voucher'}
+        direction  = 'send' if doc.type in outgoing else 'receive'
+        actual_amt = -amount_raw if direction == 'send' else amount_raw
+        result     = {}
 
-        # ── Interest record FIRST (same pattern as process_send_receive) ──────
+        # ── Interest record FIRST ──────────────────────────────────────────────
         if interest_lines:
             net = sum(
                 Decimal(str(l['amount'])) if l.get('type') == 'charge'
                 else -Decimal(str(l['amount']))
                 for l in interest_lines
             )
-            # Per spec Part 4: interest record = OPPOSITE of actual
             interest_record_amount = -net if direction == 'receive' else net
             interest_doc = Document.objects.create(
                 type         = 'interest',
@@ -137,7 +133,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 line_items   = interest_lines,
                 total_amount = abs(net),
                 date         = date,
-                reference    = doc,  # interest doc inherits reference to this document
+                reference    = doc,
             )
             int_ftxn = _create_ftxn(
                 'record', interest_record_amount,
@@ -146,8 +142,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
             result['interest_doc']  = interest_doc.pk
             result['interest_ftxn'] = int_ftxn.pk
 
-        # ── Main actual SECOND ────────────────────────────────────────────────
-        ftxn = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes)
+        # ── Main actual SECOND ─────────────────────────────────────────────────
+        ftxn           = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes)
         result['ftxn'] = ftxn.pk
         return Response(result, status=status.HTTP_201_CREATED)
 
@@ -172,8 +168,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def stock_preview(self, request, pk=None):
         """
-        Per spec 6.1: Stock Preview Panel shows only product_id items.
-        Manual/service items (product_id=null) are completely hidden.
+        Per spec 6.1: Stock Preview Panel — only product_id items shown.
+        Manual/service items (product_id=null) completely hidden.
         """
         doc     = self.get_object()
         records = StockTransaction.objects.filter(
@@ -205,7 +201,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
         Guard: skips products that already have s.txns on this doc (idempotent).
         """
         doc        = self.get_object()
-        settings   = Settings.get()
         line_items = request.data.get('line_items', [])
 
         doc.line_items = line_items
@@ -226,21 +221,18 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 product = Product.objects.get(pk=pid)
             except Product.DoesNotExist:
                 continue
-            # Guard: skip if s.txns already exist for this product on this doc
             if StockTransaction.objects.filter(document=doc, product=product).exists():
                 continue
             qty = sign * Decimal(str(item.get('quantity', 0)))
-            # add_details always creates record s.txns (user moves stock later)
-            # Per spec G3: "silently generates record s.txns... making Move Stock button appear"
             _create_stxn('record', qty, product, doc, doc.date, item.get('rate'))
 
         return Response(DocumentSerializer(doc, context={'request': request}).data)
 
-    # ── Get Reference Data (for auto-copy on new document creation) ────────────
+    # ── Reference Data ─────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
     def reference_data(self, request, pk=None):
         """
-        Returns the fields that get auto-copied when this document is selected as reference.
+        Returns fields that get auto-copied when this doc is selected as reference.
         Per spec Part 2: line_items, charges, taxes, consignee, discount, payment_terms, notes.
         contact is NOT returned — user selects independently.
         """
@@ -281,7 +273,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         Quick Action → Interest (Path C).
         Requires enable_interest = True.
         Creates Interest Document + record f.txn only. No actual. No s.txn.
-        Per spec: Charge → − (they owe us more). Credit → + (we owe them / waiving debt).
+        Charge → − (they owe us more). Credit → + (we owe them / waiving debt).
         """
         settings = Settings.get()
         if not settings.enable_interest:
@@ -295,9 +287,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         interest_lines = request.data.get('line_items', [])
         toggle         = request.data.get('toggle', 'charge')  # 'charge' or 'credit'
 
-        net = sum(Decimal(str(l['amount'])) for l in interest_lines)
-        # Charge → − (they owe us more — negative per sign convention)
-        # Credit → + (we owe them — positive per sign convention)
+        net           = sum(Decimal(str(l['amount'])) for l in interest_lines)
         record_amount = -net if toggle == 'charge' else net
 
         interest_doc = Document.objects.create(
@@ -314,6 +304,29 @@ class DocumentViewSet(viewsets.ModelViewSet):
             'ftxn':         ftxn.pk,
         }, status=status.HTTP_201_CREATED)
 
+    # ── Print Document PDF ─────────────────────────────────────────────────────
+    @action(detail=True, methods=['get'])
+    def print(self, request, pk=None):
+        """
+        GET /api/documents/{id}/print/
+        Generates document PDF on-the-fly, cached 10 min per spec Part 7.
+        Returns application/pdf with Content-Disposition: attachment.
+        File naming: {DOC_TYPE}_{doc_id}_{date}.pdf
+        """
+        doc = self.get_object()
+        try:
+            pdf_bytes, filename = generate_document_pdf(doc, request)
+        except Exception as e:
+            return Response(
+                {'error': f'PDF generation failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
+
+# ─── _sync_record_stxns (module-level helper) ─────────────────────────────────
 
 def _sync_record_stxns(doc, new_line_items):
     """
@@ -328,9 +341,6 @@ def _sync_record_stxns(doc, new_line_items):
     else:
         sign = STXN_SIGN.get(doc.type, Decimal('1'))
 
-    settings = Settings.get()
-
-    # Build map of product_id → qty from new line_items
     new_map = {}
     for item in new_line_items:
         pid = item.get('product_id')
@@ -373,12 +383,14 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         return {'request': self.request}
 
     def get_queryset(self):
-        qs       = FinancialTransaction.objects.select_related('document', 'contact', 'payment_account').all()
+        qs       = FinancialTransaction.objects.select_related(
+            'document', 'contact', 'payment_account'
+        ).all()
         params   = self.request.query_params
         settings = Settings.get()
 
-        # Auto-mode ON → hide record txns from normal listing (user never sees them)
-        # Pass ?include_records=true to see them (admin/debug use)
+        # Auto-mode ON → hide record txns from normal listing
+        # Pass ?include_records=true to see them (admin/debug)
         if settings.auto_transaction and not params.get('include_records'):
             qs = qs.exclude(type='record')
 
@@ -395,16 +407,14 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         if params.get('date_to'):
             qs = qs.filter(date__lte=params['date_to'])
 
-        # Derived filter — no DB field, computed from document.is_active
-        # ?is_document_deleted=true  → txns where document exists but is soft-deleted
-        # ?is_document_deleted=false → txns where document is active or null
         is_doc_deleted = params.get('is_document_deleted')
         if is_doc_deleted is not None:
             if is_doc_deleted.lower() == 'true':
                 qs = qs.filter(document__isnull=False, document__is_active=False)
             else:
                 qs = qs.filter(
-                    django_models.Q(document__isnull=True) | django_models.Q(document__is_active=True)
+                    django_models.Q(document__isnull=True) |
+                    django_models.Q(document__is_active=True)
                 )
 
         return qs
@@ -412,8 +422,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         """
         Only actual type transactions can be edited directly.
-        Record txns are managed via document edit → _sync_record_stxns.
-        Contra txns are managed via transfer endpoint.
+        Record txns → managed via document edit (_sync_record_stxns).
+        Contra txns → managed via transfer endpoint.
         On amount change: reverses old account balance, applies new.
         On date change: recalculates MCD for both old and new month if they differ.
         """
@@ -428,7 +438,6 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         if 'amount' in request.data:
             new_amt = Decimal(str(request.data['amount']))
             if ftxn.payment_account:
-                # Reverse old amount, apply new amount
                 ftxn.payment_account.current_balance -= ftxn.amount
                 ftxn.payment_account.current_balance += new_amt
                 ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
@@ -453,9 +462,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
 
         ftxn.save()
 
-        # Recalculate MCD for new date's month
         _recalculate_mcd(ftxn.contact, ftxn.date)
-        # If date changed to a different month, also recalculate old month
         if old_date.month != ftxn.date.month or old_date.year != ftxn.date.year:
             _recalculate_mcd(ftxn.contact, old_date)
 
@@ -464,8 +471,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         """
         Only actual transactions can be deleted directly.
-        Record txns are deleted via document deletion flow only.
-        Contra txns should not be deleted directly.
+        Record txns → deleted via document deletion flow only.
+        Contra txns → managed via transfer operations.
         Reverses PaymentAccount balance and recalculates MCD.
         """
         ftxn = self.get_object()
@@ -498,3 +505,40 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         ftxn.document_id = request.data.get('document')
         ftxn.save(update_fields=['document', 'updated_at'])
         return Response(FinancialTransactionSerializer(ftxn, context={'request': request}).data)
+
+    # ── Print Transactions PDF ─────────────────────────────────────────────────
+    @action(detail=False, methods=['get'])
+    def print(self, request):
+        """
+        GET /api/transactions/print/
+        Supports all same filters as list view:
+            ?contact={id}        → prints as Ledger for that contact (with running CF)
+            ?date_from / ?date_to
+            ?account={id}
+            ?type=actual|record|contra
+            ?document={id}
+        Returns application/pdf with Content-Disposition: attachment.
+        Per spec Part 7: Print button on ledger & list view.
+        """
+        qs = self.filter_queryset(self.get_queryset())
+
+        # Resolve contact for ledger mode
+        contact = None
+        contact_id = request.query_params.get('contact')
+        if contact_id:
+            try:
+                contact = Contact.objects.get(pk=contact_id)
+            except Contact.DoesNotExist:
+                pass
+
+        try:
+            pdf_bytes, filename = generate_transactions_pdf(qs, contact, request)
+        except Exception as e:
+            return Response(
+                {'error': f'PDF generation failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response

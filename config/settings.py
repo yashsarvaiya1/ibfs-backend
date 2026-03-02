@@ -119,3 +119,20 @@ CORS_ALLOW_CREDENTIALS = True
 CRONJOBS = [
     ('0 2 * * *', 'upload.cron.cleanup_orphaned_uploads'),
 ]
+
+CACHES = {
+    'default': {
+        'BACKEND': os.getenv(
+            'CACHE_BACKEND',
+            'django.core.cache.backends.locmem.LocMemCache',
+        ),
+        'LOCATION': os.getenv('CACHE_LOCATION', 'ibfs-cache'),
+    }
+}
+
+# Playwright PDF — no WeasyPrint deps, works everywhere
+PLAYWRIGHT_PDF_TIMEOUT = int(os.getenv('PLAYWRIGHT_PDF_TIMEOUT', '30000'))  # 30s
+PLAYWRIGHT_PDF_FORMAT = os.getenv('PLAYWRIGHT_PDF_FORMAT', 'A4')
+
+# Media base URL for PDFs (same as before)
+MEDIA_BASE_URL = os.getenv('MEDIA_BASE_URL', 'http://localhost:8000')

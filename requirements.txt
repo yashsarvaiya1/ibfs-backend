@@ -7,3 +7,4 @@ gunicorn
 Pillow
 django-extensions
 django-crontab
+playwright

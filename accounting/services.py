@@ -4,9 +4,175 @@ from django.utils import timezone
 from datetime import date as date_type
 from .models import Document, FinancialTransaction
 from shared.models import PaymentAccount, Settings
+from django.template.loader import render_to_string
+from django.core.cache import cache
+from shared.models import Settings as AppSettings
+import io
+from django.conf import settings
+from playwright.sync_api import sync_playwright
+from shared.models import Settings, Contact  
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _build_media_url(request, relative_path):
+    """Convert relative media path to absolute URL."""
+    if not relative_path:
+        return None
+    if request:
+        return request.build_absolute_uri(f"/media/{relative_path}")
+    return f"{settings.MEDIA_BASE_URL.rstrip('/')}/media/{relative_path}"
+
+
+def _contact_display(contact):
+    if not contact:
+        return None
+    return {
+        'name':    contact.company_name or contact.contact_name,
+        'phone':   contact.phone,
+        'gstin':   contact.gstin,
+        'address': contact.address,
+    }
+
+def generate_document_pdf(document, request=None):
+    """
+    Generates a PDF for a document on-the-fly using Playwright.
+    Cached for 10 minutes per spec Part 7.
+    Returns (pdf_bytes: bytes, filename: str).
+    Cache key: pdf_{document.pk}_{document.updated_at.timestamp()}
+    """
+    cache_key = f"pdf_{document.pk}_{document.updated_at.timestamp()}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    settings = Settings.get()
+
+    line_items = document.line_items or []
+    charges = document.charges or []
+    taxes = document.taxes or []
+
+    subtotal = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
+    charges_sum = sum(Decimal(str(c.get('amount', 0))) for c in charges)
+    discount = document.discount or Decimal('0')
+    taxable_base = subtotal + charges_sum - discount
+    tax_breakdown = []
+    tax_total = Decimal('0')
+    for tax in taxes:
+        pct = Decimal(str(tax.get('percentage', 0)))
+        amt = taxable_base * pct / 100
+        tax_total += amt
+        tax_breakdown.append({
+            'name':       tax.get('name', ''),
+            'percentage': str(pct),
+            'amount':     str(amt.quantize(Decimal('0.01'))),
+        })
+    grand_total = taxable_base + tax_total
+
+    context = {
+        'document':      document,
+        'settings':      settings,
+        'header_image':  _build_media_url(request, settings.header_image),
+        'sign_image':    _build_media_url(request, settings.sign_image),
+        'contact':       _contact_display(document.contact),
+        'consignee':     _contact_display(document.consignee),
+        'line_items':    line_items,
+        'charges':       charges,
+        'discount':      str(document.discount),
+        'taxes':         tax_breakdown,
+        'tax_total':     str(tax_total.quantize(Decimal('0.01'))),
+        'grand_total':   str(grand_total.quantize(Decimal('0.01'))),
+        'doc_type_label': document.get_type_display(),
+    }
+
+    html_string = render_to_string('accounting/document_print.html', context)
+
+    # Playwright PDF generation
+    pdf_bytes = _render_playwright_pdf(html_string, request=request)
+    
+    filename = f"{document.type.upper()}_{document.doc_id}_{document.date}.pdf"
+    result = (pdf_bytes, filename)
+
+    cache.set(cache_key, result, timeout=600)
+    return result
+
+def generate_transactions_pdf(transactions, contact=None, request=None):
+    """
+    Generates a PDF report of financial transactions.
+    Used by:
+        - GET /api/transactions/print/                    → full list (no contact)
+        - GET /api/transactions/print/?contact={id}      → ledger view (with running CF)
+    Returns (pdf_bytes: bytes, filename: str).
+    No caching here — queryset is dynamic/filtered.
+    """
+    settings = Settings.get()
+
+    # Build rows — compute running CF if ledger mode (contact-specific)
+    rows = []
+    running_cf = contact.opening_balance if contact else None
+
+    for txn in transactions:
+        row = {
+            'date':     txn.date,
+            'type':     txn.get_type_display(),
+            'doc_id':   txn.document.doc_id if txn.document else '—',
+            'doc_type': txn.document.get_type_display() if txn.document else '—',
+            'notes':    txn.notes or '—',
+            'amount':   str(txn.amount),
+            'account':  str(txn.payment_account) if txn.payment_account else '—',
+        }
+
+        if running_cf is not None:
+            running_cf += txn.amount
+            row['running_cf'] = str(running_cf.quantize(Decimal('0.01')))
+
+        rows.append(row)
+
+    context = {
+        'settings':      settings,
+        'header_image':  _build_media_url(request, settings.header_image),
+        'contact':       contact,
+        'transactions':  rows,
+        'is_ledger':     contact is not None,
+        'report_title': (
+            f"Ledger — {contact.company_name or contact.contact_name}"
+            if contact else "Financial Transactions"
+        ),
+    }
+
+    html_string = render_to_string('accounting/transactions_print.html', context)
+
+    # Playwright PDF generation
+    pdf_bytes = _render_playwright_pdf(html_string, request=request)
+    
+    if contact:
+        safe_name = (contact.company_name or contact.contact_name).replace(' ', '_')
+        filename = f"Ledger_{safe_name}_{timezone.now().date()}.pdf"
+    else:
+        filename = f"Transactions_{timezone.now().date()}.pdf"
+
+    return (pdf_bytes, filename)
+
+
+def _render_playwright_pdf(html_string, request=None):
+    """Internal: Render HTML to PDF using Playwright."""
+    from playwright.sync_api import sync_playwright
+    
+    base_url = request.build_absolute_uri('/') if request else settings.MEDIA_BASE_URL.rstrip('/')
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(html_string, wait_until='networkidle')
+        
+        pdf_bytes = page.pdf(
+            format=settings.PLAYWRIGHT_PDF_FORMAT,
+            print_background=True,
+            prefer_css_page_size=True
+        )
+        browser.close()
+    
+    return pdf_bytes
 
 def _parse_date(val):
     if not val:
@@ -85,7 +251,6 @@ def _create_ftxn(
     )
 
     if force_mcd_zero:
-        # Expense: MCD stays 0, account balance still updated
         if account:
             account.current_balance += amount
             account.save(update_fields=['current_balance', 'updated_at'])
@@ -137,7 +302,7 @@ def _resolve_total(data):
 def _handle_stxns(doc, line_items, sign, settings, date):
     """
     Creates record or actual s.txns for all line_items that have a product_id.
-    product_id=null items are completely ignored — they never generate s.txns.
+    product_id=null items are completely ignored.
     Per spec: "product_id is a plain integer snapshot (not a FK), null for manual/service items"
     """
     from inventory.models import Product
@@ -156,35 +321,27 @@ def _handle_stxns(doc, line_items, sign, settings, date):
 
 # ─── Document Signs ────────────────────────────────────────────────────────────
 
-# f.txn record sign — per spec Part 2 sign convention:
-# + positive = we owe them (money coming IN to them / obligation on us)
-# − negative = they owe us
 FTXN_RECORD_SIGN = {
-    'bill':    Decimal('1'),   # we owe vendor (+ we owe them)
-    'invoice': Decimal('-1'),  # customer owes us (− they owe us)
-    'cn':      Decimal('1'),   # we owe customer refund
-    'dn':      Decimal('-1'),  # vendor owes us refund
+    'bill':    Decimal('1'),
+    'invoice': Decimal('-1'),
+    'cn':      Decimal('1'),
+    'dn':      Decimal('-1'),
 }
 
-# s.txn sign — per spec Part 2:
-# + positive = stock IN
-# − negative = stock OUT
 STXN_SIGN = {
-    'bill':    Decimal('1'),   # stock IN from purchase
-    'invoice': Decimal('-1'),  # stock OUT from sale
-    'cn':      Decimal('1'),   # stock IN from return of sale
-    'dn':      Decimal('-1'),  # stock OUT from return of purchase
+    'bill':    Decimal('1'),
+    'invoice': Decimal('-1'),
+    'cn':      Decimal('1'),
+    'dn':      Decimal('-1'),
 }
 
-# Challan s.txn sign derives from referenced document type
 CHALLAN_STXN_SIGN = {
-    'bill':    Decimal('1'),   # Bill → stock IN
-    'invoice': Decimal('-1'),  # Invoice → stock OUT
-    'cn':      Decimal('1'),   # CN → stock IN (return of sale)
-    'dn':      Decimal('-1'),  # DN → stock OUT (return of purchase)
+    'bill':    Decimal('1'),
+    'invoice': Decimal('-1'),
+    'cn':      Decimal('1'),
+    'dn':      Decimal('-1'),
 }
 
-# Doc types that generate zero f.txns and zero s.txns
 NO_TXN_TYPES = {'po', 'pi', 'quotation'}
 
 
@@ -218,21 +375,16 @@ def process_document_create(doc_type, data, contact=None):
         notes           = data.get('notes'),
     )
 
-    # ── PO / PI / Quotation / Cash Vouchers — handled by send_receive flow ─────
-    # Cash vouchers are ONLY created via process_send_receive, never directly.
-    # Per spec: voucher doc is always created inside the Send/Receive flow.
     NO_DIRECT_TXN_TYPES = NO_TXN_TYPES | {'cash_payment_voucher', 'cash_receipt_voucher'}
     if doc_type in NO_DIRECT_TXN_TYPES:
         return doc
 
-    # ── Challan — s.txn only, sign from reference doc type ────────────────────
     if doc_type == 'challan':
         ref = doc.reference
         if ref and ref.type in CHALLAN_STXN_SIGN:
             _handle_stxns(doc, line_items, CHALLAN_STXN_SIGN[ref.type], settings, date)
         return doc
 
-    # ── Expense — actual f.txn only, MCD forced to 0 ──────────────────────────
     if doc_type == 'expense':
         account_id = data.get('payment_account')
         account    = PaymentAccount.objects.get(pk=account_id) if account_id else None
@@ -244,7 +396,6 @@ def process_document_create(doc_type, data, contact=None):
             )
         return doc
 
-    # ── Financial txns — bill / invoice / cn / dn ─────────────────────────────
     if doc_type in FTXN_RECORD_SIGN and total_amount:
         record_amount = FTXN_RECORD_SIGN[doc_type] * Decimal(str(total_amount))
         account_id    = data.get('payment_account')
@@ -255,18 +406,14 @@ def process_document_create(doc_type, data, contact=None):
                 _create_ftxn('record', record_amount, contact, None, doc, date)
                 _create_ftxn('actual', -record_amount, contact, account, doc, date)
             else:
-                # Auto ON + no account → record only
                 _create_ftxn('record', record_amount, contact, None, doc, date)
         else:
-            # Auto OFF → record only
             _create_ftxn('record', record_amount, contact, None, doc, date)
 
-    # ── Stock txns ─────────────────────────────────────────────────────────────
     if doc_type in STXN_SIGN and not settings.enable_challan:
         _handle_stxns(doc, line_items, STXN_SIGN[doc_type], settings, date)
 
     return doc
-
 
 
 # ─── Send / Receive ────────────────────────────────────────────────────────────
@@ -275,13 +422,11 @@ def process_document_create(doc_type, data, contact=None):
 def process_send_receive(contact, data, direction):
     """
     Handles Send / Receive actions from a contact's ledger page.
-
     Flows:
       - Plain send/receive          → actual f.txn only
       - With interest_lines         → interest doc + record f.txn (opposite sign), then actual
       - With is_expense flag        → expense doc + actual f.txn (MCD=0)
       - With cash + enable_vouchers → voucher doc created first, actual f.txn linked to it
-
     Per spec Part 4:
       Receiving (+) → interest record = −net_interest
       Sending   (−) → interest record = +net_interest
@@ -298,8 +443,6 @@ def process_send_receive(contact, data, direction):
     interest_lines = data.get('interest_lines', [])
     result         = {}
 
-    # ── Expense flow ───────────────────────────────────────────────────────────
-    # Per spec: expense f.txn MCD=0, contact CF never affected
     if is_expense:
         expense_doc = Document.objects.create(
             type         = 'expense',
@@ -317,8 +460,6 @@ def process_send_receive(contact, data, direction):
         result['ftxn']        = ftxn.pk
         return result
 
-    # ── Cash voucher doc created BEFORE any f.txn ─────────────────────────────
-    # Per spec: "Voucher document created first → then f.txn created."
     voucher_doc = None
     if settings.enable_vouchers and account and account.type == 'cash':
         v_type      = 'cash_payment_voucher' if direction == 'send' else 'cash_receipt_voucher'
@@ -331,17 +472,12 @@ def process_send_receive(contact, data, direction):
             date         = date,
         )
 
-    # ── Interest record FIRST (before actual) ─────────────────────────────────
-    # Per spec Part 4: "Interest record sign is always the OPPOSITE of the main actual payment sign."
-    # Creating record first ensures lower created_at → correct MCD ordering.
     if interest_lines:
         net = sum(
             Decimal(str(l['amount'])) if l.get('type') == 'charge'
             else -Decimal(str(l['amount']))
             for l in interest_lines
         )
-        # Receiving (+actual) → interest record = −net
-        # Sending   (−actual) → interest record = +net
         interest_record_amount = -net if direction == 'receive' else net
         interest_doc = Document.objects.create(
             type         = 'interest',
@@ -350,7 +486,7 @@ def process_send_receive(contact, data, direction):
             line_items   = interest_lines,
             total_amount = abs(net),
             date         = date,
-            reference    = doc_ref,  # inherits same reference as payment doc per spec
+            reference    = doc_ref,
         )
         interest_ftxn = _create_ftxn(
             'record', interest_record_amount, contact, None, interest_doc, date,
@@ -358,8 +494,7 @@ def process_send_receive(contact, data, direction):
         result['interest_doc']  = interest_doc.pk
         result['interest_ftxn'] = interest_ftxn.pk
 
-    # ── Main actual SECOND ────────────────────────────────────────────────────
-    main_ftxn = _create_ftxn(
+    main_ftxn      = _create_ftxn(
         'actual', actual_amount, contact, account,
         voucher_doc or doc_ref, date, data.get('notes'),
     )
@@ -374,7 +509,6 @@ def process_transfer(data):
     """
     Contra transfer between two payment accounts.
     Per spec B2: No contact. No document. Two contra f.txns.
-    contra f.txns never affect any contact → MCD = 0 (no contact to recalculate).
     """
     amount   = Decimal(str(data['amount']))
     date     = _parse_date(data.get('date'))
@@ -391,7 +525,7 @@ def process_transfer(data):
 def process_adjust_balance(account, data):
     """
     Actual f.txn with no contact and no document.
-    Per spec B3: used for bank interest credits, corrections, etc.
+    Per spec B3: bank interest credits, corrections, etc.
     No contact → no MCD recalculation needed.
     """
     amount = Decimal(str(data['amount']))
@@ -409,8 +543,7 @@ def process_move_stock(document, data):
     Per spec 6.1 / 6.2:
     - Sign from document type (or challan's reference doc type)
     - Overshoot protection: qty_to_move hard-capped at remaining (record − actuals)
-      Stock actual can NEVER exceed record quantity for a given document.
-    - Partial moves supported — remaining auto-recalculated each call
+    - Partial moves supported
     """
     from inventory.models import StockTransaction, Product
 
@@ -439,7 +572,7 @@ def process_move_stock(document, data):
             )
         ))
         remaining   = record_qty - actual_qty
-        qty_to_move = min(requested_qty, remaining)  # overshoot cap
+        qty_to_move = min(requested_qty, remaining)
         if qty_to_move <= 0:
             continue
 
@@ -458,36 +591,32 @@ def process_move_stock(document, data):
 @transaction.atomic
 def process_document_delete(document, strategy):
     """
-    Per spec Part 5 — EXACTLY 2 options, no third option exists:
+    Per spec Part 5 — EXACTLY 2 options:
 
-    Option 1 — 'revert':
+    'revert':
       - All record f.txns: hard deleted
       - All actual f.txns: hard deleted + PaymentAccount.current_balance reversed
       - All record s.txns: hard deleted
       - All actual s.txns: hard deleted + Product.current_stock reversed
       - Document: is_active = False
-      - MCD recalculated for affected contacts/months
 
-    Option 2 — 'manual':
+    'manual':
       - All record f.txns: hard deleted
-      - All actual f.txns: remain intact — FK document reference STAYS as-is
-        (system NEVER auto-nulls FK — is_active=False on doc drives ⚠️ UI warning)
+      - All actual f.txns: remain intact — FK stays, is_active=False drives UI ⚠️ badge
       - All record s.txns: hard deleted
-      - All actual s.txns: remain intact — same FK behavior
+      - All actual s.txns: remain intact
       - Document: is_active = False
 
-    ⛔ CRITICAL: The system NEVER auto-nulls any FK reference on any transaction.
+    CRITICAL: System NEVER auto-nulls any FK reference on any transaction.
     """
     from inventory.models import StockTransaction
 
-    # ── Step 1: Always hard-delete all record f.txns ──────────────────────────
     document.transactions.filter(type='record').delete()
 
     actual_ftxns = list(document.transactions.filter(type='actual'))
     actual_stxns = list(StockTransaction.objects.filter(document=document, type='actual'))
 
     if strategy == 'revert':
-        # Hard delete actuals + reverse all side effects
         for ftxn in actual_ftxns:
             if ftxn.payment_account:
                 ftxn.payment_account.current_balance -= ftxn.amount
@@ -495,7 +624,6 @@ def process_document_delete(document, strategy):
             contact = ftxn.contact
             date    = ftxn.date
             ftxn.delete()
-            # Recalculate MCD after deletion so running sums are correct
             _recalculate_mcd(contact, date)
 
         for stxn in actual_stxns:
@@ -504,13 +632,163 @@ def process_document_delete(document, strategy):
             stxn.delete()
 
     elif strategy == 'manual':
-        # Keep actual f.txns and s.txns completely intact — FK stays pointing to this doc
-        # Per spec: "FK document reference stays as-is. Since document.is_active = false,
-        # the UI renders a ⚠️ 'Document Deleted' warning badge."
-        # Do absolutely nothing to actuals — they stay as-is with their document FK.
-        pass
+        pass  # Actuals stay intact — FK stays — UI derives ⚠️ badge from is_active=False
 
-    # ── Final: soft-delete the document ───────────────────────────────────────
     document.is_active = False
     document.save(update_fields=['is_active', 'updated_at'])
     return {'status': 'deleted', 'strategy': strategy}
+
+
+# # ─── Generate Document PDF ─────────────────────────────────────────────────────
+
+# def generate_document_pdf(document, request=None):
+#     """
+#     Generates a PDF for a document on-the-fly using WeasyPrint.
+#     Cached for 10 minutes per spec Part 7.
+#     Returns (pdf_bytes: bytes, filename: str).
+#     Cache key: pdf_{document.pk}_{document.updated_at.timestamp()}
+#     updated_at in key means cache auto-invalidates on document edit.
+#     """
+#     import weasyprint
+
+#     cache_key = f"pdf_{document.pk}_{document.updated_at.timestamp()}"
+#     cached    = cache.get(cache_key)
+#     if cached:
+#         return cached
+
+#     settings = AppSettings.get()
+
+#     def _media_url(relative_path):
+#         if not relative_path:
+#             return None
+#         if request:
+#             return request.build_absolute_uri(f"/media/{relative_path}")
+#         return f"/media/{relative_path}"
+
+#     def _contact_display(contact):
+#         if not contact:
+#             return None
+#         return {
+#             'name':    contact.company_name or contact.contact_name,
+#             'phone':   contact.phone,
+#             'gstin':   contact.gstin,
+#             'address': contact.address,
+#         }
+
+#     line_items   = document.line_items or []
+#     charges      = document.charges or []
+#     taxes        = document.taxes or []
+#     subtotal     = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
+#     charges_sum  = sum(Decimal(str(c.get('amount', 0))) for c in charges)
+#     discount     = document.discount or Decimal('0')
+#     taxable_base = subtotal + charges_sum - discount
+#     tax_breakdown = []
+#     tax_total    = Decimal('0')
+#     for tax in taxes:
+#         pct = Decimal(str(tax.get('percentage', 0)))
+#         amt = taxable_base * pct / 100
+#         tax_total += amt
+#         tax_breakdown.append({
+#             'name':       tax.get('name', ''),
+#             'percentage': str(pct),
+#             'amount':     str(amt.quantize(Decimal('0.01'))),
+#         })
+#     grand_total = taxable_base + tax_total
+
+#     context = {
+#         'document':       document,
+#         'settings':       settings,
+#         'header_image':   _media_url(settings.header_image),
+#         'sign_image':     _media_url(settings.sign_image),
+#         'contact':        _contact_display(document.contact),
+#         'consignee':      _contact_display(document.consignee),
+#         'line_items':     line_items,
+#         'charges':        charges,
+#         'discount':       str(document.discount),
+#         'taxes':          tax_breakdown,
+#         'tax_total':      str(tax_total.quantize(Decimal('0.01'))),
+#         'grand_total':    str(grand_total.quantize(Decimal('0.01'))),
+#         'doc_type_label': document.get_type_display(),
+#     }
+
+#     html_string = render_to_string('accounting/document_print.html', context)
+#     pdf_bytes   = weasyprint.HTML(
+#         string=html_string,
+#         base_url=request.build_absolute_uri('/') if request else '/',
+#     ).write_pdf()
+
+#     filename = f"{document.type.upper()}_{document.doc_id}_{document.date}.pdf"
+#     result   = (pdf_bytes, filename)
+
+#     cache.set(cache_key, result, timeout=600)
+#     return result
+
+
+# # ─── Generate Transactions PDF ─────────────────────────────────────────────────
+
+# def generate_transactions_pdf(transactions, contact=None, request=None):
+#     """
+#     Generates a PDF report of financial transactions.
+#     Used by:
+#       - GET /api/transactions/print/                    → full list (no contact)
+#       - GET /api/transactions/print/?contact={id}       → ledger view (with running CF)
+#     Returns (pdf_bytes: bytes, filename: str).
+#     No caching here — queryset is dynamic/filtered.
+#     """
+#     import weasyprint
+
+#     settings = AppSettings.get()
+
+#     def _media_url(relative_path):
+#         if not relative_path:
+#             return None
+#         if request:
+#             return request.build_absolute_uri(f"/media/{relative_path}")
+#         return f"/media/{relative_path}"
+
+#     # Build rows — compute running CF if ledger mode (contact-specific)
+#     rows        = []
+#     running_cf  = contact.opening_balance if contact else None
+
+#     for txn in transactions:
+#         row = {
+#             'date':     txn.date,
+#             'type':     txn.get_type_display(),
+#             'doc_id':   txn.document.doc_id if txn.document else '—',
+#             'doc_type': txn.document.get_type_display() if txn.document else '—',
+#             'notes':    txn.notes or '—',
+#             'amount':   str(txn.amount),
+#             'account':  str(txn.payment_account) if txn.payment_account else '—',
+#         }
+
+#         if running_cf is not None:
+#             running_cf += txn.amount
+#             row['running_cf'] = str(running_cf.quantize(Decimal('0.01')))
+
+#         rows.append(row)
+
+#     context = {
+#         'settings':      settings,
+#         'header_image':  _media_url(settings.header_image),
+#         'contact':       contact,
+#         'transactions':  rows,
+#         'is_ledger':     contact is not None,
+#         'report_title': (
+#             f"Ledger — {contact.company_name or contact.contact_name}"
+#             if contact else "Financial Transactions"
+#         ),
+#     }
+
+#     html_string = render_to_string('accounting/transactions_print.html', context)
+#     pdf_bytes   = weasyprint.HTML(
+#         string=html_string,
+#         base_url=request.build_absolute_uri('/') if request else '/',
+#     ).write_pdf()
+
+#     if contact:
+#         safe_name = (contact.company_name or contact.contact_name).replace(' ', '_')
+#         filename  = f"Ledger_{safe_name}_{timezone.now().date()}.pdf"
+#     else:
+#         filename  = f"Transactions_{timezone.now().date()}.pdf"
+
+#     return (pdf_bytes, filename)

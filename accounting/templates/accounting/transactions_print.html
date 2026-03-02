@@ -1,0 +1,92 @@
+{% comment %} accounting\templates\accounting\transactions_print.html {% endcomment %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; font-size: 11px; color: #222; padding: 24px; }
+
+    .header { display: flex; justify-content: space-between; align-items: flex-start;
+              border-bottom: 2px solid #222; padding-bottom: 12px; margin-bottom: 16px; }
+    .header-logo img { max-height: 70px; max-width: 180px; }
+    .report-title { text-align: right; }
+    .report-title h1 { font-size: 18px; font-weight: bold; }
+    .report-title .sub { font-size: 11px; color: #555; margin-top: 4px; }
+
+    .contact-info { margin-bottom: 14px; font-size: 11px; }
+    .contact-info strong { display: block; font-size: 13px; margin-bottom: 2px; }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    thead tr { background: #f0f0f0; }
+    th { padding: 7px 6px; text-align: left; font-size: 10px;
+         text-transform: uppercase; border: 1px solid #ccc; }
+    td { padding: 6px 6px; border: 1px solid #ddd; font-size: 10px; vertical-align: top; }
+    tbody tr:nth-child(even) td { background: #fafafa; }
+
+    .amount { text-align: right; }
+    .cf-positive { color: #c0392b; }   /* red  — we owe them */
+    .cf-negative { color: #27ae60; }   /* green — they owe us */
+
+    @page { size: A4 landscape; margin: 15mm; }
+  </style>
+</head>
+<body>
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="header-logo">
+      {% if header_image %}<img src="{{ header_image }}" alt="Logo">{% endif %}
+    </div>
+    <div class="report-title">
+      <h1>{{ report_title }}</h1>
+      <div class="sub">Printed on {% now "d M Y" %}</div>
+    </div>
+  </div>
+
+  <!-- CONTACT / LEDGER INFO -->
+  {% if is_ledger and contact %}
+  <div class="contact-info">
+    <strong>{{ contact.company_name|default:contact.contact_name }}</strong>
+    {% if contact.phone %}Ph: {{ contact.phone }}{% endif %}
+    {% if contact.gstin %} &nbsp;|&nbsp; GSTIN: {{ contact.gstin }}{% endif %}
+    <span style="margin-left:16px;">Opening Balance: ₹{{ contact.opening_balance }}</span>
+  </div>
+  {% endif %}
+
+  <!-- TRANSACTIONS TABLE -->
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Type</th>
+        <th>Document</th>
+        <th>Doc Type</th>
+        <th>Notes</th>
+        <th class="amount">Amount (₹)</th>
+        <th>Account</th>
+        {% if is_ledger %}<th class="amount">Running CF (₹)</th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for txn in transactions %}
+      <tr>
+        <td>{{ txn.date }}</td>
+        <td>{{ txn.type }}</td>
+        <td>{{ txn.doc_id }}</td>
+        <td>{{ txn.doc_type }}</td>
+        <td>{{ txn.notes }}</td>
+        <td class="amount">{{ txn.amount }}</td>
+        <td>{{ txn.account }}</td>
+        {% if is_ledger %}
+        <td class="amount {% if txn.running_cf|slice:'0:1' == '-' %}cf-negative{% else %}cf-positive{% endif %}">
+          {{ txn.running_cf }}
+        </td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+</body>
+</html>
