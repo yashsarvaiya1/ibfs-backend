@@ -8,3 +8,4 @@ Pillow
 django-extensions
 django-crontab
 playwright
+whitenoise

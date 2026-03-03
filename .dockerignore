@@ -1,0 +1,22 @@
+# Git and IDE
+.git
+.gitignore
+.vscode
+.idea
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Django local files
+db.sqlite3
+.env
+staticfiles/
+media/
+
+# Playwright/Browsers (we install these inside the container)
+.auth/
