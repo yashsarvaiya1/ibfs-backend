@@ -1,0 +1,156 @@
+{% comment %} accounting\templates\accounting\document_print.html {% endcomment %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; font-size: 12px; color: #222; padding: 32px; }
+
+    .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; border-bottom: 2px solid #222; padding-bottom: 16px; }
+    .header-logo img { max-height: 80px; max-width: 200px; }
+    .doc-title { text-align: right; }
+    .doc-title h1 { font-size: 22px; font-weight: bold; text-transform: uppercase; }
+    .doc-title .doc-id { font-size: 14px; color: #555; margin-top: 4px; }
+
+    .parties { display: flex; gap: 32px; margin-bottom: 20px; }
+    .party { flex: 1; }
+    .party h4 { font-size: 11px; text-transform: uppercase; color: #777; margin-bottom: 6px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+    .party p { margin: 2px 0; line-height: 1.5; }
+    .party .gstin { font-size: 10px; color: #555; }
+
+    .meta-row { display: flex; gap: 24px; margin-bottom: 20px; font-size: 11px; }
+    .meta-item { }
+    .meta-item span { color: #777; }
+    .meta-item strong { margin-left: 4px; }
+
+    table.items { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+    table.items th { background: #f0f0f0; padding: 8px 6px; text-align: left; font-size: 11px; border: 1px solid #ccc; }
+    table.items td { padding: 7px 6px; border: 1px solid #ddd; font-size: 11px; vertical-align: top; }
+    table.items tr:nth-child(even) td { background: #fafafa; }
+
+    .totals { display: flex; justify-content: flex-end; margin-bottom: 20px; }
+    .totals-box { width: 280px; }
+    .totals-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 12px; border-bottom: 1px solid #eee; }
+    .totals-row.grand { font-size: 14px; font-weight: bold; border-top: 2px solid #222; border-bottom: 2px solid #222; padding: 6px 0; margin-top: 4px; }
+
+    .notes-section { margin-bottom: 20px; font-size: 11px; }
+    .notes-section h4 { font-size: 10px; text-transform: uppercase; color: #777; margin-bottom: 4px; }
+
+    .footer { margin-top: 40px; display: flex; justify-content: flex-end; }
+    .footer img { max-height: 60px; max-width: 160px; }
+
+    @page { size: A4 portrait; margin: 20mm; }
+  </style>
+</head>
+<body>
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="header-logo">
+      {% if header_image %}<img src="{{ header_image }}" alt="Company Logo">{% endif %}
+    </div>
+    <div class="doc-title">
+      <h1>{{ doc_type_label }}</h1>
+      <div class="doc-id"># {{ document.doc_id }}</div>
+    </div>
+  </div>
+
+  <!-- PARTIES -->
+  <div class="parties">
+    {% if contact %}
+    <div class="party">
+      <h4>{% if document.type in "bill,po,dn" %}Vendor{% else %}Bill To{% endif %}</h4>
+      <p><strong>{{ contact.name }}</strong></p>
+      {% if contact.address %}<p>{{ contact.address }}</p>{% endif %}
+      {% if contact.phone %}<p>Ph: {{ contact.phone }}</p>{% endif %}
+      {% if contact.gstin %}<p class="gstin">GSTIN: {{ contact.gstin }}</p>{% endif %}
+    </div>
+    {% endif %}
+    {% if consignee %}
+    <div class="party">
+      <h4>Ship To (Consignee)</h4>
+      <p><strong>{{ consignee.name }}</strong></p>
+      {% if consignee.address %}<p>{{ consignee.address }}</p>{% endif %}
+      {% if consignee.phone %}<p>Ph: {{ consignee.phone }}</p>{% endif %}
+      {% if consignee.gstin %}<p class="gstin">GSTIN: {{ consignee.gstin }}</p>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- META ROW -->
+  <div class="meta-row">
+    <div class="meta-item"><span>Date:</span> <strong>{{ document.date }}</strong></div>
+    {% if document.due_date %}<div class="meta-item"><span>Due Date:</span> <strong>{{ document.due_date }}</strong></div>{% endif %}
+    {% if document.payment_terms %}<div class="meta-item"><span>Payment Terms:</span> <strong>{{ document.payment_terms }}</strong></div>{% endif %}
+  </div>
+
+  <!-- LINE ITEMS — not shown for interest/expense/vouchers (name+amount only types) -->
+  {% if line_items %}
+  <table class="items">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Item / Description</th>
+        {% if document.type not in "interest,expense,cash_payment_voucher,cash_receipt_voucher" %}
+        <th>HSN</th>
+        <th>Qty</th>
+        <th>Rate</th>
+        {% endif %}
+        <th style="text-align:right">Amount (₹)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in line_items %}
+      <tr>
+        <td>{{ forloop.counter }}</td>
+        <td>{{ item.name }}</td>
+        {% if document.type not in "interest,expense,cash_payment_voucher,cash_receipt_voucher" %}
+        <td>{{ item.hsn|default:"—" }}</td>
+        <td>{{ item.quantity|default:"—" }}</td>
+        <td>{{ item.rate|default:"—" }}</td>
+        {% endif %}
+        <td style="text-align:right">{{ item.amount }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <!-- TOTALS BOX -->
+  <div class="totals">
+    <div class="totals-box">
+      {% if charges %}
+        {% for charge in charges %}
+        <div class="totals-row"><span>{{ charge.name }}</span><span>₹{{ charge.amount }}</span></div>
+        {% endfor %}
+      {% endif %}
+      {% if document.discount %}
+      <div class="totals-row"><span>Discount</span><span>− ₹{{ document.discount }}</span></div>
+      {% endif %}
+      {% if taxes %}
+        {% for tax in taxes %}
+        <div class="totals-row"><span>{{ tax.name }} ({{ tax.percentage }}%)</span><span>₹{{ tax.amount }}</span></div>
+        {% endfor %}
+      {% endif %}
+      <div class="totals-row grand"><span>Total</span><span>₹{{ grand_total }}</span></div>
+    </div>
+  </div>
+
+  <!-- NOTES -->
+  {% if document.notes %}
+  <div class="notes-section">
+    <h4>Notes</h4>
+    <p>{{ document.notes }}</p>
+  </div>
+  {% endif %}
+
+  <!-- FOOTER / SIGNATURE -->
+  {% if sign_image %}
+  <div class="footer">
+    <img src="{{ sign_image }}" alt="Authorised Signature">
+  </div>
+  {% endif %}
+
+</body>
+</html>

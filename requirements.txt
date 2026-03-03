@@ -4,6 +4,8 @@ psycopg2-binary
 python-dotenv
 django-cors-headers
 gunicorn
-google-cloud-storage
 Pillow
 django-extensions
+django-crontab
+playwright
+whitenoise
