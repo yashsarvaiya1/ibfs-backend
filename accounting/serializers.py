@@ -1,5 +1,4 @@
 # accounting/serializers.py
-
 from decimal import Decimal
 from rest_framework import serializers
 from django.conf import settings as django_settings
@@ -15,8 +14,13 @@ def _build_media_url(request, relative_path):
 
 
 class FinancialTransactionSerializer(serializers.ModelSerializer):
-    document_type       = serializers.SerializerMethodField()
-    is_document_deleted = serializers.SerializerMethodField()
+    document_type        = serializers.SerializerMethodField()
+    is_document_deleted  = serializers.SerializerMethodField()
+    # ✅ These replace bare IDs — card uses names directly, no extra fetches needed
+    contact_name         = serializers.SerializerMethodField()
+    payment_account_name = serializers.SerializerMethodField()
+    payment_account_type = serializers.SerializerMethodField()
+    doc_id               = serializers.SerializerMethodField()
 
     class Meta:
         model  = FinancialTransaction
@@ -30,14 +34,27 @@ class FinancialTransactionSerializer(serializers.ModelSerializer):
             return False
         return not obj.document.is_active
 
+    def get_contact_name(self, obj):
+        if not obj.contact:
+            return None
+        return obj.contact.company_name or obj.contact.contact_name
 
-# ─── List serializer — lightweight, no heavy nested fields ────────────────────
+    def get_payment_account_name(self, obj):
+        return obj.payment_account.name if obj.payment_account else None
+
+    def get_payment_account_type(self, obj):
+        return obj.payment_account.type if obj.payment_account else None
+
+    def get_doc_id(self, obj):
+        # Human-readable doc_id (e.g. "INV-0001") — avoids pk lookup in frontend
+        return obj.document.doc_id if obj.document else None
+
+
+# ─── List serializer ──────────────────────────────────────────────────────────
 
 class DocumentListSerializer(serializers.ModelSerializer):
     contact_name   = serializers.SerializerMethodField()
     payment_status = serializers.SerializerMethodField()
-    # ✅ Removed contact_display / consignee_display — not needed on list view
-    #    and were declared without being added to Meta.fields (caused AssertionError)
 
     class Meta:
         model  = Document
@@ -53,8 +70,7 @@ class DocumentListSerializer(serializers.ModelSerializer):
 
     def get_payment_status(self, obj):
         NO_PAYMENT_TYPES = {
-            'po', 'pi', 'quotation', 'challan',
-            'interest', 'expense',
+            'po', 'pi', 'quotation', 'challan', 'interest', 'expense',
         }
         if obj.type in NO_PAYMENT_TYPES:
             return None
@@ -67,20 +83,19 @@ class DocumentListSerializer(serializers.ModelSerializer):
         }
 
 
-# ─── Detail serializer — full data including contact display ──────────────────
+# ─── Detail serializer ────────────────────────────────────────────────────────
 
 class DocumentSerializer(serializers.ModelSerializer):
     transactions         = FinancialTransactionSerializer(many=True, read_only=True)
     payment_status       = serializers.SerializerMethodField()
     stock_status         = serializers.SerializerMethodField()
     attachment_urls_full = serializers.SerializerMethodField()
-    # ✅ Display fields live here only — used by detail page + print page
     contact_display      = serializers.SerializerMethodField()
     consignee_display    = serializers.SerializerMethodField()
 
     class Meta:
         model  = Document
-        fields = '__all__'   # includes all + the declared SerializerMethodFields above
+        fields = '__all__'
 
     def get_attachment_urls_full(self, obj):
         request = self.context.get('request')
@@ -117,8 +132,7 @@ class DocumentSerializer(serializers.ModelSerializer):
 
     def get_payment_status(self, obj):
         NO_PAYMENT_TYPES = {
-            'po', 'pi', 'quotation', 'challan',
-            'interest', 'expense',
+            'po', 'pi', 'quotation', 'challan', 'interest', 'expense',
         }
         if obj.type in NO_PAYMENT_TYPES:
             return None
@@ -135,8 +149,7 @@ class DocumentSerializer(serializers.ModelSerializer):
     def get_stock_status(self, obj):
         from inventory.models import StockTransaction
         NO_STOCK_TYPES = {
-            'po', 'pi', 'quotation',
-            'interest', 'expense',
+            'po', 'pi', 'quotation', 'interest', 'expense',
             'cash_payment_voucher', 'cash_receipt_voucher',
         }
         if obj.type in NO_STOCK_TYPES:

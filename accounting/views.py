@@ -22,6 +22,7 @@ from inventory.models import StockTransaction, Product
 
 # ─── Document ViewSet ──────────────────────────────────────────────────────────
 
+
 class DocumentViewSet(viewsets.ModelViewSet):
     search_fields   = ['doc_id', 'contact__contact_name', 'contact__company_name']
     ordering_fields = ['date', 'created_at', 'total_amount']
@@ -67,27 +68,43 @@ class DocumentViewSet(viewsets.ModelViewSet):
         )
 
     def update(self, request, *args, **kwargs):
-        """
-        Document edit — updates safe fields only.
-        If line_items changed → syncs record s.txns to match new line_items.
-        total_amount change does NOT auto-adjust f.txns.
-        """
-        doc         = self.get_object()
-        safe_fields = [
-            'notes', 'date', 'due_date', 'payment_terms',
-            'attachment_urls', 'charges', 'taxes', 'discount',
-            'total_amount', 'consignee', 'reference',
+        doc = self.get_object()
+
+        old_total_amount = Decimal(str(doc.total_amount)) if doc.total_amount is not None else None
+        old_date         = doc.date
+
+        # ── Simple scalar fields ───────────────────────────────────────────────
+        simple_fields = [
+            'notes', 'payment_terms', 'attachment_urls',
+            'charges', 'taxes', 'discount', 'total_amount',
         ]
-        for field in safe_fields:
+        for field in simple_fields:
             if field in request.data:
                 setattr(doc, field, request.data[field])
 
+        # ── FK fields — must use _id suffix, never assign raw int directly ────
+        if 'consignee' in request.data:
+            doc.consignee_id = request.data['consignee']   # None or int → both valid
+        if 'reference' in request.data:
+            doc.reference_id = request.data['reference']   # None or int → both valid
+
+        # ── Date fields — always parse to avoid string/date type mismatch ─────
+        if 'date' in request.data:
+            doc.date = _parse_date(request.data['date'])
+        if 'due_date' in request.data:
+            raw_due = request.data['due_date']
+            doc.due_date = _parse_date(raw_due) if raw_due else None
+
+        # ── Line items → sync record s.txns ───────────────────────────────────
         new_line_items = request.data.get('line_items')
         if new_line_items is not None:
             doc.line_items = new_line_items
             _sync_record_stxns(doc, new_line_items)
 
         doc.save()
+
+        _sync_record_ftxns(doc, old_total_amount, old_date)
+
         return Response(DocumentSerializer(doc, context={'request': request}).data)
 
     # ── Record Payment ─────────────────────────────────────────────────────────
@@ -170,6 +187,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
         """
         Per spec 6.1: Stock Preview Panel — only product_id items shown.
         Manual/service items (product_id=null) completely hidden.
+        All quantities returned as positive absolute values — sign is
+        irrelevant for display (direction is implicit from doc type).
         """
         doc     = self.get_object()
         records = StockTransaction.objects.filter(
@@ -178,19 +197,23 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         preview = []
         for r in records:
-            moved = sum(
+            record_qty = abs(r.quantity)                          # ← abs() here
+            moved      = abs(sum(
                 t.quantity for t in StockTransaction.objects.filter(
                     document=doc, product=r.product, type='actual'
                 )
-            )
+            ))                                                    # ← abs() here
+            remaining  = record_qty - moved
+
             preview.append({
                 'product_id':    r.product_id,
                 'product_name':  r.product.name,
-                'record_qty':    str(r.quantity),
+                'record_qty':    str(record_qty),
                 'moved_qty':     str(moved),
-                'remaining_qty': str(r.quantity - moved),
+                'remaining_qty': str(max(remaining, 0)),          # ← floor at 0, never negative
             })
         return Response(preview)
+
 
     # ── Add Details (Fast Bill / Fast Invoice) ─────────────────────────────────
     @action(detail=True, methods=['post'])
@@ -328,6 +351,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
 # ─── _sync_record_stxns (module-level helper) ─────────────────────────────────
 
+
 def _sync_record_stxns(doc, new_line_items):
     """
     When line_items are edited on a doc, sync the record s.txns to match.
@@ -371,7 +395,70 @@ def _sync_record_stxns(doc, new_line_items):
             _create_stxn('record', signed_qty, product, doc, doc.date)
 
 
+# ─── _sync_record_ftxns (module-level helper) ─────────────────────────────────
+
+
+def _sync_record_ftxns(doc, old_total_amount, old_date):
+    """
+    When total_amount or date changes on a document, sync the record f.txns.
+    - Preserves sign on amount change (absolute value only updated)
+    - Updates date and triggers MCD recalculation for affected month(s)
+    - NEVER touches actual f.txns
+
+    Preconditions (enforced by caller):
+      old_total_amount → Decimal or None  (normalized before calling)
+      old_date         → date object      (captured before mutation)
+      doc.date         → date object      (parsed via _parse_date in update())
+      doc.total_amount → raw value from setattr (Decimal-cast safely below)
+    """
+    try:
+        new_total_amount = Decimal(str(doc.total_amount)) if doc.total_amount is not None else None
+    except Exception:
+        new_total_amount = None
+
+    amount_changed = (
+        old_total_amount is not None
+        and new_total_amount is not None
+        and old_total_amount != new_total_amount
+    )
+    date_changed = (old_date != doc.date)
+
+    if not (amount_changed or date_changed):
+        return
+
+    record_ftxns = FinancialTransaction.objects.filter(document=doc, type='record')
+
+    for ftxn in record_ftxns:
+        update_fields = ['updated_at']
+
+        if amount_changed and new_total_amount is not None:
+            # Preserve sign — only change absolute value
+            sign            = Decimal('1') if ftxn.amount >= 0 else Decimal('-1')
+            new_ftxn_amount = sign * new_total_amount
+            if ftxn.amount != new_ftxn_amount:
+                ftxn.amount = new_ftxn_amount
+                update_fields.append('amount')
+
+        if date_changed:
+            ftxn.date = doc.date
+            update_fields.append('date')
+
+        if len(update_fields) > 1:
+            ftxn.save(update_fields=update_fields)
+
+    # MCD recalculation — always recalculate new month
+    if doc.contact_id:
+        _recalculate_mcd(doc.contact, doc.date)
+        # Also recalculate old month if it crossed a calendar month boundary
+        if date_changed and (
+            old_date.month != doc.date.month
+            or old_date.year != doc.date.year
+        ):
+            _recalculate_mcd(doc.contact, old_date)
+
+
 # ─── FinancialTransaction ViewSet ──────────────────────────────────────────────
+
 
 class FinancialTransactionViewSet(viewsets.ModelViewSet):
     serializer_class = FinancialTransactionSerializer
@@ -422,7 +509,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         """
         Only actual type transactions can be edited directly.
-        Record txns → managed via document edit (_sync_record_stxns).
+        Record txns → managed via document edit (_sync_record_ftxns).
         Contra txns → managed via transfer endpoint.
         On amount change: reverses old account balance, applies new.
         On date change: recalculates MCD for both old and new month if they differ.
@@ -522,8 +609,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         """
         qs = self.filter_queryset(self.get_queryset())
 
-        # Resolve contact for ledger mode
-        contact = None
+        contact    = None
         contact_id = request.query_params.get('contact')
         if contact_id:
             try:
