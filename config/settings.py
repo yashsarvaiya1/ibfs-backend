@@ -10,6 +10,16 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'fallback-dev-secret-key-change-in-producti
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
+# After ALLOWED_HOSTS line, add:
+CSRF_TRUSTED_ORIGINS = os.getenv(
+    'CORS_ALLOWED_ORIGINS',
+    'http://localhost:4000,http://127.0.0.1:4000'
+).split(',')
+
+# Security — reverse proxy / SSL support
+USE_X_FORWARDED_HOST = True
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',

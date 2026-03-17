@@ -1,3 +1,4 @@
+# shared/views.py
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -15,7 +16,6 @@ class SettingsViewSet(viewsets.ModelViewSet):
         return Settings.get()
 
     def get_serializer_context(self):
-        # Ensures request is passed into serializer for building absolute URLs
         context = super().get_serializer_context()
         return context
 
@@ -51,6 +51,13 @@ class ContactViewSet(viewsets.ModelViewSet):
         if is_active is not None:
             qs = qs.filter(is_active=is_active.lower() == 'true')
         return qs
+
+    def destroy(self, request, *args, **kwargs):
+        # Soft delete — never hard delete contacts (transactions reference them)
+        contact = self.get_object()
+        contact.is_active = False
+        contact.save(update_fields=['is_active', 'updated_at'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['get'])
     def ledger(self, request, pk=None):
@@ -88,6 +95,14 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
             qs = qs.filter(is_active=is_active.lower() == 'true')
         return qs
 
+    def destroy(self, request, *args, **kwargs):
+        # Soft delete — is_active = False. Hard delete is never done.
+        # Transactions reference this account via FK SET_NULL — those stay intact.
+        account = self.get_object()
+        account.is_active = False
+        account.save(update_fields=['is_active', 'updated_at'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=False, methods=['post'])
     def transfer(self, request):
         from accounting.services import process_transfer
@@ -106,7 +121,10 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
         account = self.get_object()
         balance = request.data.get('current_balance')
         if balance is None:
-            return Response({'error': 'current_balance required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'current_balance required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         # Per spec B1 — direct overwrite, no f.txn generated
         account.current_balance = balance
         account.save(update_fields=['current_balance', 'updated_at'])
