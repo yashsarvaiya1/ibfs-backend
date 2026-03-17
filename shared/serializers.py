@@ -1,24 +1,19 @@
+# shared/serializers.py
+
 from rest_framework import serializers
 from django.conf import settings as django_settings
 from .models import Settings, Contact, PaymentAccount
 
 
 def _build_media_url(request, relative_path):
-    """
-    Given a relative path like 'uploads/settings/uuid.jpg',
-    returns the full absolute URL the frontend can use directly.
-    Returns None if relative_path is None/empty.
-    """
     if not relative_path:
         return None
     if request:
         return request.build_absolute_uri(f"{django_settings.MEDIA_URL}{relative_path}")
-    # Fallback without request context
     return f"{django_settings.MEDIA_URL}{relative_path}"
 
 
 class SettingsSerializer(serializers.ModelSerializer):
-    # Computed absolute URLs for frontend image display — read-only
     header_image_url = serializers.SerializerMethodField()
     sign_image_url   = serializers.SerializerMethodField()
 
@@ -42,47 +37,55 @@ class ContactSerializer(serializers.ModelSerializer):
 
     def get_current_cf(self, obj):
         """
-        CF = opening_balance + sum of last MCD per completed month + sum of current month txns.
+        CF = opening_balance
+           + sum of (last MCD of each completed month, skipping expense txns)
+           + sum of (all individual f.txn amounts in current month, skipping expense)
 
-        Per spec (Part 11):
-        c/f = contact.opening_balance
-            + sum of (last MCD of each month before current month)
-            + sum of (all individual f.txn amounts in current month up to today)
-
-        We calculate the full-to-date CF (no date cutoff) here for the contact list/detail view.
-        For the ledger running c/f, the accounting serializer handles it row-by-row.
+        Per spec Part 11:
+          - expense f.txns have MCD forced to 0 — must be excluded from past-month lookup
+          - contra f.txns have no contact — never appear here
+          - The "last MCD" of a month = monthly_cumulative_delta of the last non-expense
+            txn ordered by (date, created_at) in that month
         """
         from accounting.models import FinancialTransaction
         from django.db.models import Max
         from datetime import date
 
-        today = date.today()
+        today     = date.today()
+        month_start = today.replace(day=1)
 
-        # --- Past months: use last MCD per month (fast — one row per month) ---
-        # Get the ID of the last transaction per year/month for this contact
-        # We use Max('id') as a proxy for last-inserted in that month.
-        # This is safe because within a month, IDs are always increasing.
-        past_month_last_ids = (
+        # ── Past months: get last non-expense txn per month ───────────────────
+        # We need the last (date, created_at) row per (year, month) that is NOT expense.
+        # Strategy: get all non-expense txns before this month, ordered desc,
+        # then pick the first per (year, month) group using Python — fast enough
+        # since MCD makes this at most N_months rows after grouping.
+
+        past_txns = (
             FinancialTransaction.objects
-            .filter(contact=obj, date__lt=today.replace(day=1))
-            .values('date__year', 'date__month')
-            .annotate(last_id=Max('id'))
-            .values_list('last_id', flat=True)
+            .filter(contact=obj, date__lt=month_start)
+            .exclude(document__type='expense')   # ✅ skip expense — MCD is always 0
+            .order_by('date__year', 'date__month', '-date', '-created_at')
+            .values('date__year', 'date__month', 'monthly_cumulative_delta')
         )
 
-        past_mcd_sum = sum(
-            t.monthly_cumulative_delta
-            for t in FinancialTransaction.objects.filter(id__in=list(past_month_last_ids))
-        ) if past_month_last_ids else 0
+        # Pick last row per (year, month) — first in desc ordering = last in asc
+        seen_months = set()
+        past_mcd_sum = 0
+        for row in past_txns:
+            key = (row['date__year'], row['date__month'])
+            if key not in seen_months:
+                seen_months.add(key)
+                past_mcd_sum += row['monthly_cumulative_delta']
 
-        # --- Current month: sum all individual amounts (per spec) ---
+        # ── Current month: sum individual amounts, skip expense ───────────────
         current_month_sum = sum(
             t.amount
             for t in FinancialTransaction.objects.filter(
                 contact=obj,
                 date__year=today.year,
                 date__month=today.month,
-            )
+            ).exclude(document__type='expense')   # ✅ expense never affects CF
+            .select_related('document')
         )
 
         cf = obj.opening_balance + past_mcd_sum + current_month_sum

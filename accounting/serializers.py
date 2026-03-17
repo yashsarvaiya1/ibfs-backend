@@ -1,4 +1,3 @@
-# accounting/serializers.py
 from decimal import Decimal
 from rest_framework import serializers
 from django.conf import settings as django_settings
@@ -16,7 +15,6 @@ def _build_media_url(request, relative_path):
 class FinancialTransactionSerializer(serializers.ModelSerializer):
     document_type        = serializers.SerializerMethodField()
     is_document_deleted  = serializers.SerializerMethodField()
-    # ✅ These replace bare IDs — card uses names directly, no extra fetches needed
     contact_name         = serializers.SerializerMethodField()
     payment_account_name = serializers.SerializerMethodField()
     payment_account_type = serializers.SerializerMethodField()
@@ -46,7 +44,6 @@ class FinancialTransactionSerializer(serializers.ModelSerializer):
         return obj.payment_account.type if obj.payment_account else None
 
     def get_doc_id(self, obj):
-        # Human-readable doc_id (e.g. "INV-0001") — avoids pk lookup in frontend
         return obj.document.doc_id if obj.document else None
 
 
@@ -60,7 +57,8 @@ class DocumentListSerializer(serializers.ModelSerializer):
         model  = Document
         fields = [
             'id', 'type', 'doc_id', 'contact', 'contact_name',
-            'date', 'total_amount', 'is_active', 'payment_status',
+            'date', 'total_amount', 'is_active', 'is_paid',  # ✅ added is_paid
+            'payment_status',
         ]
 
     def get_contact_name(self, obj):
@@ -95,7 +93,7 @@ class DocumentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model  = Document
-        fields = '__all__'
+        fields = '__all__'  # ✅ is_paid included automatically via __all__
 
     def get_attachment_urls_full(self, obj):
         request = self.context.get('request')

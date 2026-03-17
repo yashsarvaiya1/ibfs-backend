@@ -1,4 +1,3 @@
-# accounting/models.py
 from django.db import models
 from shared.models import BaseModel
 
@@ -41,21 +40,22 @@ class Document(BaseModel):
         on_delete=models.SET_NULL,
         related_name="referenced_by",
     )
-    line_items = models.JSONField(default=list, blank=True)
-    total_amount = models.DecimalField(
-        max_digits=15, decimal_places=2, null=True, blank=True
-    )
-    discount = models.DecimalField(
-        max_digits=15, decimal_places=2, default=0, blank=True
-    )
-    charges = models.JSONField(default=list, blank=True)
-    taxes = models.JSONField(default=list, blank=True)
-    date = models.DateField()
-    due_date = models.DateField(null=True, blank=True)
-    payment_terms = models.CharField(max_length=255, blank=True, null=True)
+    line_items      = models.JSONField(default=list, blank=True)
+    total_amount    = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    discount        = models.DecimalField(max_digits=15, decimal_places=2, default=0, blank=True)
+    charges         = models.JSONField(default=list, blank=True)
+    taxes           = models.JSONField(default=list, blank=True)
+    date            = models.DateField()
+    due_date        = models.DateField(null=True, blank=True)
+    payment_terms   = models.CharField(max_length=255, blank=True, null=True)
     attachment_urls = models.JSONField(default=list, blank=True)
-    notes = models.TextField(blank=True, null=True)
-    is_active = models.BooleanField(default=True)
+    notes           = models.TextField(blank=True, null=True)
+    is_active       = models.BooleanField(default=True)
+    # ── Manual paid flag ──────────────────────────────────────────────────────
+    # Only meaningful for bill, invoice, cn, dn.
+    # User sets this manually when payment is collected without referencing the
+    # document (e.g. via contact ledger). Does NOT affect any f.txn or balance.
+    is_paid         = models.BooleanField(default=False)
 
     def __str__(self):
         return f"{self.type.upper()} #{self.doc_id}"
@@ -63,9 +63,9 @@ class Document(BaseModel):
 
 class FinancialTransaction(BaseModel):
     TYPE_CHOICES = [("record", "Record"), ("actual", "Actual"), ("contra", "Contra")]
-    type = models.CharField(max_length=10, choices=TYPE_CHOICES)
-    date = models.DateField()
-    amount = models.DecimalField(max_digits=15, decimal_places=2)
+    type     = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    date     = models.DateField()
+    amount   = models.DecimalField(max_digits=15, decimal_places=2)
     document = models.ForeignKey(
         Document,
         null=True,
@@ -87,10 +87,8 @@ class FinancialTransaction(BaseModel):
         on_delete=models.SET_NULL,
         related_name="transactions",
     )
-    notes = models.TextField(blank=True, null=True)
-    monthly_cumulative_delta = models.DecimalField(
-        max_digits=15, decimal_places=2, default=0
-    )
+    notes                    = models.TextField(blank=True, null=True)
+    monthly_cumulative_delta = models.DecimalField(max_digits=15, decimal_places=2, default=0)
 
     class Meta:
         ordering = ["date", "created_at"]
