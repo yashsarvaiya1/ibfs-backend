@@ -1,0 +1,138 @@
+{# accounting/templates/inventory/stock_list_print.html #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; font-size: 11px; color: #222; padding: 24px; }
+    @page { size: A4 landscape; margin: 15mm; }
+
+    .header {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      border-bottom: 2px solid #222; padding-bottom: 12px; margin-bottom: 14px;
+    }
+    .header-logo img { max-height: 70px; max-width: 180px; }
+    .report-title { text-align: right; }
+    .report-title h1 { font-size: 18px; font-weight: bold; }
+    .report-title .sub { font-size: 10px; color: #777; margin-top: 4px; }
+
+    .summary-bar {
+      display: flex; align-items: center; gap: 24px; margin-bottom: 14px;
+      padding: 10px 14px; background: #f7f7f7;
+      border-radius: 6px; border: 1px solid #e8e8e8;
+    }
+    .stat .val { font-size: 18px; font-weight: bold; }
+    .stat .lbl { font-size: 9px; color: #777; text-transform: uppercase; letter-spacing: 0.05em; }
+    .low-val { color: #c0392b; }
+    .filter-pill {
+      margin-left: auto; font-size: 10px; font-weight: bold; color: #d97706;
+      background: #fef3c7; border: 1px solid #fcd34d;
+      border-radius: 4px; padding: 3px 10px;
+    }
+
+    table { width: 100%; border-collapse: collapse; font-size: 10px; }
+    thead tr { background: #f0f0f0; }
+    th {
+      padding: 7px 6px; text-align: left; text-transform: uppercase;
+      letter-spacing: 0.04em; font-size: 9px; font-weight: bold; border: 1px solid #ccc;
+    }
+    td { padding: 6px 6px; border: 1px solid #ddd; vertical-align: middle; }
+    tbody tr:nth-child(even) td { background: #fafafa; }
+    .r   { text-align: right; }
+    .amt { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; }
+
+    .thumb { width: 32px; height: 32px; border-radius: 4px; border: 1px solid #ddd; object-fit: cover; }
+    .thumb-ph {
+      width: 32px; height: 32px; border-radius: 4px; border: 1px dashed #ccc;
+      background: #f5f5f5; display: inline-flex; align-items: center;
+      justify-content: center; font-size: 14px;
+    }
+    .stock-ok  { color: #27ae60; font-weight: bold; }
+    .stock-low { color: #c0392b; font-weight: bold; }
+    .badge-low {
+      display: inline-block; padding: 1px 5px; border-radius: 3px;
+      font-size: 8px; font-weight: bold; text-transform: uppercase;
+      background: #fee2e2; color: #991b1b; border: 1px solid #fecaca;
+    }
+    .badge-ok {
+      font-size: 9px; font-weight: bold; color: #27ae60;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="header-logo">
+      {% if header_image %}<img src="{{ header_image }}" alt="Logo">{% endif %}
+    </div>
+    <div class="report-title">
+      <h1>{{ report_title }}</h1>
+      <div class="sub">Printed on {% now "d M Y" %}</div>
+    </div>
+  </div>
+
+  <div class="summary-bar">
+    <div class="stat">
+      <div class="val">{{ total_products }}</div>
+      <div class="lbl">Total Products</div>
+    </div>
+    <div class="stat">
+      <div class="val low-val">{{ low_stock_count }}</div>
+      <div class="lbl">Low Stock</div>
+    </div>
+    {% if low_stock_only %}
+      <div class="filter-pill">⚠ Low Stock Filter Active</div>
+    {% endif %}
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th style="width:38px"></th>
+        <th>Product</th>
+        <th style="width:80px">HSN Code</th>
+        <th style="width:50px">Unit</th>
+        <th style="width:90px" class="r">Rate (₹)</th>
+        <th style="width:100px" class="r">Current Stock</th>
+        <th style="width:80px" class="r">Min Alert</th>
+        <th style="width:60px">Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in products %}
+      <tr>
+        <td style="text-align:center;padding:4px 6px">
+          {% if p.image_url %}
+            <img src="{{ p.image_url }}" class="thumb" alt="">
+          {% else %}
+            <span class="thumb-ph">📦</span>
+          {% endif %}
+        </td>
+        <td>
+          <strong>{{ p.name }}</strong>
+          {% if p.description %}
+            <br><span style="font-size:9px;color:#777">{{ p.description }}</span>
+          {% endif %}
+        </td>
+        <td style="color:#666">{{ p.hsn_code }}</td>
+        <td>{{ p.unit }}</td>
+        <td class="amt">₹{{ p.rate }}</td>
+        <td class="amt {% if p.is_low %}stock-low{% else %}stock-ok{% endif %}">
+          {{ p.current_stock }}
+        </td>
+        <td class="r" style="color:#888">{{ p.min_stock }}</td>
+        <td>
+          {% if p.is_low %}
+            <span class="badge-low">Low</span>
+          {% else %}
+            <span class="badge-ok">✓ OK</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+</body>
+</html>

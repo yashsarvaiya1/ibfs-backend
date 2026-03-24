@@ -1,4 +1,4 @@
-{% comment %} accounting\templates\accounting\transactions_print.html {% endcomment %}
+{# accounting/templates/accounting/transactions_print.html #}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6,29 +6,59 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: Arial, sans-serif; font-size: 11px; color: #222; padding: 24px; }
+    @page { size: A4 landscape; margin: 15mm; }
 
-    .header { display: flex; justify-content: space-between; align-items: flex-start;
-              border-bottom: 2px solid #222; padding-bottom: 12px; margin-bottom: 16px; }
+    .header {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      border-bottom: 2px solid #222; padding-bottom: 12px; margin-bottom: 14px;
+    }
     .header-logo img { max-height: 70px; max-width: 180px; }
     .report-title { text-align: right; }
     .report-title h1 { font-size: 18px; font-weight: bold; }
-    .report-title .sub { font-size: 11px; color: #555; margin-top: 4px; }
+    .report-title .sub { font-size: 10px; color: #777; margin-top: 4px; }
 
-    .contact-info { margin-bottom: 14px; font-size: 11px; }
-    .contact-info strong { display: block; font-size: 13px; margin-bottom: 2px; }
+    .entity-info {
+      margin-bottom: 14px; font-size: 11px; padding: 10px 12px;
+      background: #f7f7f7; border-radius: 6px; border: 1px solid #e8e8e8;
+    }
+    .entity-info .name { font-size: 14px; font-weight: bold; margin-bottom: 4px; }
+    .entity-info .meta { color: #555; font-size: 10px; }
+    .ob { display: inline-block; margin-left: 16px; font-size: 11px; font-weight: bold; }
+    .ob-dr { color: #c0392b; }
+    .ob-cr { color: #27ae60; }
 
-    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 10px; }
     thead tr { background: #f0f0f0; }
-    th { padding: 7px 6px; text-align: left; font-size: 10px;
-         text-transform: uppercase; border: 1px solid #ccc; }
-    td { padding: 6px 6px; border: 1px solid #ddd; font-size: 10px; vertical-align: top; }
+    th {
+      padding: 7px 6px; text-align: left; text-transform: uppercase;
+      letter-spacing: 0.04em; font-size: 9px; font-weight: bold; border: 1px solid #ccc;
+    }
+    td { padding: 6px 6px; border: 1px solid #ddd; vertical-align: top; }
     tbody tr:nth-child(even) td { background: #fafafa; }
+    .r   { text-align: right; }
+    .amt { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; }
 
-    .amount { text-align: right; }
-    .cf-positive { color: #c0392b; }   /* red  — we owe them */
-    .cf-negative { color: #27ae60; }   /* green — they owe us */
+    .cf-dr  { color: #c0392b; }
+    .cf-cr  { color: #27ae60; }
+    .cf-nil { color: #888; }
 
-    @page { size: A4 landscape; margin: 15mm; }
+    .row-opening td { background: #eef4ff; font-weight: bold; border-color: #c5d9f7; }
+    .row-expense td { opacity: 0.65; }
+    .amt-expense { color: #d97706; text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; }
+    .row-closing td {
+      border-top: 2px solid #222; background: #f2f2f2;
+      font-weight: bold; font-size: 11px;
+    }
+
+    .badge {
+      display: inline-block; padding: 1px 5px; border-radius: 3px;
+      font-size: 8px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .badge-actual  { background: #222; color: #fff; }
+    .badge-record  { background: #e5e7eb; color: #374151; }
+    .badge-contra  { background: #dbeafe; color: #1d4ed8; }
+    .badge-expense { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+    .badge-deleted { background: #fee2e2; color: #991b1b; }
   </style>
 </head>
 <body>
@@ -44,49 +74,171 @@
     </div>
   </div>
 
-  <!-- CONTACT / LEDGER INFO -->
+  <!-- CONTACT INFO -->
   {% if is_ledger and contact %}
-  <div class="contact-info">
-    <strong>{{ contact.company_name|default:contact.contact_name }}</strong>
-    {% if contact.phone %}Ph: {{ contact.phone }}{% endif %}
-    {% if contact.gstin %} &nbsp;|&nbsp; GSTIN: {{ contact.gstin }}{% endif %}
-    <span style="margin-left:16px;">Opening Balance: ₹{{ contact.opening_balance }}</span>
+  <div class="entity-info">
+    <div class="name">{{ contact.company_name|default:contact.contact_name }}</div>
+    <div class="meta">
+      {% if contact.phone %}Ph: {{ contact.phone }}{% endif %}
+      {% if contact.gstin %} &nbsp;|&nbsp; GSTIN: {{ contact.gstin }}{% endif %}
+      {% if contact.address %} &nbsp;|&nbsp; {{ contact.address }}{% endif %}
+      {% if opening_balance_val and not opening_balance_zero %}
+        <span class="ob {% if opening_balance_pos %}ob-dr{% else %}ob-cr{% endif %}">
+          Opening Balance: ₹{{ opening_balance_val }}
+          {% if opening_balance_pos %}(Dr){% else %}(Cr){% endif %}
+        </span>
+      {% endif %}
+    </div>
   </div>
   {% endif %}
 
-  <!-- TRANSACTIONS TABLE -->
+  <!-- ACCOUNT INFO -->
+  {% if account %}
+  <div class="entity-info">
+    <div class="name">{{ account.name }}</div>
+    <div class="meta">
+      Type: {{ account.type|capfirst }}
+      {% if account.account_number %} &nbsp;|&nbsp; A/C: •••• {{ account.account_number|slice:"-4:" }}{% endif %}
+      {% if balance_before_period %}
+        <span class="ob cf-dr">Balance B/F: ₹{{ balance_before_period }}</span>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if is_ledger %}
   <table>
     <thead>
       <tr>
-        <th>Date</th>
-        <th>Type</th>
-        <th>Document</th>
-        <th>Doc Type</th>
+        <th style="width:70px">Date</th>
+        <th>Particulars</th>
+        <th style="width:90px" class="r">Debit (Dr)</th>
+        <th style="width:90px" class="r">Credit (Cr)</th>
+        <th style="width:110px" class="r">Balance</th>
+      </tr>
+    </thead>
+    <tbody>
+
+      {# Opening Balance row — uses opening_balance_val/pos/zero from services.py #}
+      {% if opening_balance_val and not opening_balance_zero %}
+      <tr class="row-opening">
+        <td>—</td>
+        <td><strong>{% if account %}Balance B/F{% else %}Opening Balance{% endif %}</strong></td>
+        <td class="amt cf-dr">
+          {% if opening_balance_pos %}₹{{ opening_balance_val }}{% endif %}
+        </td>
+        <td class="amt cf-cr">
+          {% if not opening_balance_pos %}₹{{ opening_balance_val }}{% endif %}
+        </td>
+        <td class="amt {% if opening_balance_pos %}cf-dr{% else %}cf-cr{% endif %}">
+          ₹{{ opening_balance_val }}
+          <span style="font-size:9px;font-weight:normal;margin-left:3px">
+            {% if opening_balance_pos %}Dr{% else %}Cr{% endif %}
+          </span>
+        </td>
+      </tr>
+      {% endif %}
+
+      {% for txn in transactions %}
+      <tr {% if txn.is_expense %}class="row-expense"{% endif %}>
+
+        <td style="font-weight:600;color:#555">{{ txn.date }}</td>
+
+        <td>
+          <span class="badge badge-{{ txn.type_raw|lower }}">{{ txn.type }}</span>
+          {% if txn.is_expense %}<span class="badge badge-expense">expense</span>{% endif %}
+          {% if txn.doc_id != "—" %}
+            <span style="margin-left:4px;font-weight:bold;color:#1d4ed8">
+              {{ txn.doc_type }} #{{ txn.doc_id }}
+            </span>
+          {% endif %}
+          {% if txn.notes != "—" and txn.notes %}
+            <br><span style="font-size:9px;color:#777">{{ txn.notes }}</span>
+          {% endif %}
+          {% if txn.account != "—" and txn.account %}
+            <br><span style="font-size:9px;color:#555">via {{ txn.account }}</span>
+          {% endif %}
+        </td>
+
+        <td class="{% if txn.is_expense %}amt-expense{% else %}amt cf-dr{% endif %}">
+          {% if txn.is_expense %}₹{{ txn.amount_abs }}
+          {% elif txn.amount_pos %}₹{{ txn.amount_abs }}{% endif %}
+        </td>
+
+        <td class="amt cf-cr">
+          {% if not txn.is_expense and not txn.amount_pos %}₹{{ txn.amount_abs }}{% endif %}
+        </td>
+
+        <td class="amt {% if txn.running_cf_zero %}cf-nil{% elif txn.running_cf_positive %}cf-dr{% else %}cf-cr{% endif %}">
+          {% if txn.running_cf %}
+            ₹{{ txn.running_cf }}
+            {% if not txn.running_cf_zero %}
+              <span style="font-size:9px;font-weight:normal;margin-left:2px">
+                {% if txn.running_cf_positive %}Dr{% else %}Cr{% endif %}
+              </span>
+            {% endif %}
+          {% endif %}
+        </td>
+
+      </tr>
+      {% endfor %}
+
+    </tbody>
+
+    {% if transactions %}
+    {% with last=transactions|last %}
+    <tr class="row-closing">
+      <td colspan="4" style="text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">
+        Closing Balance
+      </td>
+      <td class="amt {% if last.running_cf_zero %}cf-nil{% elif last.running_cf_positive %}cf-dr{% else %}cf-cr{% endif %}" style="font-size:12px">
+        {% if last.running_cf %}
+          ₹{{ last.running_cf }}
+          {% if not last.running_cf_zero %}
+            <span style="font-size:9px;font-weight:normal;margin-left:2px">
+              {% if last.running_cf_positive %}Dr{% else %}Cr{% endif %}
+            </span>
+          {% endif %}
+        {% endif %}
+      </td>
+    </tr>
+    {% endwith %}
+    {% endif %}
+
+  </table>
+
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th style="width:72px">Date</th>
+        <th style="width:60px">Type</th>
+        <th style="width:80px">Document</th>
+        <th style="width:80px">Doc Type</th>
         <th>Notes</th>
-        <th class="amount">Amount (₹)</th>
-        <th>Account</th>
-        {% if is_ledger %}<th class="amount">Running CF (₹)</th>{% endif %}
+        <th style="width:90px" class="r">Amount (₹)</th>
+        <th style="width:110px">Account</th>
       </tr>
     </thead>
     <tbody>
       {% for txn in transactions %}
       <tr>
-        <td>{{ txn.date }}</td>
-        <td>{{ txn.type }}</td>
-        <td>{{ txn.doc_id }}</td>
-        <td>{{ txn.doc_type }}</td>
-        <td>{{ txn.notes }}</td>
-        <td class="amount">{{ txn.amount }}</td>
-        <td>{{ txn.account }}</td>
-        {% if is_ledger %}
-        <td class="amount {% if txn.running_cf|slice:'0:1' == '-' %}cf-negative{% else %}cf-positive{% endif %}">
-          {{ txn.running_cf }}
+        <td style="color:#555;font-weight:600">{{ txn.date }}</td>
+        <td><span class="badge badge-{{ txn.type_raw|lower }}">{{ txn.type }}</span></td>
+        <td style="font-weight:bold;color:#1d4ed8">
+          {% if txn.doc_id != "—" %}{{ txn.doc_id }}{% else %}—{% endif %}
         </td>
-        {% endif %}
+        <td>{{ txn.doc_type }}</td>
+        <td style="color:#555">{{ txn.notes }}</td>
+        <td class="amt" style="color:{% if txn.amount_pos %}#c0392b{% else %}#27ae60{% endif %}">
+          {% if not txn.amount_pos %}−{% endif %}₹{{ txn.amount_abs }}
+        </td>
+        <td style="color:#555">{{ txn.account }}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
+  {% endif %}
 
 </body>
 </html>

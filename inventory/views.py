@@ -1,5 +1,6 @@
 from decimal import Decimal
 from django.db import models
+from django.http import HttpResponse                          # ← THIS was missing
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -22,6 +23,13 @@ class ProductViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs     = Product.objects.all()
         params = self.request.query_params
+
+        # Comma-separated IDs — used by selective print, short-circuits all other filters
+        ids_param = params.get('ids')
+        if ids_param:
+            id_list = [int(i) for i in ids_param.split(',') if i.strip().isdigit()]
+            return qs.filter(id__in=id_list)
+
         if params.get('is_active') is not None:
             qs = qs.filter(is_active=params['is_active'].lower() == 'true')
         if params.get('low_stock') == 'true':
@@ -37,7 +45,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         """
         product = self.get_object()
         stxn = _create_stxn(
-            type     = 'actual',
+            type_    = 'actual',
             quantity = Decimal(str(request.data['quantity'])),
             product  = product,
             document = None,
@@ -47,15 +55,14 @@ class ProductViewSet(viewsets.ModelViewSet):
         )
         return Response(
             StockTransactionSerializer(stxn, context={'request': request}).data,
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
 
     @action(detail=True, methods=['post'])
     def set_stock(self, request, pk=None):
         """
         Direct stock overwrite — NO s.txn created at all.
-        Per spec 6.3 — Direct Edit method: "User directly edits current_stock on the Product.
-        No s.txn is created at all."
+        Per spec 6.3 — Direct Edit method.
         """
         product = self.get_object()
         product.current_stock = Decimal(str(request.data['current_stock']))
@@ -67,9 +74,6 @@ class ProductViewSet(viewsets.ModelViewSet):
         """
         All pending record s.txns for this product where remaining quantity != 0.
         Per spec 6.2 — Product page stock movement section.
-        Only shows records where document is still active (is_active=True).
-        Record s.txns are always hard-deleted on document deletion (both options),
-        so this filter is purely a safety net.
         """
         product = self.get_object()
         records = StockTransaction.objects.filter(
@@ -117,6 +121,28 @@ class ProductViewSet(viewsets.ModelViewSet):
         })
         return Response(result)
 
+    @action(detail=False, methods=['get'])
+    def print(self, request):
+        """
+        Generates stock list PDF.
+        ?ids=1,2,3        → only those products (selective print)
+        ?low_stock=true   → only low stock products
+        ?is_active=true   → all active products (default)
+        """
+        from accounting.services import generate_stock_list_pdf
+        qs             = self.filter_queryset(self.get_queryset())
+        low_stock_only = request.query_params.get('low_stock', '').lower() == 'true'
+        try:
+            pdf_bytes, filename = generate_stock_list_pdf(
+                list(qs), request=request, low_stock_only=low_stock_only,
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
 
 class StockTransactionViewSet(viewsets.ModelViewSet):
     serializer_class = StockTransactionSerializer
@@ -142,9 +168,6 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
         if params.get('date_to'):
             qs = qs.filter(date__lte=params['date_to'])
 
-        # Derived filter — no DB field, computed from document.is_active
-        # ?is_document_deleted=true  → document exists but is soft-deleted
-        # ?is_document_deleted=false → document is active or no document linked
         is_doc_deleted = params.get('is_document_deleted')
         if is_doc_deleted is not None:
             if is_doc_deleted.lower() == 'true':
@@ -153,14 +176,12 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(
                     models.Q(document__isnull=True) | models.Q(document__is_active=True)
                 )
-
         return qs
 
     def update(self, request, *args, **kwargs):
         """
         Only actual s.txns can be edited directly.
-        Record s.txns are managed via document edit → _sync_record_stxns in accounting.services.
-        Quantity diff is applied to product.current_stock immediately.
+        Record s.txns are managed via document edit → _sync_record_stxns.
         """
         stxn = self.get_object()
         if stxn.type == 'record':
@@ -168,28 +189,24 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
                 {'error': 'Record stock transactions are managed via document edit.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
         if 'quantity' in request.data:
             new_qty = Decimal(str(request.data['quantity']))
             diff    = new_qty - stxn.quantity
             stxn.product.current_stock += diff
             stxn.product.save(update_fields=['current_stock', 'updated_at'])
             stxn.quantity = new_qty
-
         if 'notes' in request.data:
             stxn.notes = request.data['notes']
         if 'date' in request.data:
             stxn.date = _parse_date(request.data['date'])
         if 'rate' in request.data:
             stxn.rate = request.data['rate']
-
         stxn.save()
         return Response(StockTransactionSerializer(stxn, context={'request': request}).data)
 
     def destroy(self, request, *args, **kwargs):
         """
         Only actual s.txns can be deleted directly.
-        Record s.txns are deleted via document deletion flow only.
         Reverses the stock change on delete.
         """
         stxn = self.get_object()
@@ -198,7 +215,6 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
                 {'error': 'Record stock transactions are managed via document deletion.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
         stxn.product.current_stock -= stxn.quantity
         stxn.product.save(update_fields=['current_stock', 'updated_at'])
         stxn.delete()
@@ -208,11 +224,11 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
     def adjust(self, request):
         """
         Standalone stock adjustment from the Stock Transactions page.
-        Per spec 6.3 — Adjust Stock: creates actual s.txn, no document, updates current_stock.
+        Per spec 6.3 — Adjust Stock.
         """
         product = Product.objects.get(pk=request.data['product'])
         stxn = _create_stxn(
-            type     = 'actual',
+            type_    = 'actual',
             quantity = Decimal(str(request.data['quantity'])),
             product  = product,
             document = None,
@@ -222,5 +238,46 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
         )
         return Response(
             StockTransactionSerializer(stxn, context={'request': request}).data,
-            status=status.HTTP_201_CREATED
+            status=status.HTTP_201_CREATED,
         )
+
+    @action(detail=False, methods=['get'])
+    def print(self, request):
+        """
+        Generates stock transactions PDF for a product with optional date range.
+        ?product=5            → filter by product (required for running balance)
+        ?date_from=2026-01-01 → period start
+        ?date_to=2026-03-24   → period end
+        """
+        from datetime import date as date_type
+        from accounting.services import generate_stock_transactions_pdf
+
+        qs = self.filter_queryset(self.get_queryset())
+
+        product = None
+        if request.query_params.get('product'):
+            try:
+                product = Product.objects.get(pk=request.query_params['product'])
+            except Product.DoesNotExist:
+                pass
+
+        date_from, date_to = None, None
+        if request.query_params.get('date_from'):
+            try: date_from = date_type.fromisoformat(request.query_params['date_from'])
+            except ValueError: pass
+        if request.query_params.get('date_to'):
+            try: date_to = date_type.fromisoformat(request.query_params['date_to'])
+            except ValueError: pass
+
+        try:
+            pdf_bytes, filename = generate_stock_transactions_pdf(
+                list(qs), request=request,
+                product=product, date_from=date_from, date_to=date_to,
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response

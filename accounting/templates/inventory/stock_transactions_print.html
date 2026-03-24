@@ -1,0 +1,169 @@
+{# accounting/templates/inventory/stock_transactions_print.html #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; font-size: 11px; color: #222; padding: 24px; }
+    @page { size: A4 landscape; margin: 15mm; }
+
+    .header {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      border-bottom: 2px solid #222; padding-bottom: 12px; margin-bottom: 14px;
+    }
+    .header-logo img { max-height: 70px; max-width: 180px; }
+    .report-title { text-align: right; }
+    .report-title h1 { font-size: 18px; font-weight: bold; }
+    .report-title .sub { font-size: 10px; color: #777; margin-top: 4px; }
+
+    .entity-info {
+      margin-bottom: 14px; padding: 10px 12px;
+      background: #f7f7f7; border-radius: 6px; border: 1px solid #e8e8e8;
+    }
+    .entity-info .name { font-size: 14px; font-weight: bold; margin-bottom: 4px; }
+    .entity-info .meta { color: #555; font-size: 10px; }
+    .entity-info .meta span { margin-right: 12px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 10px; }
+    thead tr { background: #f0f0f0; }
+    th {
+      padding: 7px 6px; text-align: left; text-transform: uppercase;
+      letter-spacing: 0.04em; font-size: 9px; font-weight: bold; border: 1px solid #ccc;
+    }
+    td { padding: 6px 6px; border: 1px solid #ddd; vertical-align: top; }
+    tbody tr:nth-child(even) td { background: #fafafa; }
+    .r   { text-align: right; }
+    .amt { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; }
+
+    .in     { color: #27ae60; font-weight: bold; }
+    .out    { color: #c0392b; font-weight: bold; }
+    .run    { color: #1d4ed8; font-weight: bold; }
+    .run-nil { color: #888; }
+
+    .row-opening td { background: #eef4ff; font-weight: bold; border-color: #c5d9f7; }
+    .row-record td  { opacity: 0.6; }
+    .row-closing td {
+      border-top: 2px solid #222; background: #f2f2f2;
+      font-weight: bold; font-size: 11px;
+    }
+
+    .badge {
+      display: inline-block; padding: 1px 5px; border-radius: 3px;
+      font-size: 8px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .badge-actual { background: #222; color: #fff; }
+    .badge-record { background: #e5e7eb; color: #374151; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="header-logo">
+      {% if header_image %}<img src="{{ header_image }}" alt="Logo">{% endif %}
+    </div>
+    <div class="report-title">
+      <h1>{{ report_title }}</h1>
+      <div class="sub">Printed on {% now "d M Y" %}</div>
+    </div>
+  </div>
+
+  {% if product %}
+  <div class="entity-info">
+    <div class="name">{{ product.name }}</div>
+    <div class="meta">
+      <span>Unit: {{ product.unit }}</span>
+      <span>Rate: ₹{{ product.rate }}</span>
+      {% if product.hsn_code %}<span>HSN: {{ product.hsn_code }}</span>{% endif %}
+      {% if date_from or date_to %}
+        <span>Period: {{ date_from|default:"—" }} to {{ date_to|default:"present" }}</span>
+      {% endif %}
+      <span style="font-weight:bold;color:#1d4ed8">
+        Current Stock: {{ product.current_stock }} {{ product.unit }}
+      </span>
+    </div>
+  </div>
+  {% endif %}
+
+  <table>
+    <thead>
+      <tr>
+        <th style="width:70px">Date</th>
+        <th style="width:65px">Type</th>
+        <th>Document</th>
+        <th style="width:90px" class="r">Stock In</th>
+        <th style="width:90px" class="r">Stock Out</th>
+        <th style="width:110px" class="r">Running Stock</th>
+      </tr>
+    </thead>
+    <tbody>
+
+      {# Opening stock row — only when date_from is set and value is non-zero #}
+      {% if show_opening %}
+      <tr class="row-opening">
+        <td>—</td>
+        <td colspan="2"><strong>Opening Stock</strong></td>
+        <td class="amt in">{% if opening_stock_pos %}{{ opening_stock }} {{ product.unit }}{% endif %}</td>
+        <td class="amt out">{% if not opening_stock_pos %}{{ opening_stock }} {{ product.unit }}{% endif %}</td>
+        <td class="amt run">{{ opening_stock }} {{ product.unit }}</td>
+      </tr>
+      {% endif %}
+
+      {% for txn in transactions %}
+      <tr {% if txn.type_raw == 'record' %}class="row-record"{% endif %}>
+        <td style="font-weight:600;color:#555">{{ txn.date }}</td>
+        <td>
+          <span class="badge badge-{{ txn.type_raw }}">{{ txn.type }}</span>
+        </td>
+        <td>
+          {% if txn.doc_id != "—" %}
+            <span style="font-weight:bold;color:#1d4ed8">{{ txn.doc_type }} #{{ txn.doc_id }}</span>
+          {% endif %}
+          {% if txn.rate != "—" %}
+            <br><span style="font-size:9px;color:#555">₹{{ txn.rate }}/unit</span>
+          {% endif %}
+          {% if txn.notes != "—" %}
+            <br><span style="font-size:9px;color:#777">{{ txn.notes }}</span>
+          {% endif %}
+        </td>
+
+        {# Stock In — positive qty #}
+        <td class="amt in">
+          {% if txn.qty_in %}+{{ txn.quantity }} {{ product.unit }}{% endif %}
+        </td>
+
+        {# Stock Out — negative qty #}
+        <td class="amt out">
+          {% if txn.qty_out %}−{{ txn.quantity }} {{ product.unit }}{% endif %}
+        </td>
+
+        {# Running stock — only for actual txns #}
+        <td class="amt {% if txn.running_stock %}run{% else %}run-nil{% endif %}">
+          {% if txn.running_stock %}
+            {{ txn.running_stock }} {{ product.unit }}
+          {% else %}
+            —
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+
+    </tbody>
+
+    {% if transactions %}
+    {% with last=transactions|last %}
+    <tr class="row-closing">
+      <td colspan="5" style="text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">
+        Closing Stock
+      </td>
+      <td class="amt run" style="font-size:12px">
+        {% if last.running_stock %}{{ last.running_stock }} {{ product.unit }}{% endif %}
+      </td>
+    </tr>
+    {% endwith %}
+    {% endif %}
+
+  </table>
+
+</body>
+</html>
