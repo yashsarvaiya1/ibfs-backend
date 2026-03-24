@@ -1,3 +1,4 @@
+# config/settings.py
 from pathlib import Path
 from dotenv import load_dotenv
 import os
@@ -10,13 +11,11 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'fallback-dev-secret-key-change-in-producti
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
-# After ALLOWED_HOSTS line, add:
 CSRF_TRUSTED_ORIGINS = os.getenv(
     'CORS_ALLOWED_ORIGINS',
     'http://localhost:4000,http://127.0.0.1:4000'
 ).split(',')
 
-# Security — reverse proxy / SSL support
 USE_X_FORWARDED_HOST = True
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
@@ -50,9 +49,7 @@ MIDDLEWARE = [
 ]
 
 WHITENOISE_INDEX_FILE = True
-
 ROOT_URLCONF = 'config.urls'
-
 
 TEMPLATES = [
     {
@@ -98,7 +95,6 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
-# Media — Django FileSystem
 MEDIA_URL  = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
@@ -108,6 +104,9 @@ UPLOAD_MAX_PDF_SIZE_MB   = int(os.getenv('UPLOAD_MAX_PDF_SIZE_MB', 20))
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# ── Pagination ────────────────────────────────────────────────────────────────
+# Custom class lives in shared/pagination.py
+# Supports ?page_size=20|50|100 query param (GD-03)
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.BasicAuthentication',
@@ -119,8 +118,8 @@ REST_FRAMEWORK = {
         'rest_framework.filters.SearchFilter',
         'rest_framework.filters.OrderingFilter',
     ],
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 20,
+    'DEFAULT_PAGINATION_CLASS': 'shared.pagination.IBFSPageNumberPagination',
+    'PAGE_SIZE': int(os.getenv('PAGE_SIZE', 20)),
 }
 
 CORS_ALLOWED_ORIGINS = os.getenv(
@@ -129,9 +128,11 @@ CORS_ALLOWED_ORIGINS = os.getenv(
 ).split(',')
 CORS_ALLOW_CREDENTIALS = True
 
-# Daily orphan cleanup — every day at 2:00 AM  ← spec says daily, not weekly
+# ── Cron Jobs ─────────────────────────────────────────────────────────────────
+# accounting.cron.cleanup_temp_pdfs: cleans up bulk/WhatsApp temp PDFs every 30 min (DV-04)
 CRONJOBS = [
-    ('0 2 * * *', 'upload.cron.cleanup_orphaned_uploads'),
+    ('0 2 * * *',   'upload.cron.cleanup_orphaned_uploads'),
+    ('*/30 * * * *', 'accounting.cron.cleanup_temp_pdfs'),
 ]
 
 CACHES = {
@@ -144,9 +145,13 @@ CACHES = {
     }
 }
 
-# Playwright PDF — no WeasyPrint deps, works everywhere
-PLAYWRIGHT_PDF_TIMEOUT = int(os.getenv('PLAYWRIGHT_PDF_TIMEOUT', '30000'))  # 30s
-PLAYWRIGHT_PDF_FORMAT = os.getenv('PLAYWRIGHT_PDF_FORMAT', 'A4')
+# ── Playwright PDF ─────────────────────────────────────────────────────────────
+PLAYWRIGHT_PDF_TIMEOUT = int(os.getenv('PLAYWRIGHT_PDF_TIMEOUT', '30000'))
+PLAYWRIGHT_PDF_FORMAT  = os.getenv('PLAYWRIGHT_PDF_FORMAT', 'A4')
 
-# Media base URL for PDFs (same as before)
+# ── Temp PDF Storage (bulk print / WhatsApp share) ────────────────────────────
+# Files placed here are auto-deleted by accounting.cron.cleanup_temp_pdfs after TTL (DV-04)
+TEMP_PDF_ROOT        = BASE_DIR / 'media' / 'temp'
+TEMP_PDF_TTL_MINUTES = int(os.getenv('TEMP_PDF_TTL_MINUTES', 30))
+
 MEDIA_BASE_URL = os.getenv('MEDIA_BASE_URL', 'http://localhost:8000')

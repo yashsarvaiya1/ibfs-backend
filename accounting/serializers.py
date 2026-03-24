@@ -1,4 +1,6 @@
+# accounting/serializers.py
 from decimal import Decimal
+from django.db.models import Sum
 from rest_framework import serializers
 from django.conf import settings as django_settings
 from .models import Document, FinancialTransaction
@@ -28,8 +30,10 @@ class FinancialTransactionSerializer(serializers.ModelSerializer):
         return obj.document.type if obj.document else None
 
     def get_is_document_deleted(self, obj):
-        if obj.document_id is None:
+        # document_id check avoids any DB hit when document is null
+        if not obj.document_id:
             return False
+        # document should be select_related by the viewset queryset
         return not obj.document.is_active
 
     def get_contact_name(self, obj):
@@ -57,7 +61,7 @@ class DocumentListSerializer(serializers.ModelSerializer):
         model  = Document
         fields = [
             'id', 'type', 'doc_id', 'contact', 'contact_name',
-            'date', 'total_amount', 'is_active', 'is_paid',  # ✅ added is_paid
+            'date', 'total_amount', 'is_active', 'is_paid',
             'payment_status',
         ]
 
@@ -67,11 +71,10 @@ class DocumentListSerializer(serializers.ModelSerializer):
         return obj.contact.company_name or obj.contact.contact_name
 
     def get_payment_status(self, obj):
-        NO_PAYMENT_TYPES = {
-            'po', 'pi', 'quotation', 'challan', 'interest', 'expense',
-        }
+        NO_PAYMENT_TYPES = {'po', 'pi', 'quotation', 'challan', 'interest', 'expense'}
         if obj.type in NO_PAYMENT_TYPES:
             return None
+        # obj.transactions uses prefetch_related('transactions') set in the viewset
         txns   = obj.transactions.all()
         record = abs(sum(t.amount for t in txns if t.type == 'record'))
         paid   = abs(sum(t.amount for t in txns if t.type == 'actual'))
@@ -93,7 +96,7 @@ class DocumentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model  = Document
-        fields = '__all__'  # ✅ is_paid included automatically via __all__
+        fields = '__all__'
 
     def get_attachment_urls_full(self, obj):
         request = self.context.get('request')
@@ -129,9 +132,7 @@ class DocumentSerializer(serializers.ModelSerializer):
         }
 
     def get_payment_status(self, obj):
-        NO_PAYMENT_TYPES = {
-            'po', 'pi', 'quotation', 'challan', 'interest', 'expense',
-        }
+        NO_PAYMENT_TYPES = {'po', 'pi', 'quotation', 'challan', 'interest', 'expense'}
         if obj.type in NO_PAYMENT_TYPES:
             return None
         txns   = obj.transactions.all()
@@ -145,26 +146,38 @@ class DocumentSerializer(serializers.ModelSerializer):
         }
 
     def get_stock_status(self, obj):
+        """
+        BF-06 fix: replaced per-product loop queries with a single aggregation.
+        Was: 1 DB query per product inside the loop = N+1
+        Now: 1 query for all record s.txns + 1 aggregation for all actual s.txns = 2 total
+        """
         from inventory.models import StockTransaction
+
         NO_STOCK_TYPES = {
             'po', 'pi', 'quotation', 'interest', 'expense',
             'cash_payment_voucher', 'cash_receipt_voucher',
         }
         if obj.type in NO_STOCK_TYPES:
             return None
+
         records = StockTransaction.objects.filter(
             document=obj, type='record'
         ).select_related('product')
         if not records.exists():
             return None
+
+        # Single aggregation for all actual s.txns on this document (BF-06)
+        actuals_map = {
+            a['product_id']: abs(a['total'] or Decimal('0'))
+            for a in StockTransaction.objects.filter(
+                document=obj, type='actual'
+            ).values('product_id').annotate(total=Sum('quantity'))
+        }
+
         result = []
         for r in records:
-            moved = abs(sum(
-                t.quantity for t in StockTransaction.objects.filter(
-                    document=obj, product=r.product, type='actual'
-                )
-            ))
             record_qty = abs(r.quantity)
+            moved      = actuals_map.get(r.product_id, Decimal('0'))
             result.append({
                 'product_id':    r.product_id,
                 'product_name':  r.product.name,

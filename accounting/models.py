@@ -1,44 +1,36 @@
+# accounting/models.py
 from django.db import models
 from shared.models import BaseModel
 
 
 class Document(BaseModel):
     TYPE_CHOICES = [
-        ("bill", "Bill"),
-        ("invoice", "Invoice"),
-        ("po", "Purchase Order"),
-        ("pi", "Proforma Invoice"),
-        ("quotation", "Quotation"),
-        ("challan", "Challan"),
-        ("cn", "Credit Note"),
-        ("dn", "Debit Note"),
+        ("bill",                 "Bill"),
+        ("invoice",              "Invoice"),
+        ("po",                   "Purchase Order"),
+        ("pi",                   "Proforma Invoice"),
+        ("quotation",            "Quotation"),
+        ("challan",              "Challan"),
+        ("cn",                   "Credit Note"),
+        ("dn",                   "Debit Note"),
         ("cash_payment_voucher", "Cash Payment Voucher"),
         ("cash_receipt_voucher", "Cash Receipt Voucher"),
-        ("interest", "Interest"),
-        ("expense", "Expense"),
+        ("interest",             "Interest"),
+        ("expense",              "Expense"),
     ]
-    type = models.CharField(max_length=30, choices=TYPE_CHOICES)
-    doc_id = models.CharField(max_length=50, unique=True)
-    contact = models.ForeignKey(
-        "shared.Contact",
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="documents",
+    type            = models.CharField(max_length=30, choices=TYPE_CHOICES)
+    doc_id          = models.CharField(max_length=50, unique=True)
+    contact         = models.ForeignKey(
+        "shared.Contact", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="documents",
     )
-    consignee = models.ForeignKey(
-        "shared.Contact",
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="consignee_documents",
+    consignee       = models.ForeignKey(
+        "shared.Contact", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="consignee_documents",
     )
-    reference = models.ForeignKey(
-        "self",
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="referenced_by",
+    reference       = models.ForeignKey(
+        "self", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="referenced_by",
     )
     line_items      = models.JSONField(default=list, blank=True)
     total_amount    = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
@@ -51,11 +43,11 @@ class Document(BaseModel):
     attachment_urls = models.JSONField(default=list, blank=True)
     notes           = models.TextField(blank=True, null=True)
     is_active       = models.BooleanField(default=True)
-    # ── Manual paid flag ──────────────────────────────────────────────────────
-    # Only meaningful for bill, invoice, cn, dn.
-    # User sets this manually when payment is collected without referencing the
-    # document (e.g. via contact ledger). Does NOT affect any f.txn or balance.
+    # Manual paid flag — display only, no f.txn / balance effect
     is_paid         = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ['-date', '-created_at']             # DV-01: latest first
 
     def __str__(self):
         return f"{self.type.upper()} #{self.doc_id}"
@@ -63,35 +55,26 @@ class Document(BaseModel):
 
 class FinancialTransaction(BaseModel):
     TYPE_CHOICES = [("record", "Record"), ("actual", "Actual"), ("contra", "Contra")]
-    type     = models.CharField(max_length=10, choices=TYPE_CHOICES)
-    date     = models.DateField()
-    amount   = models.DecimalField(max_digits=15, decimal_places=2)
-    document = models.ForeignKey(
-        Document,
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="transactions",
+    type            = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    date            = models.DateField()
+    amount          = models.DecimalField(max_digits=15, decimal_places=2)
+    document        = models.ForeignKey(
+        Document, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="transactions",
     )
-    contact = models.ForeignKey(
-        "shared.Contact",
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="transactions",
+    contact         = models.ForeignKey(
+        "shared.Contact", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="transactions",
     )
     payment_account = models.ForeignKey(
-        "shared.PaymentAccount",
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="transactions",
+        "shared.PaymentAccount", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="transactions",
     )
     notes                    = models.TextField(blank=True, null=True)
     monthly_cumulative_delta = models.DecimalField(max_digits=15, decimal_places=2, default=0)
 
     class Meta:
-        ordering = ["date", "created_at"]
+        ordering = ['-date', '-created_at']             # BF-01: newest first everywhere
 
     def __str__(self):
         return f"{self.type} {self.amount}"
