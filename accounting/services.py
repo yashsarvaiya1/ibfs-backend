@@ -960,3 +960,66 @@ def generate_stock_txn_list_pdf(stock_txns, request=None, report_title=None):
     pdf_bytes   = _render_playwright_pdf(html_string)
     filename    = f"StockTransactions_{timezone.now().date()}.pdf"
     return (pdf_bytes, filename)
+
+@transaction.atomic
+def process_standalone_interest(contact, data):
+    date           = _parse_date(data.get('date'))
+    interest_lines = data.get('line_items', [])
+    toggle         = data.get('toggle', 'charge')  # 'charge' = we receive, 'credit' = we pay
+
+    # ✅ Respect per-line type, same formula as process_send_receive
+    net = sum(
+        Decimal(str(l['amount'])) if l.get('type') != 'discount'
+        else -Decimal(str(l['amount']))
+        for l in interest_lines
+    )
+
+    record_amount = net if toggle == 'we_pay' else -net
+
+    interest_doc = Document.objects.create(
+        type         = 'interest',
+        doc_id       = _next_doc_id('interest'),
+        contact      = contact,
+        line_items   = interest_lines,
+        total_amount = abs(net),
+        date         = date,
+        reference_id = data.get('reference'),   # ← also wire up the linked doc
+    )
+    ftxn = _create_ftxn('record', record_amount, contact, None, interest_doc, date)
+    return {'interest_doc': interest_doc.pk, 'ftxn': ftxn.pk}
+
+def _sync_ftxn_contact(doc, old_contact):
+    """
+    Called after doc.save() when contact may have changed.
+    - Bulk-updates contact on all linked FinancialTransactions.
+    - Recalculates MCD for old contact (those txns no longer belong to it).
+    - Recalculates MCD for new contact (those txns now belong to it).
+    If contact didn't change, exits immediately — zero DB cost.
+    """
+    new_contact = doc.contact
+
+    # pk-safe comparison — handles None on both sides
+    old_pk = old_contact.pk if old_contact else None
+    new_pk = new_contact.pk if new_contact else None
+    if old_pk == new_pk:
+        return
+
+    ftxns = list(FinancialTransaction.objects.filter(document=doc))
+    if not ftxns:
+        return
+
+    # Unique dates affected (usually just one, but cover multi-date edge cases)
+    affected_dates = list({f.date for f in ftxns})
+
+    # Single bulk UPDATE — no per-row save needed
+    FinancialTransaction.objects.filter(document=doc).update(contact=new_contact)
+
+    # Old contact loses these txns → recalculate its MCD
+    if old_contact:
+        for date in affected_dates:
+            _recalculate_mcd(old_contact, date)
+
+    # New contact gains these txns → recalculate its MCD
+    if new_contact:
+        for date in affected_dates:
+            _recalculate_mcd(new_contact, date)

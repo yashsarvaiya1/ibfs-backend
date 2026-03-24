@@ -17,10 +17,11 @@ from .services import (
     process_document_create, process_document_delete, process_move_stock,
     generate_document_pdf, generate_bulk_documents_pdf,
     generate_transactions_pdf,
-    STXN_SIGN, CHALLAN_STXN_SIGN,
+    STXN_SIGN, CHALLAN_STXN_SIGN,process_standalone_interest,_sync_ftxn_contact, 
 )
 from shared.models import Contact, PaymentAccount, Settings
 from inventory.models import StockTransaction, Product
+from django.db import transaction
 
 HAS_BALANCE_TYPES = {'bill', 'invoice', 'cn', 'dn'}
 
@@ -102,10 +103,12 @@ class DocumentViewSet(viewsets.ModelViewSet):
         )
 
 
+    @transaction.atomic
     def update(self, request, *args, **kwargs):
         doc              = self.get_object()
         old_total_amount = Decimal(str(doc.total_amount)) if doc.total_amount is not None else None
         old_date         = doc.date
+        old_contact      = doc.contact      # ← capture before any mutation
 
         # DI-01: editable doc_id — validate uniqueness before saving
         if 'doc_id' in request.data:
@@ -129,6 +132,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
             if field in request.data:
                 setattr(doc, field, request.data[field])
 
+        # ← contact change: resolve to object (or None if cleared)
+        if 'contact' in request.data:
+            contact_id  = request.data['contact']
+            doc.contact = Contact.objects.get(pk=contact_id) if contact_id else None
+
         if 'consignee' in request.data:
             doc.consignee_id = request.data['consignee']
         if 'reference' in request.data:
@@ -147,6 +155,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         doc.save()
         _sync_record_ftxns(doc, old_total_amount, old_date)
+        _sync_ftxn_contact(doc, old_contact)    # ← propagates contact change + MCD
+
         return Response(DocumentSerializer(doc, context={'request': request}).data)
 
 
@@ -188,31 +198,49 @@ class DocumentViewSet(viewsets.ModelViewSet):
         actual_amt = -amount_raw if direction == 'send' else amount_raw
         result     = {}
 
-        if interest_lines:
-            net = sum(
-                Decimal(str(l['amount'])) if l.get('type') == 'charge'
-                else -Decimal(str(l['amount']))
-                for l in interest_lines
-            )
-            interest_record_amount = -net if direction == 'receive' else net
-            interest_doc = Document.objects.create(
-                type         = 'interest',
-                doc_id       = _next_doc_id('interest'),
-                contact      = doc.contact,
-                line_items   = interest_lines,
-                total_amount = abs(net),
-                date         = date,
-                reference    = doc,
-            )
-            int_ftxn = _create_ftxn(
-                'record', interest_record_amount,
-                doc.contact, None, interest_doc, date,
-            )
-            result['interest_doc']  = interest_doc.pk
-            result['interest_ftxn'] = int_ftxn.pk
+        with transaction.atomic():
+            if interest_lines:
+                net = sum(
+                    Decimal(str(l['amount'])) if l.get('type') == 'charge'
+                    else -Decimal(str(l['amount']))
+                    for l in interest_lines
+                )
+                interest_record_amount = -net if direction == 'receive' else net
+                interest_doc = Document.objects.create(
+                    type         = 'interest',
+                    doc_id       = _next_doc_id('interest'),
+                    contact      = doc.contact,
+                    line_items   = interest_lines,
+                    total_amount = abs(net),
+                    date         = date,
+                    reference    = doc,
+                )
+                int_ftxn = _create_ftxn(
+                    'record', interest_record_amount,
+                    doc.contact, None, interest_doc, date,
+                )
+                result['interest_doc']  = interest_doc.pk
+                result['interest_ftxn'] = int_ftxn.pk
 
-        ftxn           = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes)
-        result['ftxn'] = ftxn.pk
+            ftxn           = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes)
+            result['ftxn'] = ftxn.pk
+
+            # BF-04: auto mark paid when actuals >= records
+            MARK_PAID_TYPES = {'bill', 'invoice', 'cn', 'dn'}
+            if doc.type in MARK_PAID_TYPES and not doc.is_paid:
+                agg    = doc.transactions.aggregate(
+                    record_total=Sum('amount', filter=django_models.Q(type='record')),
+                    actual_total=Sum('amount', filter=django_models.Q(type='actual')),
+                )
+                record = abs(agg['record_total'] or Decimal('0'))
+                paid   = abs(agg['actual_total'] or Decimal('0'))
+                if record > 0 and paid >= record:
+                    doc.is_paid = True
+                    doc.save(update_fields=['is_paid', 'updated_at'])
+                    result['is_paid'] = True
+
+        return Response(result, status=status.HTTP_201_CREATED)
+
 
         # BF-04
         MARK_PAID_TYPES = {'bill', 'invoice', 'cn', 'dn'}
@@ -348,28 +376,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 {'error': 'enable_interest is disabled.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        contact_id     = request.data.get('contact')
-        contact        = Contact.objects.get(pk=contact_id) if contact_id else None
-        date           = _parse_date(request.data.get('date'))
-        interest_lines = request.data.get('line_items', [])
-        toggle         = request.data.get('toggle', 'charge')
+        contact_id = request.data.get('contact')
+        contact    = Contact.objects.get(pk=contact_id) if contact_id else None
 
-        net           = sum(Decimal(str(l['amount'])) for l in interest_lines)
-        record_amount = -net if toggle == 'charge' else net
-
-        interest_doc = Document.objects.create(
-            type         = 'interest',
-            doc_id       = _next_doc_id('interest'),
-            contact      = contact,
-            line_items   = interest_lines,
-            total_amount = net,
-            date         = date,
-        )
-        ftxn = _create_ftxn('record', record_amount, contact, None, interest_doc, date)
-        return Response(
-            {'interest_doc': interest_doc.pk, 'ftxn': ftxn.pk},
-            status=status.HTTP_201_CREATED,
-        )
+        result = process_standalone_interest(contact, request.data)
+        return Response(result, status=status.HTTP_201_CREATED)
 
 
     # ── Print Single Document PDF ─────────────────────────────────────────────
