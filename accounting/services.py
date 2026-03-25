@@ -1,4 +1,5 @@
 # accounting/services.py
+from pathlib import Path
 import re
 from decimal import Decimal
 from django.db import transaction
@@ -9,17 +10,21 @@ from .models import Document, FinancialTransaction
 from shared.models import PaymentAccount, Settings, Contact
 from django.template.loader import render_to_string
 from django.core.cache import cache
-from django.conf import settings
+from django.conf import settings as django_settings
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _build_media_url(request, relative_path):
+    """
+    Returns a file:// URL for embedding images in Playwright-rendered HTML.
+    Playwright reads files directly from disk — no HTTP request involved,
+    so this works in all environments without network/proxy issues.
+    """
     if not relative_path:
         return None
-    if request:
-        return request.build_absolute_uri(f"/media/{relative_path}")
-    return f"{settings.MEDIA_BASE_URL.rstrip('/')}/media/{relative_path}"
+    abs_path = Path(django_settings.MEDIA_ROOT) / relative_path
+    return abs_path.as_uri() 
 
 
 def _contact_display(contact):
@@ -318,7 +323,7 @@ def _render_playwright_pdf(html_string):
         page      = browser.new_page()
         page.set_content(html_string, wait_until='networkidle')
         pdf_bytes = page.pdf(
-            format=settings.PLAYWRIGHT_PDF_FORMAT,
+            format=django_settings.PLAYWRIGHT_PDF_FORMAT,
             print_background=True,
             prefer_css_page_size=True,
         )

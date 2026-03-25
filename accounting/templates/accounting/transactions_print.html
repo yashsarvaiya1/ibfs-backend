@@ -8,11 +8,15 @@
     body { font-family: Arial, sans-serif; font-size: 11px; color: #222; padding: 24px; }
     @page { size: A4 landscape; margin: 15mm; }
 
+    /* Bug #6 fix: full-width header banner */
+    .header-banner { width: 100%; margin-bottom: 12px; }
+    .header-banner img { width: 100%; height: auto; display: block; }
+
     .header {
       display: flex; justify-content: space-between; align-items: flex-start;
       border-bottom: 2px solid #222; padding-bottom: 12px; margin-bottom: 14px;
     }
-    .header-logo img { max-height: 70px; max-width: 180px; }
+    .company-name { font-size: 16px; font-weight: bold; }
     .report-title { text-align: right; }
     .report-title h1 { font-size: 18px; font-weight: bold; }
     .report-title .sub { font-size: 10px; color: #777; margin-top: 4px; }
@@ -63,18 +67,20 @@
 </head>
 <body>
 
-  <!-- HEADER -->
+  {% if header_image %}
+  <div class="header-banner">
+    <img src="{{ header_image }}" alt="Company Header">
+  </div>
+  {% endif %}
+
   <div class="header">
-    <div class="header-logo">
-      {% if header_image %}<img src="{{ header_image }}" alt="Logo">{% endif %}
-    </div>
+    <div class="company-name">{% if not header_image %}{{ settings.company_name|default:"" }}{% endif %}</div>
     <div class="report-title">
       <h1>{{ report_title }}</h1>
       <div class="sub">Printed on {% now "d M Y" %}</div>
     </div>
   </div>
 
-  <!-- CONTACT INFO -->
   {% if is_ledger and contact %}
   <div class="entity-info">
     <div class="name">{{ contact.company_name|default:contact.contact_name }}</div>
@@ -92,7 +98,6 @@
   </div>
   {% endif %}
 
-  <!-- ACCOUNT INFO -->
   {% if account %}
   <div class="entity-info">
     <div class="name">{{ account.name }}</div>
@@ -118,93 +123,53 @@
       </tr>
     </thead>
     <tbody>
-
-      {# Opening Balance row — uses opening_balance_val/pos/zero from services.py #}
       {% if opening_balance_val and not opening_balance_zero %}
       <tr class="row-opening">
         <td>—</td>
         <td><strong>{% if account %}Balance B/F{% else %}Opening Balance{% endif %}</strong></td>
-        <td class="amt cf-dr">
-          {% if opening_balance_pos %}₹{{ opening_balance_val }}{% endif %}
-        </td>
-        <td class="amt cf-cr">
-          {% if not opening_balance_pos %}₹{{ opening_balance_val }}{% endif %}
-        </td>
+        <td class="amt cf-dr">{% if opening_balance_pos %}₹{{ opening_balance_val }}{% endif %}</td>
+        <td class="amt cf-cr">{% if not opening_balance_pos %}₹{{ opening_balance_val }}{% endif %}</td>
         <td class="amt {% if opening_balance_pos %}cf-dr{% else %}cf-cr{% endif %}">
           ₹{{ opening_balance_val }}
-          <span style="font-size:9px;font-weight:normal;margin-left:3px">
-            {% if opening_balance_pos %}Dr{% else %}Cr{% endif %}
-          </span>
+          <span style="font-size:9px;font-weight:normal;margin-left:3px">{% if opening_balance_pos %}Dr{% else %}Cr{% endif %}</span>
         </td>
       </tr>
       {% endif %}
 
       {% for txn in transactions %}
       <tr {% if txn.is_expense %}class="row-expense"{% endif %}>
-
         <td style="font-weight:600;color:#555">{{ txn.date }}</td>
-
         <td>
           <span class="badge badge-{{ txn.type_raw|lower }}">{{ txn.type }}</span>
           {% if txn.is_expense %}<span class="badge badge-expense">expense</span>{% endif %}
           {% if txn.doc_id != "—" %}
-            <span style="margin-left:4px;font-weight:bold;color:#1d4ed8">
-              {{ txn.doc_type }} #{{ txn.doc_id }}
-            </span>
+            <span style="margin-left:4px;font-weight:bold;color:#1d4ed8">{{ txn.doc_type }} #{{ txn.doc_id }}</span>
           {% endif %}
-          {% if txn.notes != "—" and txn.notes %}
-            <br><span style="font-size:9px;color:#777">{{ txn.notes }}</span>
-          {% endif %}
-          {% if txn.account != "—" and txn.account %}
-            <br><span style="font-size:9px;color:#555">via {{ txn.account }}</span>
-          {% endif %}
+          {% if txn.notes != "—" and txn.notes %}<br><span style="font-size:9px;color:#777">{{ txn.notes }}</span>{% endif %}
+          {% if txn.account != "—" and txn.account %}<br><span style="font-size:9px;color:#555">via {{ txn.account }}</span>{% endif %}
         </td>
-
         <td class="{% if txn.is_expense %}amt-expense{% else %}amt cf-dr{% endif %}">
-          {% if txn.is_expense %}₹{{ txn.amount_abs }}
-          {% elif txn.amount_pos %}₹{{ txn.amount_abs }}{% endif %}
+          {% if txn.is_expense %}₹{{ txn.amount_abs }}{% elif txn.amount_pos %}₹{{ txn.amount_abs }}{% endif %}
         </td>
-
-        <td class="amt cf-cr">
-          {% if not txn.is_expense and not txn.amount_pos %}₹{{ txn.amount_abs }}{% endif %}
-        </td>
-
+        <td class="amt cf-cr">{% if not txn.is_expense and not txn.amount_pos %}₹{{ txn.amount_abs }}{% endif %}</td>
         <td class="amt {% if txn.running_cf_zero %}cf-nil{% elif txn.running_cf_positive %}cf-dr{% else %}cf-cr{% endif %}">
-          {% if txn.running_cf %}
-            ₹{{ txn.running_cf }}
-            {% if not txn.running_cf_zero %}
-              <span style="font-size:9px;font-weight:normal;margin-left:2px">
-                {% if txn.running_cf_positive %}Dr{% else %}Cr{% endif %}
-              </span>
-            {% endif %}
+          {% if txn.running_cf %}₹{{ txn.running_cf }}
+            {% if not txn.running_cf_zero %}<span style="font-size:9px;font-weight:normal;margin-left:2px">{% if txn.running_cf_positive %}Dr{% else %}Cr{% endif %}</span>{% endif %}
           {% endif %}
         </td>
-
       </tr>
       {% endfor %}
-
     </tbody>
-
-    {% if transactions %}
-    {% with last=transactions|last %}
+    {% if transactions %}{% with last=transactions|last %}
     <tr class="row-closing">
-      <td colspan="4" style="text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">
-        Closing Balance
-      </td>
+      <td colspan="4" style="text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">Closing Balance</td>
       <td class="amt {% if last.running_cf_zero %}cf-nil{% elif last.running_cf_positive %}cf-dr{% else %}cf-cr{% endif %}" style="font-size:12px">
-        {% if last.running_cf %}
-          ₹{{ last.running_cf }}
-          {% if not last.running_cf_zero %}
-            <span style="font-size:9px;font-weight:normal;margin-left:2px">
-              {% if last.running_cf_positive %}Dr{% else %}Cr{% endif %}
-            </span>
-          {% endif %}
+        {% if last.running_cf %}₹{{ last.running_cf }}
+          {% if not last.running_cf_zero %}<span style="font-size:9px;font-weight:normal;margin-left:2px">{% if last.running_cf_positive %}Dr{% else %}Cr{% endif %}</span>{% endif %}
         {% endif %}
       </td>
     </tr>
-    {% endwith %}
-    {% endif %}
-
+    {% endwith %}{% endif %}
   </table>
 
   {% else %}
@@ -225,9 +190,7 @@
       <tr>
         <td style="color:#555;font-weight:600">{{ txn.date }}</td>
         <td><span class="badge badge-{{ txn.type_raw|lower }}">{{ txn.type }}</span></td>
-        <td style="font-weight:bold;color:#1d4ed8">
-          {% if txn.doc_id != "—" %}{{ txn.doc_id }}{% else %}—{% endif %}
-        </td>
+        <td style="font-weight:bold;color:#1d4ed8">{% if txn.doc_id != "—" %}{{ txn.doc_id }}{% else %}—{% endif %}</td>
         <td>{{ txn.doc_type }}</td>
         <td style="color:#555">{{ txn.notes }}</td>
         <td class="amt" style="color:{% if txn.amount_pos %}#c0392b{% else %}#27ae60{% endif %}">

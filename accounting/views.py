@@ -70,10 +70,34 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         # ── BF-08: is_paid — restrict to balance-carrying types only ─────────
         if params.get('is_paid') not in (None, ''):
-            qs = qs.filter(
-                type__in=HAS_BALANCE_TYPES,                     # ← key fix
-                is_paid=params['is_paid'].lower() == 'true',
-            )
+            want_paid = params['is_paid'].lower() == 'true'
+            qs = qs.filter(type__in=HAS_BALANCE_TYPES)
+
+            from decimal import Decimal
+
+            def _is_txn_settled(doc) -> bool:
+                txns   = doc.transactions.all()
+                record = abs(sum(t.amount for t in txns if t.type == 'record'))
+                paid   = abs(sum(t.amount for t in txns if t.type == 'actual'))
+                return record > 0 and paid >= record
+
+            if want_paid:
+                matched_ids = [doc.pk for doc in qs if doc.is_paid or _is_txn_settled(doc)]
+            else:
+                matched_ids = [doc.pk for doc in qs if not doc.is_paid and not _is_txn_settled(doc)]
+
+            qs = Document.objects.filter(pk__in=matched_ids)
+
+        if params.get('is_due') not in (None, ''):
+            if params['is_due'].lower() == 'true':
+                from django.utils import timezone
+                today = timezone.localdate()
+                qs = qs.filter(
+                    type__in=HAS_BALANCE_TYPES,
+                    due_date__isnull=False,
+                    due_date__lt=today,
+                    is_paid=False,
+                )
 
         return qs
 

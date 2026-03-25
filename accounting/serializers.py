@@ -61,7 +61,7 @@ class DocumentListSerializer(serializers.ModelSerializer):
         model  = Document
         fields = [
             'id', 'type', 'doc_id', 'contact', 'contact_name',
-            'date', 'total_amount', 'is_active', 'is_paid',
+            'date', 'due_date', 'total_amount', 'is_active', 'is_paid',
             'payment_status',
         ]
 

@@ -7,11 +7,30 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: Arial, sans-serif; font-size: 12px; color: #222; padding: 32px; }
 
-    .header {
-      display: flex; justify-content: space-between; align-items: flex-start;
-      margin-bottom: 24px; border-bottom: 2px solid #222; padding-bottom: 16px;
+    /* ── Bug #6: Header image stretches full width ── */
+    .header-banner {
+      width: 100%;
+      margin-bottom: 16px;
     }
-    .header-logo img { max-height: 80px; max-width: 200px; }
+    .header-banner img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    /* ── Doc title row shown when no header image, or always for doc type/id ── */
+    .header-title-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 24px;
+      border-bottom: 2px solid #222;
+      padding-bottom: 16px;
+    }
+    .header-title-row.with-banner {
+      margin-top: 0;
+    }
+    .company-name { font-size: 18px; font-weight: bold; }
     .doc-title { text-align: right; }
     .doc-title h1 { font-size: 22px; font-weight: bold; text-transform: uppercase; }
     .doc-title .doc-id { font-size: 14px; color: #555; margin-top: 4px; }
@@ -55,18 +74,46 @@
     .notes-section { margin-bottom: 20px; font-size: 11px; }
     .notes-section h4 { font-size: 10px; text-transform: uppercase; color: #777; margin-bottom: 4px; }
 
-    .footer { margin-top: 40px; display: flex; justify-content: flex-end; }
-    .footer img { max-height: 60px; max-width: 160px; }
+    /* ── Bug #6: Signature at bottom-right ── */
+    .footer {
+      margin-top: 40px;
+      display: flex;
+      justify-content: flex-end;
+      align-items: flex-end;
+    }
+    .sign-block {
+      text-align: center;
+    }
+    .sign-block img {
+      max-height: 70px;
+      max-width: 180px;
+      display: block;
+      margin-bottom: 6px;
+    }
+    .sign-block p {
+      font-size: 10px;
+      color: #555;
+      border-top: 1px solid #aaa;
+      padding-top: 4px;
+      text-align: center;
+    }
 
     @page { size: A4 portrait; margin: 20mm; }
   </style>
 </head>
 <body>
 
-  <!-- HEADER -->
-  <div class="header">
-    <div class="header-logo">
-      {% if header_image %}<img src="{{ header_image }}" alt="Company Logo">{% endif %}
+  <!-- Bug #6: Full-width header banner image -->
+  {% if header_image %}
+  <div class="header-banner">
+    <img src="{{ header_image }}" alt="Company Header">
+  </div>
+  {% endif %}
+
+  <!-- Doc type + ID row (always shown, sits below banner if present) -->
+  <div class="header-title-row {% if header_image %}with-banner{% endif %}">
+    <div class="company-name">
+      {% if not header_image %}{{ settings.company_name|default:"" }}{% endif %}
     </div>
     <div class="doc-title">
       <h1>{{ doc_type_label }}</h1>
@@ -78,7 +125,6 @@
   <div class="parties">
     {% if contact %}
     <div class="party">
-      {# BF-09: use explicit is_vendor_doc flag — no `in` substring check #}
       {% if is_vendor_doc %}
         <h4>Vendor</h4>
       {% else %}
@@ -105,7 +151,15 @@
   <div class="meta-row">
     <div class="meta-item"><span>Date:</span> <strong>{{ document.date }}</strong></div>
     {% if document.due_date %}
-      <div class="meta-item"><span>Due Date:</span> <strong>{{ document.due_date }}</strong></div>
+      <div class="meta-item">
+        {# Bug #5: show "Validity Date" label for quotations, "Due Date" for all others #}
+        {% if document.type == "quotation" %}
+          <span>Validity Date:</span>
+        {% else %}
+          <span>Due Date:</span>
+        {% endif %}
+        <strong>{{ document.due_date }}</strong>
+      </div>
     {% endif %}
     {% if document.payment_terms %}
       <div class="meta-item"><span>Payment Terms:</span> <strong>{{ document.payment_terms }}</strong></div>
@@ -119,7 +173,6 @@
       <tr>
         <th>#</th>
         <th>Item / Description</th>
-        {# BF-09: use explicit is_simple_line_type flag — no `not in` substring check #}
         {% if not is_simple_line_type %}
           <th>HSN</th>
           <th>Qty</th>
@@ -177,10 +230,13 @@
   </div>
   {% endif %}
 
-  <!-- FOOTER / SIGNATURE -->
+  <!-- Bug #6: Signature block — bottom-right, only if sign_image is set -->
   {% if sign_image %}
   <div class="footer">
-    <img src="{{ sign_image }}" alt="Authorised Signature">
+    <div class="sign-block">
+      <img src="{{ sign_image }}" alt="Authorised Signature">
+      <p>Authorised Signatory</p>
+    </div>
   </div>
   {% endif %}
 

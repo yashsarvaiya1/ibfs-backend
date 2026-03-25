@@ -8,11 +8,15 @@
     body { font-family: Arial, sans-serif; font-size: 11px; color: #222; padding: 24px; }
     @page { size: A4 landscape; margin: 15mm; }
 
+    /* Bug #6 fix: full-width header banner */
+    .header-banner { width: 100%; margin-bottom: 12px; }
+    .header-banner img { width: 100%; height: auto; display: block; }
+
     .header {
       display: flex; justify-content: space-between; align-items: flex-start;
       border-bottom: 2px solid #222; padding-bottom: 12px; margin-bottom: 14px;
     }
-    .header-logo img { max-height: 70px; max-width: 180px; }
+    .company-name { font-size: 16px; font-weight: bold; }
     .report-title { text-align: right; }
     .report-title h1 { font-size: 18px; font-weight: bold; }
     .report-title .sub { font-size: 10px; color: #777; margin-top: 4px; }
@@ -43,25 +47,23 @@
 
     .row-opening td { background: #eef4ff; font-weight: bold; border-color: #c5d9f7; }
     .row-record td  { opacity: 0.6; }
-    .row-closing td {
-      border-top: 2px solid #222; background: #f2f2f2;
-      font-weight: bold; font-size: 11px;
-    }
+    .row-closing td { border-top: 2px solid #222; background: #f2f2f2; font-weight: bold; font-size: 11px; }
 
-    .badge {
-      display: inline-block; padding: 1px 5px; border-radius: 3px;
-      font-size: 8px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.05em;
-    }
+    .badge { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 8px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.05em; }
     .badge-actual { background: #222; color: #fff; }
     .badge-record { background: #e5e7eb; color: #374151; }
   </style>
 </head>
 <body>
 
+  {% if header_image %}
+  <div class="header-banner">
+    <img src="{{ header_image }}" alt="Company Header">
+  </div>
+  {% endif %}
+
   <div class="header">
-    <div class="header-logo">
-      {% if header_image %}<img src="{{ header_image }}" alt="Logo">{% endif %}
-    </div>
+    <div class="company-name">{% if not header_image %}{{ settings.company_name|default:"" }}{% endif %}</div>
     <div class="report-title">
       <h1>{{ report_title }}</h1>
       <div class="sub">Printed on {% now "d M Y" %}</div>
@@ -75,12 +77,8 @@
       <span>Unit: {{ product.unit }}</span>
       <span>Rate: ₹{{ product.rate }}</span>
       {% if product.hsn_code %}<span>HSN: {{ product.hsn_code }}</span>{% endif %}
-      {% if date_from or date_to %}
-        <span>Period: {{ date_from|default:"—" }} to {{ date_to|default:"present" }}</span>
-      {% endif %}
-      <span style="font-weight:bold;color:#1d4ed8">
-        Current Stock: {{ product.current_stock }} {{ product.unit }}
-      </span>
+      {% if date_from or date_to %}<span>Period: {{ date_from|default:"—" }} to {{ date_to|default:"present" }}</span>{% endif %}
+      <span style="font-weight:bold;color:#1d4ed8">Current Stock: {{ product.current_stock }} {{ product.unit }}</span>
     </div>
   </div>
   {% endif %}
@@ -97,8 +95,6 @@
       </tr>
     </thead>
     <tbody>
-
-      {# Opening stock row — only when date_from is set and value is non-zero #}
       {% if show_opening %}
       <tr class="row-opening">
         <td>—</td>
@@ -112,57 +108,27 @@
       {% for txn in transactions %}
       <tr {% if txn.type_raw == 'record' %}class="row-record"{% endif %}>
         <td style="font-weight:600;color:#555">{{ txn.date }}</td>
+        <td><span class="badge badge-{{ txn.type_raw }}">{{ txn.type }}</span></td>
         <td>
-          <span class="badge badge-{{ txn.type_raw }}">{{ txn.type }}</span>
+          {% if txn.doc_id != "—" %}<span style="font-weight:bold;color:#1d4ed8">{{ txn.doc_type }} #{{ txn.doc_id }}</span>{% endif %}
+          {% if txn.rate != "—" %}<br><span style="font-size:9px;color:#555">₹{{ txn.rate }}/unit</span>{% endif %}
+          {% if txn.notes != "—" %}<br><span style="font-size:9px;color:#777">{{ txn.notes }}</span>{% endif %}
         </td>
-        <td>
-          {% if txn.doc_id != "—" %}
-            <span style="font-weight:bold;color:#1d4ed8">{{ txn.doc_type }} #{{ txn.doc_id }}</span>
-          {% endif %}
-          {% if txn.rate != "—" %}
-            <br><span style="font-size:9px;color:#555">₹{{ txn.rate }}/unit</span>
-          {% endif %}
-          {% if txn.notes != "—" %}
-            <br><span style="font-size:9px;color:#777">{{ txn.notes }}</span>
-          {% endif %}
-        </td>
-
-        {# Stock In — positive qty #}
-        <td class="amt in">
-          {% if txn.qty_in %}+{{ txn.quantity }} {{ product.unit }}{% endif %}
-        </td>
-
-        {# Stock Out — negative qty #}
-        <td class="amt out">
-          {% if txn.qty_out %}−{{ txn.quantity }} {{ product.unit }}{% endif %}
-        </td>
-
-        {# Running stock — only for actual txns #}
+        <td class="amt in">{% if txn.qty_in %}+{{ txn.quantity }} {{ product.unit }}{% endif %}</td>
+        <td class="amt out">{% if txn.qty_out %}−{{ txn.quantity }} {{ product.unit }}{% endif %}</td>
         <td class="amt {% if txn.running_stock %}run{% else %}run-nil{% endif %}">
-          {% if txn.running_stock %}
-            {{ txn.running_stock }} {{ product.unit }}
-          {% else %}
-            —
-          {% endif %}
+          {% if txn.running_stock %}{{ txn.running_stock }} {{ product.unit }}{% else %}—{% endif %}
         </td>
       </tr>
       {% endfor %}
-
     </tbody>
 
-    {% if transactions %}
-    {% with last=transactions|last %}
+    {% if transactions %}{% with last=transactions|last %}
     <tr class="row-closing">
-      <td colspan="5" style="text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">
-        Closing Stock
-      </td>
-      <td class="amt run" style="font-size:12px">
-        {% if last.running_stock %}{{ last.running_stock }} {{ product.unit }}{% endif %}
-      </td>
+      <td colspan="5" style="text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">Closing Stock</td>
+      <td class="amt run" style="font-size:12px">{% if last.running_stock %}{{ last.running_stock }} {{ product.unit }}{% endif %}</td>
     </tr>
-    {% endwith %}
-    {% endif %}
-
+    {% endwith %}{% endif %}
   </table>
 
 </body>
