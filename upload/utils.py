@@ -2,7 +2,7 @@
 import io
 import os
 import uuid
-from PIL import Image
+from PIL import Image, ImageOps
 from django.conf import settings
 
 ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
@@ -31,6 +31,11 @@ def process_upload(file, subfolder='documents'):
     """
     Validates the file, compresses if image, returns (file_data: bytes, relative_path: str).
     relative_path is what gets stored in the DB (attachment_urls, image_url, etc.)
+
+    Bug B fix: apply EXIF orientation before saving so camera photos
+    aren't stored rotated. ImageOps.exif_transpose() reads the EXIF
+    Orientation tag and physically rotates/flips the pixel data, then
+    strips the tag so no downstream tool mis-rotates it again.
     """
     _validate(file)
 
@@ -39,6 +44,11 @@ def process_upload(file, subfolder='documents'):
 
     if is_image:
         img = Image.open(file)
+
+        # Bug B fix: apply EXIF rotation before any processing
+        # This handles all 8 EXIF orientations (rotate 90/180/270, flip)
+        img = ImageOps.exif_transpose(img)
+
         if img.mode in ('RGBA', 'P'):
             img = img.convert('RGB')
         buffer = io.BytesIO()
