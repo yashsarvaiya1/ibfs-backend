@@ -699,39 +699,66 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
     # ── Print Transactions PDF (TV-06) ────────────────────────────────────────
     @action(detail=False, methods=['get'])
     def print(self, request):
-        qs        = self.filter_queryset(self.get_queryset())
-        view_mode = request.query_params.get('view', 'list')
+        # Always include record txns for print — interest/document records must show
+        # Do NOT use self.get_queryset() here as it strips records when auto_transaction=True
+        qs = (
+            FinancialTransaction.objects
+            .select_related('document', 'contact', 'payment_account')
+            .all()
+        )
+        params = request.query_params
+ 
+        # Apply all filters manually (same as get_queryset but without the record exclusion)
+        if params.get('contact') not in (None, ''):
+            qs = qs.filter(contact_id=params['contact'])
+        if params.get('account') not in (None, ''):
+            qs = qs.filter(payment_account_id=params['account'])
+        if params.get('document') not in (None, ''):
+            qs = qs.filter(document_id=params['document'])
+        if params.get('doc_type') not in (None, ''):
+            qs = qs.filter(document__type=params['doc_type'])
+        if params.get('date_from') not in (None, ''):
+            qs = qs.filter(date__gte=params['date_from'])
+        if params.get('date_to') not in (None, ''):
+            qs = qs.filter(date__lte=params['date_to'])
+        if params.get('document_type') not in (None, ''):
+            qs = qs.filter(document__type=params['document_type'])
+ 
+        # Order consistently
+        qs = qs.order_by('date', 'created_at')
+ 
+        view_mode = params.get('view', 'list')
         is_ledger = view_mode == 'ledger'
-
+ 
         contact    = None
-        contact_id = request.query_params.get('contact')
+        contact_id = params.get('contact')
         if contact_id not in (None, ''):
             try:
                 contact = Contact.objects.get(pk=contact_id)
             except Contact.DoesNotExist:
                 pass
-
+ 
         account    = None
-        account_id = request.query_params.get('account')
+        account_id = params.get('account')
         if account_id not in (None, ''):
             try:
                 account = PaymentAccount.objects.get(pk=account_id)
             except PaymentAccount.DoesNotExist:
                 pass
-
+ 
         # ── Parse date_from ───────────────────────────────────────────────────
         date_from = None
-        raw_df    = request.query_params.get('date_from')
+        raw_df    = params.get('date_from')
         if raw_df not in (None, ''):
             try:
                 from datetime import date as date_type
                 date_from = date_type.fromisoformat(raw_df)
             except Exception:
                 pass
-
+ 
         # ── opening_balance_at — contact ledger ───────────────────────────────
         opening_balance_at = None
-        raw_oba            = request.query_params.get('opening_balance_at')
+        raw_oba            = params.get('opening_balance_at')
         if raw_oba not in (None, ''):
             try:
                 opening_balance_at = Decimal(raw_oba)
@@ -739,10 +766,10 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 pass
         elif contact and is_ledger:
             opening_balance_at = compute_opening_balance_for_print(contact, date_from)
-
+ 
         # ── balance_before_period — account statement / account ledger ────────
         balance_before_period = None
-        raw_bbp               = request.query_params.get('balance_before_period')
+        raw_bbp               = params.get('balance_before_period')
         if raw_bbp not in (None, ''):
             try:
                 balance_before_period = Decimal(raw_bbp)
@@ -750,7 +777,6 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 pass
         elif account:
             if date_from:
-                # Balance just before the filtered window
                 after_sum = (
                     FinancialTransaction.objects
                     .filter(payment_account=account, date__gte=date_from)
@@ -758,19 +784,16 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 )
                 balance_before_period = Decimal(str(account.current_balance)) - after_sum
             else:
-                # No filter: balance before ALL txns = initial seeded balance
                 all_sum = (
                     FinancialTransaction.objects
                     .filter(payment_account=account)
                     .aggregate(total=Sum('amount'))['total'] or Decimal('0')
                 )
                 balance_before_period = Decimal(str(account.current_balance)) - all_sum
-
-        # For account ledger view, pipe balance_before_period as opening_balance_at
-        # so generate_transactions_pdf can seed running_cf correctly
+ 
         if is_ledger and account and balance_before_period is not None:
             opening_balance_at = balance_before_period
-
+ 
         try:
             pdf_bytes, filename = generate_transactions_pdf(
                 list(qs),
@@ -786,7 +809,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 {'error': f'PDF generation failed: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-
+ 
         response = HttpResponse(pdf_bytes, content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
         return response

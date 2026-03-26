@@ -188,21 +188,31 @@ def generate_transactions_pdf(
     balance_before_period=None,
 ):
     app_settings = Settings.get()
-
+ 
     if opening_balance_at is not None:
         running_cf = Decimal(str(opening_balance_at))
     elif contact:
         running_cf = Decimal(str(contact.opening_balance or 0))
     else:
         running_cf = None
-
+ 
+    is_account_ledger = is_ledger_view and account is not None
+ 
     rows = []
     for txn in transactions:
-        # Mirror frontend ContactLedger logic exactly
         is_expense = txn.document is not None and txn.document.type == 'expense'
         is_contra  = txn.type == 'contra'
-        affects_cf = not is_expense and not is_contra
-
+ 
+        # Contact ledger: expenses do NOT affect the contact's running balance.
+        #   The contact owes/is owed the same regardless of internal expenses.
+        # Account ledger: expenses DO affect the account balance —
+        #   money physically left the account, so it must move the running CF.
+        # Contra never affects either — it's an internal transfer, not a real inflow/outflow.
+        if is_account_ledger:
+            affects_cf = not is_contra
+        else:
+            affects_cf = not is_expense and not is_contra
+ 
         row = {
             'date':       txn.date,
             'type':       txn.get_type_display(),
@@ -210,26 +220,23 @@ def generate_transactions_pdf(
             'doc_id':     txn.document.doc_id if txn.document else '—',
             'doc_type':   txn.document.get_type_display() if txn.document else '—',
             'notes':      txn.notes or '—',
-            'amount':     str(txn.amount.quantize(Decimal('0.01'))),          # ← add back
+            'amount':     str(txn.amount.quantize(Decimal('0.01'))),
             'amount_abs': str(abs(txn.amount).quantize(Decimal('0.01'))),
             'amount_pos': txn.amount >= 0,
             'account':    txn.payment_account.name if txn.payment_account else '—',
             'is_expense': is_expense,
             'is_contra':  is_contra,
         }
-
+ 
         if is_ledger_view and running_cf is not None:
-            # Only advance running_cf for CF-affecting txns (matches frontend)
             if affects_cf:
                 running_cf += txn.amount
-            # Always emit balance (expense rows show unchanged balance, same as frontend)
             row['running_cf']          = str(abs(running_cf).quantize(Decimal('0.01')))
             row['running_cf_positive'] = running_cf > 0
             row['running_cf_zero']     = running_cf == 0
-
+ 
         rows.append(row)
-
-    # Opening balance — absolute value + direction flags, no string slicing in template
+ 
     ob_val  = None
     ob_pos  = False
     ob_zero = False
@@ -238,7 +245,7 @@ def generate_transactions_pdf(
         ob_val  = str(abs(ob_dec).quantize(Decimal('0.01')))
         ob_pos  = ob_dec > 0
         ob_zero = ob_dec == 0
-
+ 
     if not report_title:
         if contact:
             report_title = f"Ledger — {contact.company_name or contact.contact_name}"
@@ -246,7 +253,7 @@ def generate_transactions_pdf(
             report_title = f"Account Statement — {account.name}"
         else:
             report_title = "Financial Transactions"
-
+ 
     context = {
         'settings':              app_settings,
         'header_image':          _build_media_url(request, app_settings.header_image),
@@ -255,7 +262,6 @@ def generate_transactions_pdf(
         'transactions':          rows,
         'is_ledger':             is_ledger_view,
         'report_title':          report_title,
-        # Clean flags — no raw signed strings sent to template
         'opening_balance_val':   ob_val,
         'opening_balance_pos':   ob_pos,
         'opening_balance_zero':  ob_zero,
@@ -264,10 +270,10 @@ def generate_transactions_pdf(
             if balance_before_period is not None else None
         ),
     }
-
+ 
     html_string = render_to_string('accounting/transactions_print.html', context)
     pdf_bytes   = _render_playwright_pdf(html_string)
-
+ 
     if contact:
         safe_name = (contact.company_name or contact.contact_name).replace(' ', '_')
         filename  = f"Ledger_{safe_name}_{timezone.now().date()}.pdf"
@@ -276,7 +282,7 @@ def generate_transactions_pdf(
         filename  = f"Statement_{safe_name}_{timezone.now().date()}.pdf"
     else:
         filename = f"Transactions_{timezone.now().date()}.pdf"
-
+ 
     return (pdf_bytes, filename)
 
 
