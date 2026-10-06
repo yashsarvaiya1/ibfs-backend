@@ -184,6 +184,7 @@ class ContactViewSet(viewsets.ModelViewSet):
 
 
 class PaymentAccountViewSet(viewsets.ModelViewSet):
+    search_fields = ['name', 'account_number', 'upi_id']
     serializer_class = PaymentAccountSerializer
     ordering         = ['name']
 
@@ -193,6 +194,18 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
         if is_active is not None:
             qs = qs.filter(is_active=is_active.lower() == 'true')
         return qs
+
+    def perform_update(self, serializer):
+        from django.db import transaction
+        from accounting.services import _create_ftxn
+        from django.utils import timezone
+        with transaction.atomic():
+            serializer.instance = PaymentAccount.objects.select_for_update().get(pk=serializer.instance.pk)
+            target = serializer.validated_data.pop('current_balance', None)
+            account = serializer.save()
+            if target is not None and target != account.current_balance:
+                _create_ftxn('actual', target-account.current_balance, None, account, None,
+                    timezone.localdate(), 'Balance reconciliation')
 
     def destroy(self, request, *args, **kwargs):
         account = self.get_object()

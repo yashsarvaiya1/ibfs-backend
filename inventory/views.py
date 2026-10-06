@@ -5,7 +5,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import Product, StockTransaction
-from .serializers import ProductSerializer, ProductListSerializer, StockTransactionSerializer
+from .serializers import ProductSerializer, ProductListSerializer, StockTransactionSerializer, StockAdjustmentSerializer
 from django.db import transaction
 from django.utils import timezone
 from accounting.services import _create_stxn, _parse_date
@@ -44,6 +44,15 @@ class ProductViewSet(viewsets.ModelViewSet):
             qs = qs.filter(current_stock__lte=models.F('min_stock'))
         return qs
 
+    @transaction.atomic
+    def perform_update(self, serializer):
+        serializer.instance = Product.objects.select_for_update().get(pk=serializer.instance.pk)
+        target = serializer.validated_data.pop('current_stock', None)
+        product = serializer.save()
+        if target is not None and target != product.current_stock:
+            _create_stxn('actual', target-product.current_stock, product, None,
+                timezone.localdate(), notes='Stock reconciliation')
+
     @action(detail=True, methods=['post'])
     def adjust_stock(self, request, pk=None):
         """
@@ -52,15 +61,11 @@ class ProductViewSet(viewsets.ModelViewSet):
         Per spec 6.3 — Adjust Stock method.
         """
         product = self.get_object()
-        stxn = _create_stxn(
-            type_    = 'actual',
-            quantity = Decimal(str(request.data['quantity'])),
-            product  = product,
-            document = None,
-            date     = _parse_date(request.data.get('date')),
-            rate     = request.data.get('rate'),
-            notes    = request.data.get('notes'),
-        )
+        command = StockAdjustmentSerializer(data=request.data)
+        command.is_valid(raise_exception=True)
+        data = command.validated_data
+        stxn = _create_stxn('actual', data['quantity'], product, None,
+            data.get('date', timezone.localdate()), data.get('rate'), data.get('notes'))
         return Response(
             StockTransactionSerializer(stxn, context={'request': request}).data,
             status=status.HTTP_201_CREATED,
@@ -73,9 +78,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         Per spec 6.3 — Direct Edit method.
         """
         product = self.get_object()
-        product.current_stock = Decimal(str(request.data['current_stock']))
-        product.save(update_fields=['current_stock', 'updated_at'])
-        return Response(ProductSerializer(product, context={'request': request}).data)
+        serializer = ProductSerializer(product, data=request.data, partial=True, context={'request':request})
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
 
     @action(detail=True, methods=['get'])
     def pending_moves(self, request, pk=None):
@@ -112,7 +118,8 @@ class ProductViewSet(viewsets.ModelViewSet):
         product = self.get_object()
         from accounting.models import Document
         from accounting.services import process_move_stock
-        doc    = Document.objects.get(pk=request.data['document_id'])
+        from django.shortcuts import get_object_or_404
+        doc = get_object_or_404(Document, pk=request.data.get('document_id'), is_active=True)
         result = process_move_stock(doc, {
             'items': [{'product_id': product.pk, 'quantity': request.data['quantity']}],
             'date':  _parse_date(request.data.get('date')),
@@ -239,16 +246,13 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
         Standalone stock adjustment from the Stock Transactions page.
         Per spec 6.3 — Adjust Stock.
         """
-        product = Product.objects.get(pk=request.data['product'])
-        stxn = _create_stxn(
-            type_    = 'actual',
-            quantity = Decimal(str(request.data['quantity'])),
-            product  = product,
-            document = None,
-            date     = _parse_date(request.data.get('date')),
-            rate     = request.data.get('rate'),
-            notes    = request.data.get('notes'),
-        )
+        from rest_framework import serializers
+        product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.filter(is_active=True)).run_validation(request.data.get('product'))
+        command = StockAdjustmentSerializer(data=request.data)
+        command.is_valid(raise_exception=True)
+        data = command.validated_data
+        stxn = _create_stxn('actual', data['quantity'], product, None,
+            data.get('date', timezone.localdate()), data.get('rate'), data.get('notes'))
         return Response(
             StockTransactionSerializer(stxn, context={'request': request}).data,
             status=status.HTTP_201_CREATED,

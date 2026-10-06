@@ -657,9 +657,10 @@ def process_transfer(data):
 @transaction.atomic
 def process_adjust_balance(account, data):
     """Spec B3: Actual f.txn with no contact and no document."""
-    amount = Decimal(str(data['amount']))
-    date   = _parse_date(data.get('date'))
-    ftxn   = _create_ftxn('actual', amount, None, account, None, date, data.get('notes'))
+    from rest_framework import serializers
+    amount = serializers.DecimalField(max_digits=15, decimal_places=2).run_validation(data.get('amount'))
+    date = serializers.DateField().run_validation(data['date']) if data.get('date') else timezone.localdate()
+    ftxn = _create_ftxn('actual', amount, None, account, None, date, data.get('notes'))
     return {'ftxn': ftxn.pk, 'new_balance': str(account.current_balance)}
 
 
