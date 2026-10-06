@@ -3,6 +3,7 @@ set -eu
 python manage.py wait_for_db --timeout "${DB_STARTUP_TIMEOUT:-60}"
 python manage.py check --deploy --fail-level ERROR
 python manage.py migrate --noinput
+python manage.py provision_cache
 python manage.py collectstatic --noinput
 # Provision the initial admin deliberately through manage.py createsuperuser.
 # Never swallow database errors or keep an admin password in the runtime image.

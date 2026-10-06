@@ -145,9 +145,9 @@ CACHES = {
     'default': {
         'BACKEND': os.getenv(
             'CACHE_BACKEND',
-            'django.core.cache.backends.locmem.LocMemCache',
+            'django.core.cache.backends.locmem.LocMemCache' if DEBUG else 'django.core.cache.backends.db.DatabaseCache',
         ),
-        'LOCATION': os.getenv('CACHE_LOCATION', 'ibfs-cache'),
+        'LOCATION': os.getenv('CACHE_LOCATION', 'ibfs-cache' if DEBUG else 'ibfs_cache'),
     }
 }
 
