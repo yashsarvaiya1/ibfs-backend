@@ -93,3 +93,11 @@ docker compose up -d
 ```
 
 The one-shot `volume-init` helper automatically prepares media/static ownership before backend startup. The image already makes its entrypoint executable at build time. Do not run chmod or chown on the VM files for this app update. The helper exits successfully and stays stopped; this is expected. PostgreSQL storage is unchanged. When building local images, `docker compose build` builds the backend/frontend images before this same startup flow.
+
+### Small VM startup and image size
+
+The backend installs only Chromium headless shell (the PDF renderer uses headless mode), and removes package-download caches in the same image layer. The default is one Gunicorn worker with two threads; `WEB_CONCURRENCY` can be increased on larger VMs. Keep an existing environment override in mind: set `WEB_CONCURRENCY=1` explicitly on a small VM.
+
+Compose allows `BACKEND_HEALTH_START_PERIOD=600s` before counting failed backend probes, followed by ten retries. Successful probes still mark it healthy immediately. This accommodates cold database migrations and static collection on shared-core VMs; it does not hide a failed startup command. The existing `/health/` probe continues to test the running application.
+
+A 1 GiB VM has limited headroom for PostgreSQL, Next.js and Chromium PDF generation. Smaller images save disk/download space, not equivalent runtime RAM. If failures persist, inspect `docker compose logs --tail=150 backend`, `docker inspect ibfs_backend --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{json .State.Health}}'`, `free -h` and `df -h`. Do not delete database volumes to fix health checks. Fresh PostgreSQL `initdb` logs indicate a new database; check the Compose project name and volume identity if existing records were expected.
