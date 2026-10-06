@@ -7,7 +7,7 @@ The development branches are not deployed automatically. Back up and rehearse th
 1. Copy the frontend `.env.example` to `.env` on the VM. Set private database credentials, a unique Django `SECRET_KEY`, real `ALLOWED_HOSTS`, and the public HTTPS origin in `CSRF_TRUSTED_ORIGINS`. Set `DEBUG=False`.
 2. Browsers use `/api` and `/media` on the frontend origin. Set only the server-side `DJANGO_ORIGIN=http://backend:8000` for the frontend. Remove the old public API URL override. Session cookies require HTTPS in production; terminate TLS at the existing reverse proxy and preserve `X-Forwarded-Proto`.
 3. Run `docker compose config --quiet` and build both images. The frontend uses Node 24 and a standalone Next server. The backend uses Python 3.14 and pinned requirements. Database and application health checks gate startup.
-4. Existing media/static volumes may be owned by root. Before the first non-root backend release, grant UID/GID 1000 ownership of those two volumes. Do not change ownership of the PostgreSQL volume.
+4. Compose runs the one-shot `volume-init` service automatically as root to set media/static ownership to UID/GID 1000. The backend waits for successful completion, then runs as its existing non-root user. The helper has no network access and never mounts the PostgreSQL volume. No manual chmod/chown command is needed.
 5. Run the backup script from the frontend Compose directory. It stops the running app services during the database/media snapshot and restarts them in a finally block. Pause other writers and scheduled maintenance too. Retain the previous image tags and database dump.
 6. Start the deployment. Startup waits for PostgreSQL, checks configuration, applies migrations, provisions the shared cache, runs optional first-admin setup and collects static files; any error stops the container. On an empty user table, set `DJANGO_SUPERUSER_USERNAME` and `DJANGO_SUPERUSER_PASSWORD` (optional `DJANGO_SUPERUSER_EMAIL`) in the private `.env` to create the first administrator automatically. Passwords use Django validation/hashing. Once any user exists, startup leaves all accounts and passwords unchanged. Leave all three fields blank for manual `docker compose exec backend python manage.py createsuperuser` instead.
 7. Verify login, a document edit, a payment allocation, stock movement and PDF download using a test contact. Existing web users sign in once again because legacy browser-stored passwords are removed.
@@ -82,3 +82,14 @@ Use `linux/arm64` for an ARM VM, or `linux/amd64,linux/arm64` to publish both ar
 The optional `DJANGO_SUPERUSER_*` fields belong only in the backend runtime environment, not Docker build arguments or the frontend container. Startup creates an admin only when the database has no users; it never resets passwords, promotes existing users or adds a different admin on restart. Partial/invalid first-start credentials fail with a clear error. Remove the password field after the initial successful setup if desired. Existing installations keep their current login; use `createsuperuser` to add an administrator manually or `changepassword USERNAME` for an intentional password change.
 
 Images published before the bootstrap-admin change still require manual creation. Rebuild/push the backend image, then pull/recreate that service before expecting automatic first-start setup. No new migration or port change is needed.
+
+## Simple VM update
+
+Keep the existing Compose directory/project name and volume names. Set the private environment and pull the published images, then start with:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+The one-shot `volume-init` helper automatically prepares media/static ownership before backend startup. The image already makes its entrypoint executable at build time. Do not run chmod or chown on the VM files for this app update. The helper exits successfully and stays stopped; this is expected. PostgreSQL storage is unchanged. When building local images, `docker compose build` builds the backend/frontend images before this same startup flow.
