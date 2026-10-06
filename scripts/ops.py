@@ -113,7 +113,9 @@ def rehearse(directory, backend_image=None):
              '--env', f'POSTGRES_PASSWORD={password}', '--env', 'POSTGRES_DB=ibfs_restore',
              '--tmpfs', '/var/lib/postgresql/data:rw', manifest['images']['db']]); created_db = True
         for _ in range(60):
-            ready = subprocess.run(['docker', 'exec', name, 'pg_isready', '-U', 'postgres', '-d', 'ibfs_restore'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # PostgreSQL's image briefly starts a socket-only initialization
+            # server before restarting. TCP readiness waits for the final server.
+            ready = subprocess.run(['docker', 'exec', name, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres', '-d', 'ibfs_restore'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if ready.returncode == 0:
                 break
             time.sleep(1)
