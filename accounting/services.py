@@ -12,21 +12,14 @@ from django.template.loader import render_to_string
 from django.core.cache import cache
 from django.conf import settings as django_settings
 from .calculations import document_totals
+from .printing import document_context, media_data_url
 from .workflows import FINANCIAL_SIGNS, STOCK_SIGNS, NON_POSTING_TYPES
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _build_media_url(request, relative_path):
-    """
-    Returns a file:// URL for embedding images in Playwright-rendered HTML.
-    Playwright reads files directly from disk — no HTTP request involved,
-    so this works in all environments without network/proxy issues.
-    """
-    if not relative_path:
-        return None
-    abs_path = Path(django_settings.MEDIA_ROOT) / relative_path
-    return abs_path.as_uri() 
+    return media_data_url(relative_path)
 
 
 def _contact_display(contact):
@@ -47,100 +40,37 @@ def _contact_display(contact):
 # ─── PDF Generation ───────────────────────────────────────────────────────────
 
 def generate_document_pdf(document, request=None):
-    """Single document PDF — cached for 10 min keyed on (pk, updated_at)."""
-    cache_key = f"pdf_{document.pk}_{document.updated_at.timestamp()}"
-    cached    = cache.get(cache_key)
-    if cached:
-        return cached
-
     app_settings = Settings.get()
-    context      = _build_document_context(document, app_settings, request)
-    html_string  = render_to_string('accounting/document_print.html', context)
-    pdf_bytes    = _render_playwright_pdf(html_string)
-    filename     = f"{document.type.upper()}_{document.doc_id}_{document.date}.pdf"
-    result       = (pdf_bytes, filename)
+    contacts = tuple(c.updated_at.isoformat() if c else '' for c in (document.contact, document.consignee))
+    cache_key = f'pdf_v2_{document.pk}_{document.updated_at.isoformat()}_{app_settings.updated_at.isoformat()}_{contacts}'
+    result = cache.get(cache_key)
+    if result:
+        return result
+    context = _build_document_context(document, app_settings, request)
+    html_string = render_to_string('accounting/document_print.html', {
+        'documents': [context], 'print_settings': app_settings,
+        'page_letterhead': context['header_image'] if app_settings.letterhead_mode == 'page' else None,
+    })
+    pdf_bytes = _render_playwright_pdf(html_string, context['header_image'] if app_settings.letterhead_mode == 'page' else None)
+    safe_id = re.sub(r'[^A-Za-z0-9._-]', '_', document.doc_id)
+    result = (pdf_bytes, f'{document.type.upper()}_{safe_id}_{document.date}.pdf')
     cache.set(cache_key, result, timeout=600)
     return result
 
 
 def generate_bulk_documents_pdf(documents, request=None):
-    """
-    Merged PDF of multiple documents — one per page (DV-04).
-    Each document's HTML is separated by a CSS page-break wrapper.
-    """
     app_settings = Settings.get()
-    html_parts   = []
-
-    for doc in documents:
-        context = _build_document_context(doc, app_settings, request, is_bulk=True)
-        html_parts.append(render_to_string('accounting/document_print.html', context))
-
-    # Wrap each part in a page-break container
-    combined_html = '\n'.join(
-        f'<div class="page-wrapper">{part}</div>' for part in html_parts
-    )
-    # Outer shell with global page-break CSS
-    full_html = f"""
-    <!DOCTYPE html><html><head><meta charset="UTF-8">
-    <style>
-      .page-wrapper {{ page-break-after: always; }}
-      .page-wrapper:last-child {{ page-break-after: avoid; }}
-    </style>
-    </head><body>{combined_html}</body></html>
-    """
-    pdf_bytes = _render_playwright_pdf(full_html)
-    filename  = f"Documents_Bulk_{timezone.now().date()}.pdf"
-    return (pdf_bytes, filename)
+    contexts = [_build_document_context(doc, app_settings, request) for doc in documents]
+    html_string = render_to_string('accounting/document_print.html', {
+        'documents': contexts, 'print_settings': app_settings,
+        'page_letterhead': media_data_url(app_settings.header_image) if app_settings.letterhead_mode == 'page' else None,
+    })
+    return _render_playwright_pdf(html_string, media_data_url(app_settings.header_image) if app_settings.letterhead_mode == 'page' else None), f'Documents_Bulk_{timezone.localdate()}.pdf'
 
 
 def _build_document_context(document, app_settings, request=None, is_bulk=False):
-    """Shared context builder for single and bulk document PDFs."""
-    line_items   = document.line_items or []
-    charges      = document.charges or []
-    taxes        = document.taxes or []
+    return document_context(document, app_settings, _contact_display)
 
-    subtotal     = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
-    charges_sum  = sum(Decimal(str(c.get('amount', 0))) for c in charges)
-    discount     = document.discount or Decimal('0')
-    taxable_base = subtotal + charges_sum - discount
-    tax_breakdown, tax_total = [], Decimal('0')
-
-    for tax in taxes:
-        pct = Decimal(str(tax.get('percentage', 0)))
-        amt = taxable_base * pct / 100
-        tax_total += amt
-        tax_breakdown.append({
-            'name':       tax.get('name', ''),
-            'percentage': str(pct),
-            'amount':     str(amt.quantize(Decimal('0.01'))),
-        })
-
-    grand_total = taxable_base + tax_total
-
-    # BF-09: Pass explicit boolean flags instead of relying on template `in` substring check
-    is_simple_line_type = document.type in {
-        'interest', 'expense', 'cash_payment_voucher', 'cash_receipt_voucher'
-    }
-    is_vendor_doc = document.type in {'bill', 'po', 'dn'}
-
-    return {
-        'document':          document,
-        'settings':          app_settings,
-        'header_image':      _build_media_url(request, app_settings.header_image),
-        'sign_image':        _build_media_url(request, app_settings.sign_image),
-        'contact':           _contact_display(document.contact),
-        'consignee':         _contact_display(document.consignee),
-        'line_items':        line_items,
-        'charges':           charges,
-        'discount':          str(document.discount),
-        'taxes':             tax_breakdown,
-        'tax_total':         str(tax_total.quantize(Decimal('0.01'))),
-        'grand_total':       str(grand_total.quantize(Decimal('0.01'))),
-        'doc_type_label':    document.get_type_display(),
-        'is_simple_line_type': is_simple_line_type,  # BF-09: no qty/rate/hsn cols
-        'is_vendor_doc':     is_vendor_doc,           # BF-09: "Vendor" vs "Bill To"
-        'is_bulk':           is_bulk,
-    }
 
 def compute_opening_balance_for_print(contact, date_from=None) -> Decimal:
     base = Decimal(str(contact.opening_balance or 0))
@@ -318,19 +248,43 @@ def generate_stock_transactions_pdf(stock_txns, request=None, report_title=None)
     return (pdf_bytes, filename)
 
 
-def _render_playwright_pdf(html_string):
+def _render_playwright_pdf(html_string, letterhead=None):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser   = p.chromium.launch(headless=True)
-        page      = browser.new_page()
-        page.set_content(html_string, wait_until='networkidle')
-        pdf_bytes = page.pdf(
-            format=django_settings.PLAYWRIGHT_PDF_FORMAT,
-            print_background=True,
-            prefer_css_page_size=True,
-        )
-        browser.close()
-    return pdf_bytes
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_default_timeout(django_settings.PLAYWRIGHT_PDF_TIMEOUT)
+            page.set_content(html_string, wait_until='load')
+            page.evaluate("""async () => {
+                await document.fonts.ready;
+                await Promise.all([...document.images].map(image => image.decode().catch(() => {})));
+            }""")
+            pdf_bytes = page.pdf(
+                format=django_settings.PLAYWRIGHT_PDF_FORMAT,
+                print_background=True, prefer_css_page_size=True,
+                display_header_footer=True, header_template='<span></span>',
+                footer_template='<div style="font:9px Arial;width:100%;text-align:center;color:#64748b;">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>',
+            )
+            if letterhead:
+                import io
+                from pypdf import PdfReader, PdfWriter
+                background = browser.new_page()
+                background.set_content('<style>@page{size:A4;margin:0}body{margin:0}img{width:210mm;height:297mm;object-fit:contain;display:block}</style><img src="' + letterhead + '">', wait_until='load')
+                background.evaluate('async () => { await document.images[0].decode(); }')
+                backdrop = background.pdf(print_background=True, prefer_css_page_size=True)
+                reader = PdfReader(io.BytesIO(pdf_bytes))
+                writer = PdfWriter()
+                for content in reader.pages:
+                    sheet = PdfReader(io.BytesIO(backdrop)).pages[0]
+                    sheet.merge_page(content)
+                    writer.add_page(sheet)
+                output = io.BytesIO()
+                writer.write(output)
+                pdf_bytes = output.getvalue()
+            return pdf_bytes
+        finally:
+            browser.close()
 
 
 # ─── Core Helpers ─────────────────────────────────────────────────────────────

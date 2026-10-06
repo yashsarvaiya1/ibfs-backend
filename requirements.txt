@@ -9,3 +9,5 @@ django-extensions
 django-crontab
 playwright
 whitenoise
+
+pypdf==6.19.0

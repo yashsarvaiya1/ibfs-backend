@@ -16,6 +16,45 @@ class SettingsSerializer(serializers.ModelSerializer):
     header_image_url = serializers.SerializerMethodField()
     sign_image_url   = serializers.SerializerMethodField()
 
+    def validate_letterhead_height_mm(self, value):
+        if not 15 <= value <= 65:
+            raise serializers.ValidationError('Use a height between 15 and 65 mm.')
+        return value
+
+    def validate_letterhead_footer_mm(self, value):
+        if not 10 <= value <= 40:
+            raise serializers.ValidationError('Use a footer space between 10 and 40 mm.')
+        return value
+
+    def validate_company_gstin(self, value):
+        import re
+        value = value.strip().upper()
+        if value and not re.fullmatch(r'[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]', value):
+            raise serializers.ValidationError('Enter a valid 15-character GSTIN.')
+        return value
+
+    def _validate_branding(self, value):
+        from pathlib import Path
+        from PIL import Image, UnidentifiedImageError
+        if not value:
+            return value
+        root = Path(django_settings.MEDIA_ROOT).resolve()
+        path = (root / value).resolve()
+        if not path.is_relative_to(root / 'uploads' / 'settings') or not path.is_file():
+            raise serializers.ValidationError('Upload a branding image before selecting it.')
+        try:
+            with Image.open(path) as image:
+                image.verify()
+        except (UnidentifiedImageError, OSError, ValueError):
+            raise serializers.ValidationError('Letterhead and signature must be PNG, JPEG or WebP images.')
+        return value
+
+    def validate_header_image(self, value):
+        return self._validate_branding(value)
+
+    def validate_sign_image(self, value):
+        return self._validate_branding(value)
+
     class Meta:
         model  = Settings
         fields = '__all__'

@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from django.db.models import Sum
 from .models import Settings, Contact, PaymentAccount
 from .serializers import SettingsSerializer, ContactSerializer, PaymentAccountSerializer
+from django.http import HttpResponse
 
 
 class SettingsViewSet(viewsets.ModelViewSet):
@@ -38,6 +39,31 @@ class SettingsViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+    def print_preview(self, request):
+        from accounting.models import Document
+        from accounting.services import _build_document_context, _render_playwright_pdf
+        from django.template.loader import render_to_string
+        from django.utils import timezone
+        kind = request.query_params.get('type', 'invoice')
+        if kind not in {'invoice', 'bill'}:
+            return Response({'error': 'Choose invoice or bill.'}, status=400)
+        profile = self.get_object()
+        contact = Contact(contact_name='Sample customer' if kind == 'invoice' else 'Sample supplier',
+                          phone='9876543210', address='Sample address\nMumbai, Maharashtra')
+        doc = Document(type=kind, doc_id=f'PREVIEW-{kind.upper()}', contact=contact,
+            date=timezone.localdate(), line_items=[{'name': 'Sample product', 'hsn': '0000',
+            'quantity': 2, 'unit': 'pcs', 'rate': 100, 'amount': 200}], total_amount=236,
+            taxes=[{'name': 'Tax', 'percentage': 18}],
+            notes='Sample preview only. This is not a financial document.')
+        context = _build_document_context(doc, profile, request)
+        html = render_to_string('accounting/document_print.html', {'documents': [context],
+            'print_settings': profile,
+            'page_letterhead': context['header_image'] if profile.letterhead_mode == 'page' else None})
+        response = HttpResponse(_render_playwright_pdf(html, context['header_image'] if profile.letterhead_mode == 'page' else None), content_type='application/pdf')
+        response['Content-Disposition'] = f'inline; filename="{kind}-preview.pdf"'
+        response['Cache-Control'] = 'private, no-store'
+        return response
 
 
 class ContactViewSet(viewsets.ModelViewSet):

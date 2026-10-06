@@ -11,6 +11,18 @@ class BaseModel(models.Model):
 
 
 class Settings(BaseModel):
+    company_name = models.CharField(max_length=255, blank=True, default='')
+    company_address = models.TextField(blank=True, default='')
+    company_phone = models.CharField(max_length=30, blank=True, default='')
+    company_email = models.EmailField(blank=True, default='')
+    company_gstin = models.CharField(max_length=15, blank=True, default='')
+    payment_details = models.TextField(blank=True, default='')
+    print_terms = models.TextField(blank=True, default='')
+    signatory_name = models.CharField(max_length=100, blank=True, default='')
+    letterhead_mode = models.CharField(max_length=10, default='banner',
+        choices=[('banner', 'Header banner'), ('page', 'Full-page letterhead')])
+    letterhead_height_mm = models.PositiveSmallIntegerField(default=32)
+    letterhead_footer_mm = models.PositiveSmallIntegerField(default=20)
     header_image    = models.CharField(max_length=500, blank=True, null=True)  # relative media path
     sign_image      = models.CharField(max_length=500, blank=True, null=True)  # relative media path
     auto_stock      = models.BooleanField(default=True)

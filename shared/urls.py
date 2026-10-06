@@ -7,6 +7,7 @@ router.register('contacts', ContactViewSet,        basename='contacts')
 router.register('accounts', PaymentAccountViewSet, basename='accounts')
 
 urlpatterns = [
+    path('settings/print-preview/', SettingsViewSet.as_view({'get': 'print_preview'})),
     path('settings/', SettingsViewSet.as_view({
         'get':   'list',
         'post':  'create',
