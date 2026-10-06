@@ -6,6 +6,8 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import Product, StockTransaction
 from .serializers import ProductSerializer, ProductListSerializer, StockTransactionSerializer
+from django.db import transaction
+from django.utils import timezone
 from accounting.services import _create_stxn, _parse_date
 
 
@@ -13,6 +15,12 @@ class ProductViewSet(viewsets.ModelViewSet):
     search_fields   = ['name', 'hsn_code']
     ordering_fields = ['name', 'current_stock', 'rate']
     ordering        = ['name']
+
+    def destroy(self, request, *args, **kwargs):
+        product = self.get_object()
+        product.is_active = False
+        product.save(update_fields=['is_active', 'updated_at'])
+        return Response(status=204)
 
     def get_serializer_class(self):
         return ProductListSerializer if self.action == 'list' else ProductSerializer
@@ -33,7 +41,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         if params.get('is_active') is not None:
             qs = qs.filter(is_active=params['is_active'].lower() == 'true')
         if params.get('low_stock') == 'true':
-            qs = qs.filter(current_stock__lt=models.F('min_stock'))
+            qs = qs.filter(current_stock__lte=models.F('min_stock'))
         return qs
 
     @action(detail=True, methods=['post'])
@@ -146,6 +154,16 @@ class ProductViewSet(viewsets.ModelViewSet):
 
 class StockTransactionViewSet(viewsets.ModelViewSet):
     serializer_class = StockTransactionSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if data['type'] != 'actual':
+            return Response({'error': 'Record stock is managed through documents.'}, status=400)
+        stxn = _create_stxn('actual', data['quantity'], data['product'],
+            data.get('document'), data['date'], data.get('rate'), data.get('notes'))
+        return Response(self.get_serializer(stxn).data, status=201)
     search_fields    = ['product__name', 'notes']
     ordering_fields  = ['date', 'quantity', 'created_at']
     ordering         = ['-date']
@@ -178,45 +196,50 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
                 )
         return qs
 
+    @transaction.atomic
     def update(self, request, *args, **kwargs):
         """
         Only actual s.txns can be edited directly.
         Record s.txns are managed via document edit → _sync_record_stxns.
         """
         stxn = self.get_object()
+        stxn = StockTransaction.objects.select_for_update().get(pk=stxn.pk)
         if stxn.type == 'record':
             return Response(
                 {'error': 'Record stock transactions are managed via document edit.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if 'quantity' in request.data:
-            new_qty = Decimal(str(request.data['quantity']))
+        serializer = self.get_serializer(stxn, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if 'quantity' in data:
+            new_qty = data['quantity']
             diff    = new_qty - stxn.quantity
-            stxn.product.current_stock += diff
-            stxn.product.save(update_fields=['current_stock', 'updated_at'])
+            Product.objects.filter(pk=stxn.product_id).update(current_stock=models.F('current_stock') + diff, updated_at=timezone.now())
             stxn.quantity = new_qty
-        if 'notes' in request.data:
-            stxn.notes = request.data['notes']
-        if 'date' in request.data:
-            stxn.date = _parse_date(request.data['date'])
-        if 'rate' in request.data:
-            stxn.rate = request.data['rate']
+        if 'notes' in data:
+            stxn.notes = data['notes']
+        if 'date' in data:
+            stxn.date = data['date']
+        if 'rate' in data:
+            stxn.rate = data['rate']
         stxn.save()
         return Response(StockTransactionSerializer(stxn, context={'request': request}).data)
 
+    @transaction.atomic
     def destroy(self, request, *args, **kwargs):
         """
         Only actual s.txns can be deleted directly.
         Reverses the stock change on delete.
         """
         stxn = self.get_object()
+        stxn = StockTransaction.objects.select_for_update().get(pk=stxn.pk)
         if stxn.type == 'record':
             return Response(
                 {'error': 'Record stock transactions are managed via document deletion.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        stxn.product.current_stock -= stxn.quantity
-        stxn.product.save(update_fields=['current_stock', 'updated_at'])
+        Product.objects.filter(pk=stxn.product_id).update(current_stock=models.F('current_stock') - stxn.quantity, updated_at=timezone.now())
         stxn.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 

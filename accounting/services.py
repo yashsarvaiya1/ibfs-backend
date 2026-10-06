@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Sum, F
 from django.utils import timezone
 from datetime import date as date_type
 from .models import Document, FinancialTransaction
@@ -77,38 +77,11 @@ def compute_opening_balance_for_print(contact, date_from=None) -> Decimal:
     if date_from is None:
         return base
 
-    month_start = date_from.replace(day=1)
+    delta = FinancialTransaction.objects.filter(contact=contact, date__lt=date_from).exclude(
+        document__type='expense').exclude(type='contra').aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    return base + delta
 
-    # Cross-month: last MCD per month strictly before date_from's month
-    txns_before = (
-        FinancialTransaction.objects
-        .filter(contact=contact, date__lt=month_start)
-        .order_by('date', 'created_at')
-        .values('date', 'monthly_cumulative_delta')
-    )
-    month_last_mcd: dict = {}
-    for txn in txns_before:
-        key = (txn['date'].year, txn['date'].month)
-        month_last_mcd[key] = txn['monthly_cumulative_delta']
 
-    cross_month_base = base + sum(month_last_mcd.values(), Decimal('0'))
-
-    # Intra-month: CF-affecting txns in SAME month strictly before date_from
-    # This is the missing piece — old code stopped here and returned cross_month_base
-    same_month_before = (
-        FinancialTransaction.objects
-        .filter(contact=contact, date__gte=month_start, date__lt=date_from)
-        .select_related('document')
-        .order_by('date', 'created_at')
-    )
-    intra_month_sum = Decimal('0')
-    for txn in same_month_before:
-        is_expense = txn.document is not None and txn.document.type == 'expense'
-        is_contra  = txn.type == 'contra'
-        if not is_expense and not is_contra:
-            intra_month_sum += txn.amount
-
-    return cross_month_base + intra_month_sum
 def generate_transactions_pdf(
     transactions,
     contact=None,
@@ -128,12 +101,13 @@ def generate_transactions_pdf(
     else:
         running_cf = None
 
+    transactions = sorted(transactions, key=lambda txn: (txn.date, txn.created_at, txn.pk)) if is_ledger_view else transactions
     rows = []
     for txn in transactions:
         # Mirror frontend ContactLedger logic exactly
         is_expense = txn.document is not None and txn.document.type == 'expense'
         is_contra  = txn.type == 'contra'
-        affects_cf = not is_expense and not is_contra
+        affects_cf = bool(account) or (not is_expense and not is_contra)
 
         row = {
             'date':       txn.date,
@@ -322,6 +296,9 @@ def _next_doc_id(doc_type):
     }
     prefix = prefix_map.get(doc_type, 'DOC')
 
+    # A stable singleton lock also protects the very first document of a type.
+    Settings.objects.select_for_update().get(pk=Settings.get().pk)
+
     # Lock all doc_id rows for this type to prevent concurrent duplicates (BF-05)
     existing_ids = (
         Document.objects
@@ -342,6 +319,7 @@ def _next_doc_id(doc_type):
 
 # ─── MCD Recalculation ────────────────────────────────────────────────────────
 
+@transaction.atomic
 def _recalculate_mcd(contact, date):
     """
     Recalculates MCD for all f.txns in the same month/year for a contact.
@@ -352,11 +330,12 @@ def _recalculate_mcd(contact, date):
     """
     if not contact:
         return
+    Contact.objects.select_for_update().get(pk=contact.pk)
     date = _parse_date(date)
     txns = (
         FinancialTransaction.objects
         .filter(contact=contact, date__year=date.year, date__month=date.month)
-        .order_by('date', 'created_at')
+        .order_by('date', 'created_at', 'pk')
         .select_related('document')
     )
 
@@ -376,6 +355,7 @@ def _recalculate_mcd(contact, date):
 
 # ─── Core f.txn / s.txn creators ─────────────────────────────────────────────
 
+@transaction.atomic
 def _create_ftxn(
     type_, amount, contact=None, account=None,
     document=None, date=None, notes=None,
@@ -394,6 +374,9 @@ def _create_ftxn(
       - PaymentAccount.current_balance updated after
     """
     date = _parse_date(date)
+    if contact:
+        Contact.objects.select_for_update().get(pk=contact.pk)
+    amount = Decimal(str(amount))
 
     ftxn = FinancialTransaction.objects.create(
         type=type_,
@@ -408,20 +391,21 @@ def _create_ftxn(
 
     if force_mcd_zero:
         if account:
-            account.current_balance += amount
-            account.save(update_fields=['current_balance', 'updated_at'])
+            PaymentAccount.objects.filter(pk=account.pk).update(current_balance=F('current_balance') + amount, updated_at=timezone.now())
+            account.refresh_from_db(fields=['current_balance'])
         return ftxn
 
     if contact:
         _recalculate_mcd(contact, date)
 
     if account:
-        account.current_balance += amount
-        account.save(update_fields=['current_balance', 'updated_at'])
+        PaymentAccount.objects.filter(pk=account.pk).update(current_balance=F('current_balance') + amount, updated_at=timezone.now())
+        account.refresh_from_db(fields=['current_balance'])
 
     return ftxn
 
 
+@transaction.atomic
 def _create_stxn(type_, quantity, product, document=None, date=None, rate=None, notes=None):
     """
     Creates a StockTransaction.
@@ -435,8 +419,8 @@ def _create_stxn(type_, quantity, product, document=None, date=None, rate=None, 
         document=document, date=date, rate=rate, notes=notes,
     )
     if type_ == 'actual':
-        product.current_stock += quantity
-        product.save(update_fields=['current_stock', 'updated_at'])
+        type(product).objects.filter(pk=product.pk).update(current_stock=F('current_stock') + quantity, updated_at=timezone.now())
+        product.refresh_from_db(fields=['current_stock'])
     return stxn
 
 
@@ -713,6 +697,16 @@ def process_document_delete(document, strategy):
     """
     from inventory.models import StockTransaction
 
+    if strategy not in {'revert', 'manual'}:
+        from rest_framework.exceptions import ValidationError
+        raise ValidationError({'strategy': 'Choose revert or manual.'})
+    document = Document.objects.select_for_update().get(pk=document.pk)
+    if not document.is_active:
+        return {'status': 'deleted', 'strategy': strategy}
+    contact_ids = document.transactions.exclude(contact=None).values_list('contact_id', flat=True).distinct()
+    list(Contact.objects.select_for_update().filter(pk__in=contact_ids).order_by('pk'))
+    StockTransaction.objects.filter(document=document, type='record').delete()
+
     # Collect record contacts/dates before deletion
     record_ftxns         = list(document.transactions.filter(type='record').select_related('contact'))
     record_contact_dates = [(f.contact, f.date) for f in record_ftxns]
@@ -729,8 +723,7 @@ def process_document_delete(document, strategy):
 
         for ftxn in actual_ftxns:
             if ftxn.payment_account:
-                ftxn.payment_account.current_balance -= ftxn.amount
-                ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
+                PaymentAccount.objects.filter(pk=ftxn.payment_account_id).update(current_balance=F('current_balance') - ftxn.amount, updated_at=timezone.now())
             contact = ftxn.contact
             date    = ftxn.date
             ftxn.delete()
@@ -738,8 +731,7 @@ def process_document_delete(document, strategy):
                 _recalculate_mcd(contact, date)
 
         for stxn in actual_stxns:
-            stxn.product.current_stock -= stxn.quantity
-            stxn.product.save(update_fields=['current_stock', 'updated_at'])
+            type(stxn.product).objects.filter(pk=stxn.product_id).update(current_stock=F('current_stock') - stxn.quantity, updated_at=timezone.now())
             stxn.delete()
 
     elif strategy == 'manual':
@@ -791,7 +783,7 @@ def generate_stock_list_pdf(products, request=None, low_stock_only=False):
 # ── Stock Transactions PDF (Product detail page) ───────────────────────────────
 def generate_stock_transactions_pdf(stock_txns, request=None, product=None, date_from=None, date_to=None):
     from inventory.models import StockTransaction as StockTxnModel
-    from django.db.models import Sum
+    from django.db.models import Sum, F
 
     app_settings  = Settings.get()
 

@@ -22,6 +22,7 @@ from .services import (
 from shared.models import Contact, PaymentAccount, Settings
 from inventory.models import StockTransaction, Product
 from django.db import transaction
+from .workflows import OUTGOING_TYPES
 
 HAS_BALANCE_TYPES = {'bill', 'invoice', 'cn', 'dn'}
 
@@ -108,6 +109,13 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         return {'request': self.request}
+
+    def destroy(self, request, *args, **kwargs):
+        strategy = request.data.get('strategy') or request.query_params.get('strategy')
+        if strategy not in {'revert', 'manual'}:
+            return Response({'error': 'Choose revert or manual when deleting a document.'}, status=400)
+        process_document_delete(self.get_object(), strategy)
+        return Response(status=204)
 
 
     def create(self, request, *args, **kwargs):
@@ -217,8 +225,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         notes          = request.data.get('notes')
         interest_lines = request.data.get('interest_lines', [])
 
-        outgoing   = {'bill', 'dn', 'cash_payment_voucher'}
-        direction  = 'send' if doc.type in outgoing else 'receive'
+        direction  = 'send' if doc.type in OUTGOING_TYPES else 'receive'
         actual_amt = -amount_raw if direction == 'send' else amount_raw
         result     = {}
 
@@ -553,6 +560,17 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
     ordering_fields  = ['date', 'amount', 'created_at']
     ordering         = ['-date', '-created_at']
 
+    def create(self, request, *args, **kwargs):
+        from rest_framework.exceptions import ValidationError
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if data['type'] != 'actual':
+            raise ValidationError({'type': 'Use document creation or account transfer for this transaction type.'})
+        ftxn = _create_ftxn('actual', data['amount'], data.get('contact'),
+            data.get('payment_account'), data.get('document'), data['date'], data.get('notes'))
+        return Response(self.get_serializer(ftxn).data, status=201)
+
 
     def get_serializer_context(self):
         return {'request': self.request}
@@ -621,39 +639,44 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         return qs
 
 
+    @transaction.atomic
     def update(self, request, *args, **kwargs):
         ftxn = self.get_object()
+        if ftxn.contact_id:
+            Contact.objects.select_for_update().get(pk=ftxn.contact_id)
+        ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
         if ftxn.type != 'actual':
             return Response(
                 {'error': 'Only actual transactions can be edited directly.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         old_date = ftxn.date
+        serializer = self.get_serializer(ftxn, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        old_amount, old_account_id = ftxn.amount, ftxn.payment_account_id
 
-        if 'amount' in request.data:
-            new_amt = Decimal(str(request.data['amount']))
-            if ftxn.payment_account:
-                ftxn.payment_account.current_balance -= ftxn.amount
-                ftxn.payment_account.current_balance += new_amt
-                ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
-            ftxn.amount = new_amt
+        if 'amount' in data:
+            ftxn.amount = data['amount']
 
-        if 'date' in request.data:
-            ftxn.date = _parse_date(request.data['date'])
+        if 'date' in data:
+            ftxn.date = data['date']
 
-        if 'payment_account' in request.data:
-            acct_id = request.data['payment_account']
-            if ftxn.payment_account:
-                ftxn.payment_account.current_balance -= ftxn.amount
-                ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
-            new_acct = PaymentAccount.objects.get(pk=acct_id) if acct_id else None
-            if new_acct:
-                new_acct.current_balance += ftxn.amount
-                new_acct.save(update_fields=['current_balance', 'updated_at'])
-            ftxn.payment_account = new_acct
+        if 'payment_account' in data:
+            ftxn.payment_account = data['payment_account']
 
-        if 'notes' in request.data:
-            ftxn.notes = request.data['notes']
+        from django.db.models import F
+        from django.utils import timezone
+        deltas = {}
+        if old_account_id:
+            deltas[old_account_id] = -old_amount
+        if ftxn.payment_account_id:
+            deltas[ftxn.payment_account_id] = deltas.get(ftxn.payment_account_id, Decimal('0')) + ftxn.amount
+        for account_id, delta in sorted(deltas.items()):
+            PaymentAccount.objects.filter(pk=account_id).update(current_balance=F('current_balance') + delta, updated_at=timezone.now())
+
+        if 'notes' in data:
+            ftxn.notes = data['notes']
 
         ftxn.save()
         _recalculate_mcd(ftxn.contact, ftxn.date)
@@ -663,8 +686,12 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         return Response(FinancialTransactionSerializer(ftxn, context={'request': request}).data)
 
 
+    @transaction.atomic
     def destroy(self, request, *args, **kwargs):
         ftxn = self.get_object()
+        if ftxn.contact_id:
+            Contact.objects.select_for_update().get(pk=ftxn.contact_id)
+        ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
         if ftxn.type == 'record':
             return Response(
                 {'error': 'Record transactions are managed via document deletion.'},
@@ -680,8 +707,9 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         contact = ftxn.contact
 
         if ftxn.payment_account:
-            ftxn.payment_account.current_balance -= ftxn.amount
-            ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
+            from django.db.models import F
+            from django.utils import timezone
+            PaymentAccount.objects.filter(pk=ftxn.payment_account_id).update(current_balance=F('current_balance') - ftxn.amount, updated_at=timezone.now())
 
         ftxn.delete()
         _recalculate_mcd(contact, date)

@@ -25,6 +25,14 @@ class FinancialTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model  = FinancialTransaction
         fields = '__all__'
+        read_only_fields = ['monthly_cumulative_delta']
+
+    def validate(self, attrs):
+        document = attrs.get('document', self.instance.document if self.instance else None)
+        contact = attrs.get('contact', self.instance.contact if self.instance else None)
+        if document and contact and document.contact_id != contact.pk:
+            raise serializers.ValidationError({'document': 'Choose a document belonging to this contact.'})
+        return attrs
 
     def get_document_type(self, obj):
         return obj.document.type if obj.document else None
