@@ -72,7 +72,7 @@ Both layouts share the same backend data and pagination. The amount-in-words box
 - [x] Prospective saved document versions and known legacy baseline; archived documents remain readable/printable while edit/reposting bypasses are blocked.
 - [x] Installed-PWA desktop/mobile offline workspace: explicitly saved encrypted PDFs and local draft CRUD, returning to the normal online form for posting.
 - [x] Database-backed shared production cache provisioned at startup, compatible with existing Compose environments.
-- [x] Optional environment-based first-admin startup restored; passwords are validated/hashed, and existing users are never reset or promoted.
+- [x] Environment-managed app administrator created or synchronized at startup, including existing databases; passwords are validated/hashed and unchanged credentials preserve their hash.
 - [x] Automatic media/static volume ownership initialization in Compose; simple pull/up commands require no manual chmod/chown.
 - [x] Verified database/media backup bundles, checksums, accounting snapshots, isolated restore/migration rehearsal and host health/schedule commands.
 - [x] Project-specific frontend/backend READMEs and deployment/report/PDF/offline documentation.

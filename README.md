@@ -37,7 +37,7 @@ Document-wide tax remains the default. Optional item rates support mixed-tax doc
 
 ## VM deployment and documentation
 
-Keep the existing frontend Compose project and private `.env`, including its PostgreSQL 15 data volume. The production image installs Chromium, runs as a non-root user, validates configuration and runs migrations/cache provisioning/static collection before starting Gunicorn. Optional `DJANGO_SUPERUSER_USERNAME`/`DJANGO_SUPERUSER_PASSWORD` (and email) create the first admin when no users exist; subsequent starts preserve all accounts. Blank fields keep manual setup available. Database-major upgrades are a separate operation.
+Keep the existing frontend Compose project and private `.env`, including its PostgreSQL 15 data volume. The production image installs Chromium, runs as a non-root user, validates configuration and runs migrations/cache provisioning/static collection before starting Gunicorn. Optional `DJANGO_SUPERUSER_USERNAME`/`DJANGO_SUPERUSER_PASSWORD` (and email) create or synchronize the configured app administrator on every startup, including existing databases. Changing the environment password updates that login; unchanged credentials preserve the password hash. Leave all three fields blank to disable environment management. Database-major upgrades are a separate operation.
 
 - [Deployment, backup, isolated restore and health tools](docs/DEPLOYMENT.md)
 - [CA PDFs, GST/HSN exports, allocation review and read-only CSV comparisons](docs/REPORTS.md)
