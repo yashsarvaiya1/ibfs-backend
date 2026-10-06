@@ -4,7 +4,7 @@ import mimetypes
 from pathlib import Path
 from decimal import Decimal
 from django.conf import settings
-from .calculations import decimal_value, document_totals, money
+from .calculations import item_discount, decimal_value, document_totals, money
 from .workflows import SIMPLE_LINE_TYPES
 from .models import Document
 
@@ -65,7 +65,10 @@ def document_context(document, app_settings, contact_display):
         if amount is None and item.get('rate') is not None and item.get('quantity') is not None:
             amount = decimal_value(item['rate']) * decimal_value(item['quantity'])
         calculation_items.append({**item, 'amount': amount})
-        row['amount_display'] = format_money(amount) if amount is not None else ''
+        discount = item_discount({**item, 'amount': amount}) if amount is not None else Decimal('0')
+        row['amount_display'] = format_money(decimal_value(amount) - discount) if amount is not None else ''
+        row['item_discount_display'] = format_money(discount) if discount else ''
+        row['item_discount_percentage'] = item.get('discount_percentage')
         row['rate_display'] = format_money(item['rate']) if item.get('rate') is not None else ''
         row['quantity_display'] = format(decimal_value(item['quantity']), 'f').rstrip('0').rstrip('.') if '.' in str(item.get('quantity', '')) else item.get('quantity', '')
         if item.get('supply_category'):

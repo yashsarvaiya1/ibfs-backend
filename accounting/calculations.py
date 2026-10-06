@@ -35,11 +35,25 @@ def allocate_cents(total, weights):
     return [value * (-1 if total < 0 else 1) for value in cents]
 
 
+def item_discount(item):
+    gross = money(item.get('amount'))
+    discount = money(item.get('discount'))
+    if item.get('discount_percentage') is not None:
+        percentage = decimal_value(item['discount_percentage'])
+        if not 0 <= percentage <= 100:
+            raise ValueError('Item discount percentage must be between 0 and 100.')
+        discount = money(gross * percentage / 100)
+    if discount < 0 or discount > gross:
+        raise ValueError('Item discount must be between zero and the item amount.')
+    return discount
+
+
 def document_totals(data, document_type=None):
     items = data.get('line_items') or []
-    subtotal = sum((decimal_value(i.get('amount')) *
+    item_discounts = [item_discount(item) for item in items]
+    subtotal = sum(((decimal_value(i.get('amount')) - discount) *
                     (-1 if document_type == 'interest' and i.get('type') == 'discount' else 1)
-                    for i in items), Decimal('0'))
+                    for i, discount in zip(items, item_discounts)), Decimal('0'))
     charges = sum((decimal_value(c.get('amount')) for c in data.get('charges') or []), Decimal('0'))
     percentage = data.get('discount_percentage')
     discount = decimal_value(data.get('discount'))
@@ -54,7 +68,7 @@ def document_totals(data, document_type=None):
     if data.get('tax_mode') == 'item':
         if data.get('taxes'):
             raise ValueError('Per-item tax cannot also include document-wide taxes.')
-        bases = [money(item.get('amount')) for item in items]
+        bases = [money(item.get('amount')) - discount for item, discount in zip(items, item_discounts)]
         if any(base < 0 for base in bases) or taxable < 0:
             raise ValueError('Per-item taxable values cannot be negative.')
         base_sum = sum(bases, Decimal('0'))
@@ -95,7 +109,7 @@ def document_totals(data, document_type=None):
     tax_total = sum((t['amount'] for t in taxes), Decimal('0'))
     total = money(taxable + tax_total)
     if data.get('tax_mode') != 'item' and items and taxable >= 0 and all(decimal_value(item.get('amount')) >= 0 for item in items):
-        weights = [decimal_value(item.get('amount')) for item in items]
+        weights = [money(item.get('amount')) - discount for item, discount in zip(items, item_discounts)]
         try:
             bases = allocate_cents(taxable, weights)
             parts = [allocate_cents(tax['amount'], weights) for tax in taxes]
@@ -103,8 +117,11 @@ def document_totals(data, document_type=None):
         except ValueError:
             # Preserve existing document calculations; HSN allocation is unavailable.
             line_details = []
+    for detail, item, line_discount in zip(line_details, items, item_discounts):
+        detail['discount'] = money(line_discount)
+        detail['net_amount'] = money(item.get('amount')) - line_discount
     if document_type == 'interest':
         total = abs(total)
-    return {'subtotal': money(subtotal), 'charges_total': money(charges),
+    return {'gross_subtotal': money(subtotal + sum(item_discounts, Decimal('0'))), 'item_discount_total': sum(item_discounts, Decimal('0')), 'subtotal': money(subtotal), 'charges_total': money(charges),
             'discount': money(discount), 'taxable_amount': taxable,
             'taxes': taxes, 'tax_total': tax_total, 'total': total, 'line_details': line_details}

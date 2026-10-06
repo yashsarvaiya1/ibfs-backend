@@ -10,13 +10,13 @@ from .services import _build_document_context, _render_playwright_pdf
 
 
 class PDFPaginationTests(SimpleTestCase):
-    def render(self, template, count):
+    def render(self, template, count, item_discount=None):
         profile = Settings(company_name='Saved business', print_template=template, signatory_name='Saved signatory')
         document = Document(type='bill', doc_id='BILL-LAYOUT-42', date=date(2026, 10, 6),
             line_items=[{'name': f'Item {i + 1:03d}', 'description': 'Saved item description',
-                         'quantity': 2, 'rate': 150, 'amount': 300} for i in range(count)],
+                         'quantity': 2, 'rate': 150, 'amount': 300, 'discount_percentage': item_discount} for i in range(count)],
             taxes=[{'name': 'CGST', 'percentage': 9}, {'name': 'SGST', 'percentage': 9}],
-            total_amount=count * 354)
+            total_amount=count * (318.6 if item_discount else 354))
         html = render_to_string('accounting/document_print.html', {
             'documents': [_build_document_context(document, profile)], 'print_settings': profile})
         return [page.extract_text() for page in PdfReader(io.BytesIO(_render_playwright_pdf(html))).pages]
@@ -48,3 +48,17 @@ class PDFPaginationTests(SimpleTestCase):
         self.assertIn('Item 003', pages[0])
         self.assertIn('1,062.00', pages[0])
         self.assertIn('Rupees ', pages[0])
+
+    def test_item_discount_details_keep_multi_page_totals_only_on_final_page(self):
+        pages = self.render('classic', 32, 10)
+        self.assertGreater(len(pages), 1)
+        for page in pages:
+            self.assertIn('amount in words', page.lower())
+            self.assertIn('Total INR', page)
+        for page in pages[:-1]:
+            self.assertNotIn('10,195.20', page)
+            self.assertNotIn('Rupees ', page)
+        self.assertIn('10,195.20', pages[-1])
+        text = '\n'.join(pages)
+        self.assertEqual(text.count('Item discount 10%: INR 30.00'), 32)
+        self.assertEqual(text.count('10,195.20'), 1)

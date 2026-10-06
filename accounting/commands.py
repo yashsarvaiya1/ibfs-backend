@@ -5,7 +5,7 @@ from rest_framework.exceptions import APIException
 from shared.models import PaymentAccount, Contact
 from inventory.models import Product
 from .models import Document
-from .calculations import decimal_value, money
+from .calculations import decimal_value, money, item_discount
 
 
 class EditConflict(APIException):
@@ -35,7 +35,7 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError('Every line needs a description.')
             row = dict(item)
             try:
-                for key in ('quantity', 'rate', 'amount'):
+                for key in ('quantity', 'rate', 'amount', 'discount'):
                     if row.get(key) is not None:
                         number = decimal_value(row[key])
                         if number < 0 or number > Decimal('9999999999999.99'):
@@ -43,6 +43,13 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
                         row[key] = float(money(number))
                 if row.get('amount') is None and row.get('quantity') is not None and row.get('rate') is not None:
                     row['amount'] = float(money(decimal_value(row['quantity']) * decimal_value(row['rate'])))
+                if row.get('discount_percentage') is not None:
+                    percentage = decimal_value(row['discount_percentage'])
+                    if not 0 <= percentage <= 100:
+                        raise ValueError('Item discount percentage must be between 0 and 100.')
+                    row['discount_percentage'] = float(percentage)
+                if row.get('discount') is not None or row.get('discount_percentage') is not None:
+                    row['discount'] = float(item_discount(row))
                 if row.get('product_id'):
                     row['product_id'] = int(row['product_id'])
                     product_ids.add(row['product_id'])
