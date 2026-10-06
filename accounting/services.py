@@ -444,7 +444,9 @@ def process_document_create(doc_type, data, contact=None):
     total_amount = data.get('total_amount')
 
     if line_items and doc_type != 'challan':
-        total_amount = _resolve_total({**data, 'type': doc_type})
+        totals = document_totals(data, doc_type)
+        total_amount = totals['total']
+        data = {**data, 'discount': totals['discount']}
 
     reference = Document.objects.filter(pk=data.get('reference')).first() if data.get('reference') else None
     doc = Document.objects.create(
@@ -457,6 +459,7 @@ def process_document_create(doc_type, data, contact=None):
         line_items      = line_items,
         total_amount    = total_amount,
         discount        = data.get('discount', 0),
+        discount_percentage = data.get('discount_percentage'),
         charges         = data.get('charges', []),
         taxes           = data.get('taxes', []),
         tax_mode = data.get('tax_mode', 'document'),

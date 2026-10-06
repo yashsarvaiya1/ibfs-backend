@@ -57,7 +57,7 @@ def hsn_report(start, end):
         if row['bucket'] == 'review':
             excluded.append({'id': doc.pk, 'doc_id': doc.doc_id, 'issues': row['issues']})
             continue
-        totals = document_totals({key: getattr(doc, key) for key in ('line_items', 'charges', 'taxes', 'discount', 'tax_mode')}, doc.type)
+        totals = document_totals({key: getattr(doc, key) for key in ('line_items', 'charges', 'taxes', 'discount', 'discount_percentage', 'tax_mode')}, doc.type)
         details = totals['line_details']
         if len(details) != len(doc.line_items):
             excluded.append({'id': doc.pk, 'doc_id': doc.doc_id, 'issues': ['Item amounts cannot allocate the document taxable value.']})

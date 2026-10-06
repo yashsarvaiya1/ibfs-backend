@@ -129,7 +129,7 @@ tr { break-inside: avoid; }
       <div class="totals">
         {% if print.has_line_totals %}<div class="total-row"><span>Subtotal</span><span data-summary-value>{{ print.subtotal }}</span></div>{% endif %}
         {% for charge in print.charges %}<div class="total-row"><span>{{ charge.name }}</span><span data-summary-value>{{ charge.amount_display }}</span></div>{% endfor %}
-        {% if print.document.discount %}<div class="total-row"><span>Discount</span><span data-summary-value>-{{ print.discount }}</span></div>{% endif %}
+        {% if print.document.discount %}<div class="total-row"><span>Discount{% if print.document.discount_percentage != None %} ({{ print.document.discount_percentage|floatformat:-4 }}%){% endif %}</span><span data-summary-value>-{{ print.discount }}</span></div>{% endif %}
         {% if print.taxes and print.has_line_totals %}<div class="total-row"><span>Taxable amount</span><span data-summary-value>{{ print.taxable_amount }}</span></div>{% endif %}
         {% if print.has_line_totals %}{% for tax in print.taxes %}<div class="total-row"><span>{{ tax.name }} ({{ tax.percentage }}%)</span><span data-summary-value>{{ tax.amount_display }}</span></div>{% endfor %}{% endif %}
         {% if print.has_adjustment %}<div class="total-row"><span>Adjustment</span><span data-summary-value>{{ print.adjustment }}</span></div>{% endif %}

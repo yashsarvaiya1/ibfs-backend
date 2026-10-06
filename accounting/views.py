@@ -253,6 +253,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             'supplier_invoice_number': doc.supplier_invoice_number,
             'consignee':     doc.consignee_id,
             'discount':      str(doc.discount),
+            'discount_percentage': str(doc.discount_percentage) if doc.discount_percentage is not None else None,
             'payment_terms': doc.payment_terms,
             'notes':         doc.notes,
         })

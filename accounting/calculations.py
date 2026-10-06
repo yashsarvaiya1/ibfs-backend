@@ -41,7 +41,13 @@ def document_totals(data, document_type=None):
                     (-1 if document_type == 'interest' and i.get('type') == 'discount' else 1)
                     for i in items), Decimal('0'))
     charges = sum((decimal_value(c.get('amount')) for c in data.get('charges') or []), Decimal('0'))
+    percentage = data.get('discount_percentage')
     discount = decimal_value(data.get('discount'))
+    if percentage is not None:
+        percentage = decimal_value(percentage)
+        if not 0 <= percentage <= 100:
+            raise ValueError('Discount percentage must be between 0 and 100.')
+        discount = money(subtotal * percentage / 100)
     taxable = money(subtotal + charges - discount)
     taxes = []
     line_details = []

@@ -36,6 +36,7 @@ class Document(BaseModel):
     line_items      = models.JSONField(default=list, blank=True)
     total_amount    = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
     discount        = models.DecimalField(max_digits=15, decimal_places=2, default=0, blank=True)
+    discount_percentage = models.DecimalField(max_digits=7, decimal_places=4, null=True, blank=True)
     charges         = models.JSONField(default=list, blank=True)
     taxes           = models.JSONField(default=list, blank=True)
     tax_mode = models.CharField(max_length=10, default='document', choices=[('document', 'Whole document'), ('item', 'Per item')])

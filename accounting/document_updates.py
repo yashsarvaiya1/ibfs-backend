@@ -99,9 +99,11 @@ def update_document(document, payload, preserve_total=False):
     account = data.pop('payment_account', None)
     for field, value in data.items():
         setattr(document, field, value)
-    calculation_changed = any(key in data for key in ('line_items', 'charges', 'taxes', 'discount', 'tax_mode'))
+    calculation_changed = any(key in data for key in ('line_items', 'charges', 'taxes', 'discount', 'discount_percentage', 'tax_mode'))
     if calculation_changed and document.line_items and (not preserve_total or document.total_amount is None):
-        document.total_amount = document_totals({key: getattr(document, key) for key in ('line_items','charges','taxes','discount','tax_mode')}, document.type)['total']
+        totals = document_totals({key: getattr(document, key) for key in ('line_items','charges','taxes','discount','discount_percentage','tax_mode')}, document.type)
+        document.discount = totals['discount']
+        document.total_amount = totals['total']
     document.save()
     if calculation_changed or 'date' in data or 'reference' in data:
         sync_stock(document, old_items, force='reference' in data)

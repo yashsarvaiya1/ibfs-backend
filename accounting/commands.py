@@ -14,13 +14,14 @@ class EditConflict(APIException):
 
 
 class DocumentWriteSerializer(serializers.ModelSerializer):
+    discount_percentage = serializers.DecimalField(max_digits=7, decimal_places=4, min_value=Decimal('0'), max_value=Decimal('100'), required=False, allow_null=True)
     payment_account = serializers.PrimaryKeyRelatedField(queryset=PaymentAccount.objects.filter(is_active=True), required=False, allow_null=True)
     expected_updated_at = serializers.DateTimeField(required=False, write_only=True)
 
     class Meta:
         model = Document
         fields = ['type', 'doc_id', 'contact', 'consignee', 'reference', 'line_items',
-            'total_amount', 'charges', 'taxes', 'tax_mode', 'supply_category', 'supplier_invoice_number', 'discount', 'date', 'due_date',
+            'total_amount', 'charges', 'taxes', 'tax_mode', 'supply_category', 'supplier_invoice_number', 'discount', 'discount_percentage', 'date', 'due_date',
             'payment_terms', 'place_of_supply', 'reverse_charge', 'attachment_urls', 'notes', 'payment_account', 'expected_updated_at']
         extra_kwargs = {'doc_id': {'required': False}, 'date': {'required': False}}
 
@@ -107,9 +108,12 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'total_amount': 'Enter a positive document amount.'})
         if attrs.get('discount', 0) < 0:
             raise serializers.ValidationError({'discount': 'Discount cannot be negative.'})
+        if 'discount' in attrs and 'discount_percentage' not in attrs:
+            # Legacy clients explicitly entering a currency discount select amount mode.
+            attrs['discount_percentage'] = None
         kind = attrs.get('type', self.instance.type if self.instance else '')
         values = {field: attrs.get(field, getattr(self.instance, field, None) if self.instance else None)
-                  for field in ('line_items', 'charges', 'taxes', 'discount', 'tax_mode', 'supply_category')}
+                  for field in ('line_items', 'charges', 'taxes', 'discount', 'discount_percentage', 'tax_mode', 'supply_category')}
         if values['tax_mode'] == 'item' and (kind not in ('bill', 'invoice', 'cn', 'dn', 'quotation', 'po', 'pi') or not values['line_items']):
             raise serializers.ValidationError({'tax_mode': 'Per-item tax requires item details on a bill, invoice, note, quotation or order.'})
         if values['tax_mode'] == 'item' and any(item.get('amount') is None for item in values['line_items'] or []):
@@ -121,6 +125,8 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
             except (ValueError, TypeError, ArithmeticError) as exc:
                 raise serializers.ValidationError({'taxes': str(exc)}) from exc
             serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal('0')).run_validation(totals['total'])
+            if values['discount_percentage'] is not None:
+                attrs['discount'] = totals['discount']
             no_tax = ('nil_rated', 'exempt', 'non_gst')
             for item in values['line_items']:
                 item_taxes = (item.get('taxes') or []) if values['tax_mode'] == 'item' else (values['taxes'] or [])
@@ -128,6 +134,8 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({'line_items': 'Nil-rated, exempt and non-GST items cannot have positive tax rates. Use per-item tax for mixed classifications.'})
             if values['supply_category'] in no_tax and totals['tax_total']:
                 raise serializers.ValidationError({'supply_category': 'This classification cannot include tax. Clear taxes or change the classification.'})
+        if values['discount_percentage'] is not None and not values['line_items']:
+            raise serializers.ValidationError({'discount_percentage': 'Percentage discount requires item details.'})
         return attrs
 
 

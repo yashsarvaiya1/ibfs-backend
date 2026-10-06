@@ -56,7 +56,7 @@ def amount_in_words(value):
 
 
 def document_context(document, app_settings, contact_display):
-    data = {key: getattr(document, key) for key in ('line_items', 'charges', 'taxes', 'discount', 'tax_mode')}
+    data = {key: getattr(document, key) for key in ('line_items', 'charges', 'taxes', 'discount', 'discount_percentage', 'tax_mode')}
     items = []
     calculation_items = []
     for item in document.line_items or []:
