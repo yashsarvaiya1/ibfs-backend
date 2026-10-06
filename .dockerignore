@@ -20,3 +20,7 @@ media/
 
 # Playwright/Browsers (we install these inside the container)
 .auth/
+
+.vne
+.env.*
+!.env.example

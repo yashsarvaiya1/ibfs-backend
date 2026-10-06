@@ -1,12 +1,13 @@
 # accounting/views.py
 from decimal import Decimal
 from django.db import models as django_models
-from django.db.models import Q, Sum
+from django.db.models import Q, Sum, F, OuterRef, Subquery, DecimalField, Value
+from django.db.models.functions import Abs, Coalesce
 from django.http import HttpResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from .models import Document, FinancialTransaction
+from .models import Document, FinancialTransaction, PaymentAllocation
 from .serializers import (
     DocumentSerializer, DocumentListSerializer,
     FinancialTransactionSerializer,
@@ -22,6 +23,9 @@ from .services import (
 from shared.models import Contact, PaymentAccount, Settings
 from inventory.models import StockTransaction, Product
 from django.db import transaction
+from .workflows import OUTGOING_TYPES
+from .commands import DocumentWriteSerializer, PaymentCommandSerializer, command_data
+from .document_updates import update_document
 
 HAS_BALANCE_TYPES = {'bill', 'invoice', 'cn', 'dn'}
 
@@ -39,16 +43,17 @@ class DocumentViewSet(viewsets.ModelViewSet):
         qs = (
             Document.objects
             .select_related('contact')          # ← remove .filter(is_active=True)
-            .prefetch_related('transactions')
+            .prefetch_related('transactions__allocations__document', 'payment_allocations__payment__allocations__document', 'payment_allocations__payment__document', 'payment_allocations__payment__payment_account', 'payment_allocations__payment__contact')
         )
         params = self.request.query_params
 
-        # ── is_active — deleted filter ────────────────────────────────────────
+        # List filters do not hide archived read-only detail/print/history.
+        # Mutation actions can never select archived documents using query params.
         raw_active = params.get('is_active')
-        if raw_active not in (None, ''):
-            qs = qs.filter(is_active=raw_active.lower() == 'true')
-        else:
-            qs = qs.filter(is_active=True)      # default: hide deleted
+        if self.action == 'list':
+            qs = qs.filter(is_active=raw_active.lower() == 'true' if raw_active not in (None, '') else True)
+        elif self.request.method not in ('GET', 'HEAD', 'OPTIONS'):
+            qs = qs.filter(is_active=True)
 
         # ── Multi-type: ?type=bill,invoice OR ?type=bill ──────────────────────
         if params.get('type') not in (None, ''):
@@ -68,36 +73,24 @@ class DocumentViewSet(viewsets.ModelViewSet):
         if params.get('reference') not in (None, ''):
             qs = qs.filter(reference_id=params['reference'])
 
-        # ── BF-08: is_paid — restrict to balance-carrying types only ─────────
-        if params.get('is_paid') not in (None, ''):
-            want_paid = params['is_paid'].lower() == 'true'
-            qs = qs.filter(type__in=HAS_BALANCE_TYPES)
-
-            from decimal import Decimal
-
-            def _is_txn_settled(doc) -> bool:
-                txns   = doc.transactions.all()
-                record = abs(sum(t.amount for t in txns if t.type == 'record'))
-                paid   = abs(sum(t.amount for t in txns if t.type == 'actual'))
-                return record > 0 and paid >= record
-
-            if want_paid:
-                matched_ids = [doc.pk for doc in qs if doc.is_paid or _is_txn_settled(doc)]
-            else:
-                matched_ids = [doc.pk for doc in qs if not doc.is_paid and not _is_txn_settled(doc)]
-
-            qs = Document.objects.filter(pk__in=matched_ids)
-
-        if params.get('is_due') not in (None, ''):
-            if params['is_due'].lower() == 'true':
+        if params.get('is_paid') is not None or params.get('is_due') == 'true' or params.get('payment_status'):
+            decimal_field = DecimalField(max_digits=15, decimal_places=2)
+            records = FinancialTransaction.objects.filter(document_id=OuterRef('pk'),type='record').values('document_id').annotate(total=Sum('amount')).values('total')
+            allocations = PaymentAllocation.objects.filter(document_id=OuterRef('pk')).values('document_id').annotate(total=Sum('amount')).values('total')
+            qs = qs.filter(type__in=HAS_BALANCE_TYPES).annotate(
+                record_amount=Abs(Coalesce(Subquery(records),Value(0),output_field=decimal_field)),
+                paid_amount=Coalesce(Subquery(allocations),Value(0),output_field=decimal_field))
+            settled = Q(is_paid=True) | (Q(record_amount__gt=0) & Q(paid_amount__gte=F('record_amount')))
+            state = params.get('payment_status')
+            if params.get('is_paid') == 'true' or state == 'paid':
+                qs = qs.filter(settled)
+            elif params.get('is_paid') == 'false' or state in {'unpaid','partial','due'} or params.get('is_due') == 'true':
+                qs = qs.exclude(settled)
+            if state == 'partial':
+                qs = qs.filter(paid_amount__gt=0, paid_amount__lt=F('record_amount'))
+            if state == 'due' or params.get('is_due') == 'true':
                 from django.utils import timezone
-                today = timezone.localdate()
-                qs = qs.filter(
-                    type__in=HAS_BALANCE_TYPES,
-                    due_date__isnull=False,
-                    due_date__lt=today,
-                    is_paid=False,
-                )
+                qs = qs.filter(due_date__lt=timezone.localdate())
 
         return qs
 
@@ -109,78 +102,31 @@ class DocumentViewSet(viewsets.ModelViewSet):
     def get_serializer_context(self):
         return {'request': self.request}
 
+    def destroy(self, request, *args, **kwargs):
+        strategy = request.data.get('strategy') or request.query_params.get('strategy')
+        if strategy not in {'revert', 'manual'}:
+            return Response({'error': 'Choose revert or manual when deleting a document.'}, status=400)
+        process_document_delete(self.get_object(), strategy)
+        return Response(status=204)
+
 
     def create(self, request, *args, **kwargs):
-        doc_type = request.data.get('type')
-        BLOCKED_DIRECT = {'cash_payment_voucher', 'cash_receipt_voucher'}
-        if doc_type in BLOCKED_DIRECT:
-            return Response(
-                {'error': f'{doc_type} can only be created via Send/Receive flow.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        contact_id = request.data.get('contact')
-        contact    = Contact.objects.get(pk=contact_id) if contact_id else None
-        doc        = process_document_create(doc_type, request.data, contact)
-        return Response(
-            DocumentSerializer(doc, context={'request': request}).data,
-            status=status.HTTP_201_CREATED,
-        )
+        serializer = DocumentWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = command_data(serializer)
+        doc_type = data['type']
+        if doc_type in {'cash_payment_voucher', 'cash_receipt_voucher', 'interest'}:
+            return Response({'error': 'Use the payment or interest action to create this document.'}, status=400)
+        feature = {'po':'enable_po', 'pi':'enable_pi', 'quotation':'enable_quotation',
+                   'challan':'enable_challan', 'cn':'enable_cn', 'dn':'enable_dn'}.get(doc_type)
+        if feature and not getattr(Settings.get(), feature):
+            return Response({'error': 'Enable this document type in Settings first.'}, status=400)
+        contact = serializer.validated_data.get('contact')
+        doc = process_document_create(doc_type, data, contact)
+        return Response(DocumentSerializer(doc, context={'request': request}).data, status=201)
 
-
-    @transaction.atomic
     def update(self, request, *args, **kwargs):
-        doc              = self.get_object()
-        old_total_amount = Decimal(str(doc.total_amount)) if doc.total_amount is not None else None
-        old_date         = doc.date
-        old_contact      = doc.contact      # ← capture before any mutation
-
-        # DI-01: editable doc_id — validate uniqueness before saving
-        if 'doc_id' in request.data:
-            new_doc_id = request.data['doc_id']
-            if new_doc_id != doc.doc_id:
-                if Document.objects.filter(doc_id=new_doc_id).exclude(pk=doc.pk).exists():
-                    return Response(
-                        {
-                            'error':    f'Document ID "{new_doc_id}" already exists.',
-                            'conflict': True,
-                        },
-                        status=status.HTTP_409_CONFLICT,
-                    )
-                doc.doc_id = new_doc_id
-
-        simple_fields = [
-            'notes', 'payment_terms', 'attachment_urls',
-            'charges', 'taxes', 'discount', 'total_amount',
-        ]
-        for field in simple_fields:
-            if field in request.data:
-                setattr(doc, field, request.data[field])
-
-        # ← contact change: resolve to object (or None if cleared)
-        if 'contact' in request.data:
-            contact_id  = request.data['contact']
-            doc.contact = Contact.objects.get(pk=contact_id) if contact_id else None
-
-        if 'consignee' in request.data:
-            doc.consignee_id = request.data['consignee']
-        if 'reference' in request.data:
-            doc.reference_id = request.data['reference']
-
-        if 'date' in request.data:
-            doc.date = _parse_date(request.data['date'])
-        if 'due_date' in request.data:
-            raw_due      = request.data['due_date']
-            doc.due_date = _parse_date(raw_due) if raw_due else None
-
-        new_line_items = request.data.get('line_items')
-        if new_line_items is not None:
-            doc.line_items = new_line_items
-            _sync_record_stxns(doc, new_line_items)
-
-        doc.save()
-        _sync_record_ftxns(doc, old_total_amount, old_date)
-        _sync_ftxn_contact(doc, old_contact)    # ← propagates contact change + MCD
-
+        doc = update_document(self.get_object(), request.data)
         return Response(DocumentSerializer(doc, context={'request': request}).data)
 
 
@@ -210,77 +156,38 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        amount_raw     = Decimal(str(request.data['amount']))
-        account_id     = request.data.get('payment_account')
-        account        = PaymentAccount.objects.get(pk=account_id) if account_id else None
-        date           = _parse_date(request.data.get('date'))
-        notes          = request.data.get('notes')
-        interest_lines = request.data.get('interest_lines', [])
+        serializer = PaymentCommandSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = command_data(serializer)
+        amount_raw = data['amount']
+        account = serializer.validated_data.get('payment_account')
+        date = _parse_date(data.get('date'))
+        notes = data.get('notes')
+        interest_lines = data.get('interest_lines', [])
 
-        outgoing   = {'bill', 'dn', 'cash_payment_voucher'}
-        direction  = 'send' if doc.type in outgoing else 'receive'
+        direction  = 'send' if doc.type in OUTGOING_TYPES else 'receive'
         actual_amt = -amount_raw if direction == 'send' else amount_raw
         result     = {}
 
+        from .payments import allocate_payment, payment_status
         with transaction.atomic():
+            doc = Document.objects.select_for_update().get(pk=doc.pk)
+            interest_doc = None
+            net = Decimal('0')
             if interest_lines:
-                net = sum(
-                    Decimal(str(l['amount'])) if l.get('type') == 'charge'
-                    else -Decimal(str(l['amount']))
-                    for l in interest_lines
-                )
-                interest_record_amount = -net if direction == 'receive' else net
-                interest_doc = Document.objects.create(
-                    type         = 'interest',
-                    doc_id       = _next_doc_id('interest'),
-                    contact      = doc.contact,
-                    line_items   = interest_lines,
-                    total_amount = abs(net),
-                    date         = date,
-                    reference    = doc,
-                )
-                int_ftxn = _create_ftxn(
-                    'record', interest_record_amount,
-                    doc.contact, None, interest_doc, date,
-                )
-                result['interest_doc']  = interest_doc.pk
-                result['interest_ftxn'] = int_ftxn.pk
-
-            ftxn           = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes)
+                net = sum((Decimal(str(line['amount'])) * (1 if line.get('type') == 'charge' else -1) for line in interest_lines), Decimal('0'))
+                interest_doc = Document.objects.create(type='interest', doc_id=_next_doc_id('interest'),
+                    contact=doc.contact, line_items=interest_lines, total_amount=abs(net), date=date, reference=doc)
+                _create_ftxn('record', -net if direction == 'receive' else net,
+                    doc.contact, None, interest_doc, date)
+                result['interest_doc'] = interest_doc.pk
+            ftxn = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes, auto_allocate=False)
+            allocate_payment(ftxn, doc, max(amount_raw-net, Decimal('0')))
+            if interest_doc:
+                allocate_payment(ftxn, interest_doc, min(net, amount_raw))
             result['ftxn'] = ftxn.pk
-
-            # BF-04: auto mark paid when actuals >= records
-            MARK_PAID_TYPES = {'bill', 'invoice', 'cn', 'dn'}
-            if doc.type in MARK_PAID_TYPES and not doc.is_paid:
-                agg    = doc.transactions.aggregate(
-                    record_total=Sum('amount', filter=django_models.Q(type='record')),
-                    actual_total=Sum('amount', filter=django_models.Q(type='actual')),
-                )
-                record = abs(agg['record_total'] or Decimal('0'))
-                paid   = abs(agg['actual_total'] or Decimal('0'))
-                if record > 0 and paid >= record:
-                    doc.is_paid = True
-                    doc.save(update_fields=['is_paid', 'updated_at'])
-                    result['is_paid'] = True
-
-        return Response(result, status=status.HTTP_201_CREATED)
-
-
-        # BF-04
-        MARK_PAID_TYPES = {'bill', 'invoice', 'cn', 'dn'}
-        if doc.type in MARK_PAID_TYPES and not doc.is_paid:
-            agg    = doc.transactions.aggregate(
-                record_total=Sum('amount', filter=django_models.Q(type='record')),
-                actual_total=Sum('amount', filter=django_models.Q(type='actual')),
-            )
-            record = abs(agg['record_total'] or Decimal('0'))
-            paid   = abs(agg['actual_total'] or Decimal('0'))
-            if record > 0 and paid >= record:
-                doc.is_paid = True
-                doc.save(update_fields=['is_paid', 'updated_at'])
-                result['is_paid'] = True
-
-        return Response(result, status=status.HTTP_201_CREATED)
+            result['is_paid'] = bool((payment_status(doc) or {}).get('is_paid'))
+        return Response(result, status=201)
 
 
     # ── Move Stock ────────────────────────────────────────────────────────────
@@ -300,67 +207,38 @@ class DocumentViewSet(viewsets.ModelViewSet):
     # ── Stock Preview ─────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
     def stock_preview(self, request, pk=None):
-        doc     = self.get_object()
-        records = StockTransaction.objects.filter(
-            document=doc, type='record'
-        ).select_related('product')
-
-        if not records.exists():
-            return Response([])
-
-        actuals_map = {
-            a['product_id']: abs(a['total'] or Decimal('0'))
-            for a in StockTransaction.objects.filter(
-                document=doc, type='actual'
-            ).values('product_id').annotate(total=Sum('quantity'))
-        }
-
-        preview = []
-        for r in records:
-            record_qty = abs(r.quantity)
-            moved      = actuals_map.get(r.product_id, Decimal('0'))
-            remaining  = record_qty - moved
-            preview.append({
-                'product_id':    r.product_id,
-                'product_name':  r.product.name,
-                'record_qty':    str(record_qty),
-                'moved_qty':     str(moved),
-                'remaining_qty': str(max(remaining, Decimal('0'))),
-            })
-        return Response(preview)
-
+        from .stock_status import document_stock_status
+        return Response(document_stock_status(self.get_object()))
 
     # ── Add Details ───────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def add_details(self, request, pk=None):
-        doc        = self.get_object()
-        line_items = request.data.get('line_items', [])
-
-        doc.line_items = line_items
-        if not doc.total_amount:
-            doc.total_amount = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
-        doc.save(update_fields=['line_items', 'total_amount', 'updated_at'])
-
-        if doc.type == 'challan' and doc.reference:
-            sign = CHALLAN_STXN_SIGN.get(doc.reference.type, Decimal('1'))
-        else:
-            sign = STXN_SIGN.get(doc.type, Decimal('1'))
-
-        for item in line_items:
-            pid = item.get('product_id')
-            if not pid:
-                continue
-            try:
-                product = Product.objects.get(pk=pid)
-            except Product.DoesNotExist:
-                continue
-            if StockTransaction.objects.filter(document=doc, product=product).exists():
-                continue
-            qty = sign * Decimal(str(item.get('quantity', 0)))
-            _create_stxn('record', qty, product, doc, doc.date, item.get('rate'))
-
+        doc = update_document(self.get_object(), {'line_items':request.data.get('line_items', [])}, preserve_total=True)
         return Response(DocumentSerializer(doc, context={'request': request}).data)
 
+    @action(detail=True, methods=['get'])
+    def history(self, request, pk=None):
+        from .reports import CADocumentPagination
+        document = self.get_object()
+        pagination = CADocumentPagination()
+        if request.query_params.get('revision'):
+            from django.shortcuts import get_object_or_404
+            revision_id = serializers.IntegerField(min_value=1).run_validation(request.query_params['revision'])
+            row = get_object_or_404(document.revisions, pk=revision_id)
+            return Response({'id': row.pk, 'recorded_at': row.recorded_at, 'event': row.event, 'snapshot': row.snapshot})
+        query = document.revisions.values('id', 'recorded_at', 'event', 'changed_fields', 'snapshot__doc_id', 'snapshot__date', 'snapshot__total_amount')
+        rows = pagination.paginate_queryset(query, request, view=self)
+        return pagination.get_paginated_response([{'id': row['id'], 'recorded_at': row['recorded_at'],
+            'event': row['event'], 'changed_fields': row['changed_fields'], 'doc_id': row['snapshot__doc_id'],
+            'date': row['snapshot__date'], 'total_amount': row['snapshot__total_amount']} for row in rows])
+
+    @action(detail=False, methods=['post'])
+    def preview_totals(self, request):
+        from .commands import DocumentTotalsPreviewSerializer, command_data
+        from .calculations import document_totals
+        serializer = DocumentTotalsPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(document_totals(command_data(serializer), request.data.get('type')))
 
     # ── Reference Data ────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
@@ -370,8 +248,12 @@ class DocumentViewSet(viewsets.ModelViewSet):
             'line_items':    doc.line_items,
             'charges':       doc.charges,
             'taxes':         doc.taxes,
+            'tax_mode': doc.tax_mode,
+            'supply_category': doc.supply_category,
+            'supplier_invoice_number': doc.supplier_invoice_number,
             'consignee':     doc.consignee_id,
             'discount':      str(doc.discount),
+            'discount_percentage': str(doc.discount_percentage) if doc.discount_percentage is not None else None,
             'payment_terms': doc.payment_terms,
             'notes':         doc.notes,
         })
@@ -400,10 +282,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 {'error': 'enable_interest is disabled.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        contact_id = request.data.get('contact')
-        contact    = Contact.objects.get(pk=contact_id) if contact_id else None
-
-        result = process_standalone_interest(contact, request.data)
+        from .commands import StandaloneInterestSerializer
+        serializer=StandaloneInterestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data=command_data(serializer)
+        result = process_standalone_interest(serializer.validated_data.get('contact'), data)
         return Response(result, status=status.HTTP_201_CREATED)
 
 
@@ -460,90 +343,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
         return response
 
 
-# ─── _sync_record_stxns ───────────────────────────────────────────────────────
-
-
-def _sync_record_stxns(doc, new_line_items):
-    if doc.type == 'challan' and doc.reference:
-        sign = CHALLAN_STXN_SIGN.get(doc.reference.type, Decimal('1'))
-    else:
-        sign = STXN_SIGN.get(doc.type, Decimal('1'))
-
-    new_map = {
-        int(item['product_id']): Decimal(str(item.get('quantity', 0)))
-        for item in new_line_items
-        if item.get('product_id')
-    }
-
-    existing_records = StockTransaction.objects.filter(document=doc, type='record')
-    existing_map     = {r.product_id: r for r in existing_records}
-
-    for pid, stxn in existing_map.items():
-        if pid not in new_map:
-            stxn.delete()
-
-    for pid, qty in new_map.items():
-        signed_qty = sign * qty
-        if pid in existing_map:
-            stxn = existing_map[pid]
-            if stxn.quantity != signed_qty:
-                stxn.quantity = signed_qty
-                stxn.save(update_fields=['quantity', 'updated_at'])
-        else:
-            try:
-                product = Product.objects.get(pk=pid)
-            except Product.DoesNotExist:
-                continue
-            _create_stxn('record', signed_qty, product, doc, doc.date)
-
-
-# ─── _sync_record_ftxns ───────────────────────────────────────────────────────
-
-
-def _sync_record_ftxns(doc, old_total_amount, old_date):
-    try:
-        new_total_amount = Decimal(str(doc.total_amount)) if doc.total_amount is not None else None
-    except Exception:
-        new_total_amount = None
-
-    amount_changed = (
-        old_total_amount is not None
-        and new_total_amount is not None
-        and old_total_amount != new_total_amount
-    )
-    date_changed = (old_date != doc.date)
-
-    if not (amount_changed or date_changed):
-        return
-
-    record_ftxns = FinancialTransaction.objects.filter(document=doc, type='record')
-
-    for ftxn in record_ftxns:
-        update_fields = ['updated_at']
-
-        if amount_changed and new_total_amount is not None:
-            sign            = Decimal('1') if ftxn.amount >= 0 else Decimal('-1')
-            new_ftxn_amount = sign * new_total_amount
-            if ftxn.amount != new_ftxn_amount:
-                ftxn.amount = new_ftxn_amount
-                update_fields.append('amount')
-
-        if date_changed:
-            ftxn.date = doc.date
-            update_fields.append('date')
-
-        if len(update_fields) > 1:
-            ftxn.save(update_fields=update_fields)
-
-    if doc.contact_id:
-        _recalculate_mcd(doc.contact, doc.date)
-        if date_changed and (
-            old_date.month != doc.date.month
-            or old_date.year != doc.date.year
-        ):
-            _recalculate_mcd(doc.contact, old_date)
-
-
 # ─── FinancialTransaction ViewSet ─────────────────────────────────────────────
 
 
@@ -553,6 +352,42 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
     ordering_fields  = ['date', 'amount', 'created_at']
     ordering         = ['-date', '-created_at']
 
+    def create(self, request, *args, **kwargs):
+        from rest_framework.exceptions import ValidationError
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if data['type'] != 'actual':
+            raise ValidationError({'type': 'Use document creation or account transfer for this transaction type.'})
+        ftxn = _create_ftxn('actual', data['amount'], data.get('contact'),
+            data.get('payment_account'), data.get('document'), data['date'], data.get('notes'))
+        return Response(self.get_serializer(ftxn).data, status=201)
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def allocate(self, request, pk=None):
+        from rest_framework.exceptions import ValidationError
+        from .payments import replace_allocations
+        payment = self.get_object()
+        if payment.type != 'actual' or (payment.document and payment.document.type == 'expense'):
+            raise ValidationError({'allocations':'Only ordinary payments can be allocated.'})
+        entries = request.data.get('allocations', [])
+        if not isinstance(entries, list) or any(not isinstance(row, dict) or not isinstance(row.get('document'), int) for row in entries):
+            raise ValidationError({'allocations':'Choose documents and amounts.'})
+        contact_ids = set(Document.objects.filter(pk__in=[row['document'] for row in entries]).values_list('contact_id', flat=True))
+        contact_ids.add(payment.contact_id)
+        list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in contact_ids if pk]).order_by('pk'))
+        if payment.document_id:
+            Document.objects.select_for_update().get(pk=payment.document_id)
+        payment = FinancialTransaction.objects.select_for_update().get(pk=payment.pk)
+        replace_allocations(payment, entries)
+        return Response(self.get_serializer(payment).data)
+
+
+    @action(detail=True,methods=['post'])
+    def reverse_transfer(self,request,pk=None):
+        from .services import reverse_transfer
+        return Response(reverse_transfer(self.get_object()))
 
     def get_serializer_context(self):
         return {'request': self.request}
@@ -562,12 +397,13 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         qs = (
             FinancialTransaction.objects
             .select_related('document', 'contact', 'payment_account')
+            .prefetch_related('allocations__document')
             .all()
         )
         params       = self.request.query_params
         app_settings = Settings.get()
 
-        if app_settings.auto_transaction and not params.get('include_records'):
+        if app_settings.auto_transaction and not params.get('include_records') and not (params.get('contact') and self.action == 'print'):
             qs = qs.exclude(type='record')
 
         if params.get('contact') not in (None, ''):
@@ -578,10 +414,12 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(document_id=params['document'])
         if params.get('doc_type') not in (None, ''):
             qs = qs.filter(document__type=params['doc_type'])
-        if params.get('date_from') not in (None, ''):
-            qs = qs.filter(date__gte=params['date_from'])
-        if params.get('date_to') not in (None, ''):
-            qs = qs.filter(date__lte=params['date_to'])
+        from .ledger import ledger_dates
+        date_from, date_to = ledger_dates(params)
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
         if params.get('document_type') not in (None, ''):
             qs = qs.filter(document__type=params['document_type'])
 
@@ -621,41 +459,53 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         return qs
 
 
+    @transaction.atomic
     def update(self, request, *args, **kwargs):
         ftxn = self.get_object()
+        if ftxn.contact_id:
+            Contact.objects.select_for_update().get(pk=ftxn.contact_id)
+        if ftxn.document_id:
+            Document.objects.select_for_update().get(pk=ftxn.document_id)
+        ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
         if ftxn.type != 'actual':
             return Response(
                 {'error': 'Only actual transactions can be edited directly.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         old_date = ftxn.date
+        serializer = self.get_serializer(ftxn, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        old_amount, old_account_id = ftxn.amount, ftxn.payment_account_id
 
-        if 'amount' in request.data:
-            new_amt = Decimal(str(request.data['amount']))
-            if ftxn.payment_account:
-                ftxn.payment_account.current_balance -= ftxn.amount
-                ftxn.payment_account.current_balance += new_amt
-                ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
-            ftxn.amount = new_amt
+        if 'amount' in data:
+            ftxn.amount = data['amount']
 
-        if 'date' in request.data:
-            ftxn.date = _parse_date(request.data['date'])
+        if 'date' in data:
+            ftxn.date = data['date']
 
-        if 'payment_account' in request.data:
-            acct_id = request.data['payment_account']
-            if ftxn.payment_account:
-                ftxn.payment_account.current_balance -= ftxn.amount
-                ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
-            new_acct = PaymentAccount.objects.get(pk=acct_id) if acct_id else None
-            if new_acct:
-                new_acct.current_balance += ftxn.amount
-                new_acct.save(update_fields=['current_balance', 'updated_at'])
-            ftxn.payment_account = new_acct
+        if 'payment_account' in data:
+            ftxn.payment_account = data['payment_account']
 
-        if 'notes' in request.data:
-            ftxn.notes = request.data['notes']
+        from django.db.models import F
+        from django.utils import timezone
+        deltas = {}
+        if old_account_id:
+            deltas[old_account_id] = -old_amount
+        if ftxn.payment_account_id:
+            deltas[ftxn.payment_account_id] = deltas.get(ftxn.payment_account_id, Decimal('0')) + ftxn.amount
+        for account_id, delta in sorted(deltas.items()):
+            PaymentAccount.objects.filter(pk=account_id).update(current_balance=F('current_balance') + delta, updated_at=timezone.now())
+
+        if 'notes' in data:
+            ftxn.notes = data['notes']
 
         ftxn.save()
+        from .payments import rescale_allocations
+        rescale_allocations(ftxn, old_amount)
+        if ftxn.document and ftxn.document.type in {'expense','cash_payment_voucher','cash_receipt_voucher'}:
+            ftxn.document.total_amount = abs(sum((row.amount for row in ftxn.document.transactions.filter(type='actual')), Decimal('0')))
+            ftxn.document.save(update_fields=['total_amount','updated_at'])
         _recalculate_mcd(ftxn.contact, ftxn.date)
         if old_date.month != ftxn.date.month or old_date.year != ftxn.date.year:
             _recalculate_mcd(ftxn.contact, old_date)
@@ -663,8 +513,14 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         return Response(FinancialTransactionSerializer(ftxn, context={'request': request}).data)
 
 
+    @transaction.atomic
     def destroy(self, request, *args, **kwargs):
         ftxn = self.get_object()
+        if ftxn.contact_id:
+            Contact.objects.select_for_update().get(pk=ftxn.contact_id)
+        if ftxn.document_id:
+            Document.objects.select_for_update().get(pk=ftxn.document_id)
+        ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
         if ftxn.type == 'record':
             return Response(
                 {'error': 'Record transactions are managed via document deletion.'},
@@ -680,8 +536,9 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         contact = ftxn.contact
 
         if ftxn.payment_account:
-            ftxn.payment_account.current_balance -= ftxn.amount
-            ftxn.payment_account.save(update_fields=['current_balance', 'updated_at'])
+            from django.db.models import F
+            from django.utils import timezone
+            PaymentAccount.objects.filter(pk=ftxn.payment_account_id).update(current_balance=F('current_balance') - ftxn.amount, updated_at=timezone.now())
 
         ftxn.delete()
         _recalculate_mcd(contact, date)
@@ -689,11 +546,25 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
 
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def link_document(self, request, pk=None):
-        ftxn             = self.get_object()
-        ftxn.document_id = request.data.get('document')
-        ftxn.save(update_fields=['document', 'updated_at'])
-        return Response(FinancialTransactionSerializer(ftxn, context={'request': request}).data)
+        from rest_framework.exceptions import ValidationError
+        from django.shortcuts import get_object_or_404
+        from .payments import replace_allocations
+        ftxn = self.get_object()
+        if ftxn.type != 'actual' or (ftxn.document and ftxn.document.type == 'expense'):
+            raise ValidationError({'document':'Only ordinary payments can be linked to documents.'})
+        doc_id = request.data.get('document')
+        doc = get_object_or_404(Document, pk=doc_id, is_active=True, type__in=HAS_BALANCE_TYPES) if doc_id else None
+        list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in
+            (ftxn.contact_id, doc.contact_id if doc else None) if pk]).order_by('pk'))
+        if ftxn.document_id:
+            Document.objects.select_for_update().get(pk=ftxn.document_id)
+        ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
+        adjustments = sum((row.amount for row in ftxn.allocations.filter(document__type='interest')), Decimal('0'))
+        available = max(abs(ftxn.amount) - adjustments, Decimal('0'))
+        replace_allocations(ftxn, [{'document':doc.pk, 'amount':available}] if doc and available else [])
+        return Response(self.get_serializer(ftxn).data)
 
 
     # ── Print Transactions PDF (TV-06) ────────────────────────────────────────
@@ -719,57 +590,16 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             except PaymentAccount.DoesNotExist:
                 pass
 
-        # ── Parse date_from ───────────────────────────────────────────────────
-        date_from = None
-        raw_df    = request.query_params.get('date_from')
-        if raw_df not in (None, ''):
-            try:
-                from datetime import date as date_type
-                date_from = date_type.fromisoformat(raw_df)
-            except Exception:
-                pass
-
-        # ── opening_balance_at — contact ledger ───────────────────────────────
-        opening_balance_at = None
-        raw_oba            = request.query_params.get('opening_balance_at')
-        if raw_oba not in (None, ''):
-            try:
-                opening_balance_at = Decimal(raw_oba)
-            except Exception:
-                pass
-        elif contact and is_ledger:
-            opening_balance_at = compute_opening_balance_for_print(contact, date_from)
-
-        # ── balance_before_period — account statement / account ledger ────────
-        balance_before_period = None
-        raw_bbp               = request.query_params.get('balance_before_period')
-        if raw_bbp not in (None, ''):
-            try:
-                balance_before_period = Decimal(raw_bbp)
-            except Exception:
-                pass
-        elif account:
-            if date_from:
-                # Balance just before the filtered window
-                after_sum = (
-                    FinancialTransaction.objects
-                    .filter(payment_account=account, date__gte=date_from)
-                    .aggregate(total=Sum('amount'))['total'] or Decimal('0')
-                )
-                balance_before_period = Decimal(str(account.current_balance)) - after_sum
-            else:
-                # No filter: balance before ALL txns = initial seeded balance
-                all_sum = (
-                    FinancialTransaction.objects
-                    .filter(payment_account=account)
-                    .aggregate(total=Sum('amount'))['total'] or Decimal('0')
-                )
-                balance_before_period = Decimal(str(account.current_balance)) - all_sum
-
-        # For account ledger view, pipe balance_before_period as opening_balance_at
-        # so generate_transactions_pdf can seed running_cf correctly
-        if is_ledger and account and balance_before_period is not None:
-            opening_balance_at = balance_before_period
+        from .ledger import ledger_dates, account_opening_balance, with_running_cf, with_running_account_balance
+        date_from, date_to = ledger_dates(request.query_params)
+        opening_balance_at = compute_opening_balance_for_print(contact, date_from) if contact else None
+        balance_before_period = account_opening_balance(account, date_from) if account else None
+        if is_ledger:
+            if account:
+                opening_balance_at = balance_before_period
+                qs = with_running_account_balance(qs, account)
+            elif contact:
+                qs = with_running_cf(qs, contact.opening_balance)
 
         try:
             pdf_bytes, filename = generate_transactions_pdf(
@@ -780,6 +610,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 is_ledger_view        = is_ledger,
                 account               = account,
                 balance_before_period = balance_before_period,
+                date_from = date_from, date_to = date_to,
             )
         except Exception as e:
             return Response(

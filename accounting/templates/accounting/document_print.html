@@ -1,244 +1,154 @@
-{% comment %} accounting/templates/accounting/document_print.html {% endcomment %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: Arial, sans-serif; font-size: 12px; color: #222; padding: 32px; }
-
-    /* ── Bug #6: Header image stretches full width ── */
-    .header-banner {
-      width: 100%;
-      margin-bottom: 16px;
-    }
-    .header-banner img {
-      width: 100%;
-      height: auto;
-      display: block;
-    }
-
-    /* ── Doc title row shown when no header image, or always for doc type/id ── */
-    .header-title-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      margin-bottom: 24px;
-      border-bottom: 2px solid #222;
-      padding-bottom: 16px;
-    }
-    .header-title-row.with-banner {
-      margin-top: 0;
-    }
-    .company-name { font-size: 18px; font-weight: bold; }
-    .doc-title { text-align: right; }
-    .doc-title h1 { font-size: 22px; font-weight: bold; text-transform: uppercase; }
-    .doc-title .doc-id { font-size: 14px; color: #555; margin-top: 4px; }
-
-    .parties { display: flex; gap: 32px; margin-bottom: 20px; }
-    .party { flex: 1; }
-    .party h4 {
-      font-size: 11px; text-transform: uppercase; color: #777;
-      margin-bottom: 6px; border-bottom: 1px solid #ddd; padding-bottom: 4px;
-    }
-    .party p { margin: 2px 0; line-height: 1.5; }
-    .party .gstin { font-size: 10px; color: #555; }
-
-    .meta-row { display: flex; gap: 24px; margin-bottom: 20px; font-size: 11px; }
-    .meta-item span { color: #777; }
-    .meta-item strong { margin-left: 4px; }
-
-    table.items { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
-    table.items th {
-      background: #f0f0f0; padding: 8px 6px; text-align: left;
-      font-size: 11px; border: 1px solid #ccc;
-    }
-    table.items td {
-      padding: 7px 6px; border: 1px solid #ddd;
-      font-size: 11px; vertical-align: top;
-    }
-    table.items tr:nth-child(even) td { background: #fafafa; }
-
-    .totals { display: flex; justify-content: flex-end; margin-bottom: 20px; }
-    .totals-box { width: 300px; }
-    .totals-row {
-      display: flex; justify-content: space-between;
-      padding: 4px 0; font-size: 12px; border-bottom: 1px solid #eee;
-    }
-    .totals-row.grand {
-      font-size: 14px; font-weight: bold;
-      border-top: 2px solid #222; border-bottom: 2px solid #222;
-      padding: 6px 0; margin-top: 4px;
-    }
-
-    .notes-section { margin-bottom: 20px; font-size: 11px; }
-    .notes-section h4 { font-size: 10px; text-transform: uppercase; color: #777; margin-bottom: 4px; }
-
-    /* ── Bug #6: Signature at bottom-right ── */
-    .footer {
-      margin-top: 40px;
-      display: flex;
-      justify-content: flex-end;
-      align-items: flex-end;
-    }
-    .sign-block {
-      text-align: center;
-    }
-    .sign-block img {
-      max-height: 70px;
-      max-width: 180px;
-      display: block;
-      margin-bottom: 6px;
-    }
-    .sign-block p {
-      font-size: 10px;
-      color: #555;
-      border-top: 1px solid #aaa;
-      padding-top: 4px;
-      text-align: center;
-    }
-
-    @page { size: A4 portrait; margin: 20mm; }
-  </style>
+<meta charset="UTF-8"><title>Business documents</title>
+<style>
+@page { size: A4; margin: 0; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 10.5px/1.4 Arial, Helvetica, sans-serif; color: #182536; -webkit-print-color-adjust: exact; }
+.print-page { --accent: #233e59; --tint: #edf2f6; width: 210mm; height: 297mm; padding: {% if page_letterhead %}{{ print_settings.letterhead_height_mm }}mm 14mm {{ print_settings.letterhead_footer_mm }}mm{% else %}12mm 14mm 10mm{% endif %}; display: flex; flex-direction: column; break-after: page; }
+.print-page:last-child { break-after: auto; }
+.classic { --accent: #222; --tint: #f4f4f4; color: #222; }
+.page-header, .page-summary, .page-footer { flex-shrink: 0; }
+.page-body { flex: 1; min-height: 0; }
+.banner { width: 100%; max-height: {{ print_settings.letterhead_height_mm }}mm; object-fit: contain; object-position: left center; display: block; margin-bottom: 2mm; }
+.title-row { display: flex; justify-content: space-between; gap: 8mm; border-bottom: 1.5px solid var(--accent); padding-bottom: 2mm; margin-bottom: 2mm; }
+.business { max-width: 56%; }
+.eyebrow { font-size: 8px; color: #64748b; text-transform: uppercase; letter-spacing: .8px; margin: 0 0 1.5mm; }
+.business h2 { font-size: 14px; line-height: 1.25; margin: 0 0 1mm; }
+.address { white-space: pre-line; overflow-wrap: anywhere; }
+.muted { color: #64748b; }
+.title { text-align: right; max-width: 48%; overflow-wrap: anywhere; }
+h1 { font-size: 21px; line-height: 1.2; margin: 0 0 1.5mm; font-weight: 700; letter-spacing: -.5px; }
+.classic h1 { font-family: Georgia, 'Times New Roman', serif; font-size: 22px; letter-spacing: 0; }
+.document-id { font-size: 12px; font-weight: 700; margin-bottom: 1.5mm; }
+.parties { display: flex; gap: 6mm; margin-bottom: 2mm; }
+.party { flex: 1; padding: 1.5mm; border: 1px solid #dce3ea; border-radius: 3px; min-width: 0; }
+.classic .party { border-radius: 0; border-color: #aaa; }
+.party h3 { margin: 0 0 1mm; font-size: 11px; }
+.party p { margin: .5mm 0; }
+.metadata { display: flex; flex-wrap: wrap; gap: 1.5mm 6mm; padding-bottom: 2mm; margin-bottom: 2mm; border-bottom: 1px solid #dce3ea; }
+.metadata strong { margin-left: 1mm; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th { background: var(--tint); color: var(--accent); font-size: 8px; text-transform: uppercase; letter-spacing: .3px; padding: 1.5mm; border-bottom: 1px solid #c9d4df; text-align: left; }
+td { padding: 1.1mm 1.5mm; border-bottom: 1px solid #e5eaf0; vertical-align: top; overflow-wrap: anywhere; }
+.classic td { border-bottom-color: #ccc; }
+.classic th { border-top: 1px solid #444; border-bottom: 1px solid #444; }
+tr { break-inside: avoid; }
+.number { text-align: right; font-variant-numeric: tabular-nums; }
+.item-name { font-weight: 600; }
+.item-description { margin-top: .6mm; font-size: 9px; color: #64748b; white-space: pre-line; }
+.settlement { display: flex; align-items: stretch; gap: 5mm; margin-top: 3mm; }
+.amount-words { flex: 1; min-width: 0; min-height: 20mm; font-size: 9px; padding: 2mm; border: 1px solid #dce3ea; }
+.amount-words [data-summary-value] { display: block; min-height: 12mm; overflow-wrap: anywhere; }
+.totals { width: 60mm; flex-shrink: 0; }
+.total-row { display: flex; justify-content: space-between; gap: 3mm; padding: .8mm 1.5mm; border-bottom: 1px solid #e5eaf0; font-size: 9px; }
+.total-row [data-summary-value] { min-width: 22mm; min-height: 1.4em; text-align: right; font-variant-numeric: tabular-nums; }
+.grand { border: 1px solid var(--accent); background: var(--tint); margin-top: 1.5mm; padding: 1.8mm; font-size: 12px; font-weight: 700; }
+.notes-block { margin-top: 1.5mm; font-size: 9px; }
+.notes-block p { margin: 0; white-space: pre-line; overflow-wrap: anywhere; }
+.page-footer { display: flex; justify-content: space-between; align-items: flex-end; gap: 6mm; border-top: 1px solid #c9d4df; padding-top: 2mm; margin-top: 3mm; min-height: 8mm; font-size: 8px; }
+.footer-info { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.footer-business { font-weight: 600; margin-bottom: 1mm; }
+.signature { width: 48mm; text-align: center; flex-shrink: 0; }
+.signature img { max-width: 44mm; height: 10mm; object-fit: contain; display: block; margin: 0 auto 1mm; }
+.signature-label { border-top: 1px solid #94a3b8; padding-top: 1mm; }
+.page-count { white-space: nowrap; color: #64748b; }
+.cancelled { color: #a33131; font-size: 10px; font-weight: 700; }
+</style>
 </head>
-<body>
-
-  <!-- Bug #6: Full-width header banner image -->
-  {% if header_image %}
-  <div class="header-banner">
-    <img src="{{ header_image }}" alt="Company Header">
+<body data-document-layout>
+{% for print in documents %}
+<article class="print-page {{ print.settings.print_template }}" data-source-document>
+<header class="page-header">
+  {% if print.header_image and print.settings.letterhead_mode == 'banner' %}<img class="banner" src="{{ print.header_image }}" alt="Letterhead">{% endif %}
+  <div class="title-row">
+    <div class="business">
+      {% if print.settings.company_name or print.settings.company_address or print.settings.company_gstin %}<p class="eyebrow">{{ print.business_label }}</p>{% endif %}
+      {% if print.settings.company_name %}<h2>{{ print.settings.company_name }}</h2>{% endif %}
+      {% if print.settings.company_address %}<div class="address">{{ print.settings.company_address }}</div>{% endif %}
+      {% if print.settings.company_gstin %}<div><strong>GSTIN</strong> {{ print.settings.company_gstin }}</div>{% endif %}
+      {% if print.settings.company_phone %}<div>{{ print.settings.company_phone }}</div>{% endif %}
+      {% if print.settings.company_email %}<div>{{ print.settings.company_email }}</div>{% endif %}
+    </div>
+    <div class="title">
+      <h1>{{ print.doc_type_label }}</h1>
+      {% if print.document.doc_id %}<div class="document-id">{{ print.document.doc_id }}</div>{% endif %}
+      {% if print.document.date %}<div class="muted">Date: {{ print.document.date|date:"d M Y" }}</div>{% endif %}
+      {% if not print.document.is_active %}<div class="cancelled">CANCELLED</div>{% endif %}
+    </div>
   </div>
-  {% endif %}
-
-  <!-- Doc type + ID row (always shown, sits below banner if present) -->
-  <div class="header-title-row {% if header_image %}with-banner{% endif %}">
-    <div class="company-name">
-      {% if not header_image %}{{ settings.company_name|default:"" }}{% endif %}
-    </div>
-    <div class="doc-title">
-      <h1>{{ doc_type_label }}</h1>
-      <div class="doc-id"># {{ document.doc_id }}</div>
+  {% if print.contact or print.consignee %}<section class="parties">
+    {% if print.contact %}<div class="party">
+      <p class="eyebrow">{{ print.party_label }}</p><h3>{{ print.contact.name }}</h3>
+      {% if print.contact.address %}<p class="address">{{ print.contact.address }}</p>{% endif %}
+      {% if print.contact.gstin %}<p><strong>GSTIN</strong> {{ print.contact.gstin }}</p>{% endif %}
+      {% if print.contact.phone %}<p>{{ print.contact.phone }}</p>{% endif %}
+    </div>{% endif %}
+    {% if print.consignee %}<div class="party">
+      <p class="eyebrow">Ship to</p><h3>{{ print.consignee.name }}</h3>
+      {% if print.consignee.address %}<p class="address">{{ print.consignee.address }}</p>{% endif %}
+      {% if print.consignee.gstin %}<p><strong>GSTIN</strong> {{ print.consignee.gstin }}</p>{% endif %}
+      {% if print.consignee.phone %}<p>{{ print.consignee.phone }}</p>{% endif %}
+    </div>{% endif %}
+  </section>{% endif %}
+  {% if print.document.reference or print.document.due_date or print.document.payment_terms or print.document.place_of_supply or print.document.reverse_charge != None or print.document.supply_category or print.document.supplier_invoice_number %}<section class="metadata">
+    {% if print.document.reference %}<div><span class="muted">Reference</span><strong>{{ print.document.reference.doc_id }}</strong></div>{% endif %}
+    {% if print.document.due_date %}<div><span class="muted">{% if print.document.type == 'quotation' %}Valid until{% else %}Due date{% endif %}</span><strong>{{ print.document.due_date|date:"d M Y" }}</strong></div>{% endif %}
+    {% if print.document.payment_terms %}<div><span class="muted">Payment terms</span><strong>{{ print.document.payment_terms }}</strong></div>{% endif %}
+    {% if print.document.place_of_supply %}<div><span class="muted">Place of supply</span><strong>{{ print.document.place_of_supply }}</strong></div>{% endif %}
+    {% if print.document.reverse_charge != None %}<div><span class="muted">Reverse charge</span><strong>{{ print.document.reverse_charge|yesno:"Yes,No" }}</strong></div>{% endif %}
+    {% if print.document.supply_category %}<div><span class="muted">Supply</span><strong>{{ print.document.get_supply_category_display }}</strong></div>{% endif %}
+    {% if print.document.supplier_invoice_number %}<div><span class="muted">Supplier invoice</span><strong>{{ print.document.supplier_invoice_number }}</strong></div>{% endif %}
+  </section>{% endif %}
+</header>
+<div class="page-body">
+  {% if print.line_items %}<table class="items" aria-label="Document items">
+    <thead><tr>
+      <th style="width:7%">#</th>
+      <th style="width:{% if print.is_simple_line_type %}68{% elif print.is_challan %}58{% else %}38{% endif %}%">Description</th>
+      {% if not print.is_simple_line_type %}<th style="width:12%">HSN/SAC</th><th class="number" style="width:13%">Quantity</th>{% endif %}
+      {% if not print.is_challan %}{% if not print.is_simple_line_type %}<th class="number" style="width:14%">Rate</th>{% endif %}<th class="number">Amount (INR)</th>{% endif %}
+    </tr></thead>
+    <tbody>{% for item in print.line_items %}<tr>
+      <td class="muted">{{ forloop.counter }}</td><td><div class="item-name">{{ item.name }}</div>{% if item.description %}<div class="item-description">{{ item.description }}</div>{% endif %}{% if item.is_discount %}<div class="muted">Waiver</div>{% endif %}{% if item.supply_label %}<div class="item-description">{{ item.supply_label }}</div>{% endif %}{% if item.item_discount_display %}<div class="item-description">Item discount{% if item.item_discount_percentage != None %} {{ item.item_discount_percentage|floatformat:-4 }}%{% endif %}: INR {{ item.item_discount_display }}</div>{% endif %}{% if item.item_tax_details %}<div class="item-description">{% for tax in item.item_tax_details %}{{ tax.name }} {{ tax.percentage }}%{% if not forloop.last %} · {% endif %}{% endfor %}</div>{% endif %}</td>
+      {% if not print.is_simple_line_type %}<td>{{ item.hsn }}</td><td class="number">{{ item.quantity_display }}{% if item.unit %} {{ item.unit }}{% endif %}</td>{% endif %}
+      {% if not print.is_challan %}{% if not print.is_simple_line_type %}<td class="number">{{ item.rate_display }}</td>{% endif %}<td class="number">{% if item.is_discount %}-{% endif %}{{ item.amount_display }}</td>{% endif %}
+    </tr>{% endfor %}</tbody>
+  </table>{% endif %}
+  <div class="document-end">
+    <div class="end-notes">
+      {% if print.document.notes %}<section class="notes-block"><p class="eyebrow">Notes</p><p class="note-text">{{ print.document.notes }}</p></section>{% endif %}
+      {% if print.settings.print_terms %}<section class="notes-block"><p class="eyebrow">Terms &amp; conditions</p><p class="note-text">{{ print.settings.print_terms }}</p></section>{% endif %}
+      {% if not print.is_vendor_doc and not print.is_challan and print.settings.payment_details %}<section class="notes-block"><p class="eyebrow">Payment details</p><p class="note-text">{{ print.settings.payment_details }}</p></section>{% endif %}
     </div>
   </div>
-
-  <!-- PARTIES -->
-  <div class="parties">
-    {% if contact %}
-    <div class="party">
-      {% if is_vendor_doc %}
-        <h4>Vendor</h4>
-      {% else %}
-        <h4>Bill To</h4>
-      {% endif %}
-      <p><strong>{{ contact.name }}</strong></p>
-      {% if contact.address %}<p>{{ contact.address }}</p>{% endif %}
-      {% if contact.phone %}<p>Ph: {{ contact.phone }}</p>{% endif %}
-      {% if contact.gstin %}<p class="gstin">GSTIN: {{ contact.gstin }}</p>{% endif %}
-    </div>
-    {% endif %}
-
-    {% if consignee %}
-    <div class="party">
-      <h4>Ship To (Consignee)</h4>
-      <p><strong>{{ consignee.name }}</strong></p>
-      {% if consignee.address %}<p>{{ consignee.address }}</p>{% endif %}
-      {% if consignee.phone %}<p>Ph: {{ consignee.phone }}</p>{% endif %}
-    </div>
-    {% endif %}
-  </div>
-
-  <!-- META ROW -->
-  <div class="meta-row">
-    <div class="meta-item"><span>Date:</span> <strong>{{ document.date }}</strong></div>
-    {% if document.due_date %}
-      <div class="meta-item">
-        {# Bug #5: show "Validity Date" label for quotations, "Due Date" for all others #}
-        {% if document.type == "quotation" %}
-          <span>Validity Date:</span>
-        {% else %}
-          <span>Due Date:</span>
-        {% endif %}
-        <strong>{{ document.due_date }}</strong>
+</div>
+    {% if not print.is_challan %}<section class="page-summary settlement">
+      <div class="amount-words"><p class="eyebrow">Amount in words</p><div data-summary-value>{% if print.has_total %}{{ print.amount_in_words }}{% endif %}</div></div>
+      <div class="totals">
+        {% if print.has_line_totals %}<div class="total-row"><span>Subtotal</span><span data-summary-value>{{ print.subtotal }}</span></div>{% endif %}
+        {% for charge in print.charges %}<div class="total-row"><span>{{ charge.name }}</span><span data-summary-value>{{ charge.amount_display }}</span></div>{% endfor %}
+        {% if print.document.discount %}<div class="total-row"><span>Discount{% if print.document.discount_percentage != None %} ({{ print.document.discount_percentage|floatformat:-4 }}%){% endif %}</span><span data-summary-value>-{{ print.discount }}</span></div>{% endif %}
+        {% if print.taxes and print.has_line_totals %}<div class="total-row"><span>Taxable amount</span><span data-summary-value>{{ print.taxable_amount }}</span></div>{% endif %}
+        {% if print.has_line_totals %}{% for tax in print.taxes %}<div class="total-row"><span>{{ tax.name }} ({{ tax.percentage }}%)</span><span data-summary-value>{{ tax.amount_display }}</span></div>{% endfor %}{% endif %}
+        {% if print.has_adjustment %}<div class="total-row"><span>Adjustment</span><span data-summary-value>{{ print.adjustment }}</span></div>{% endif %}
+        <div class="total-row grand"><span>Total INR</span><span data-summary-value>{% if print.has_total %}{{ print.grand_total }}{% endif %}</span></div>
       </div>
-    {% endif %}
-    {% if document.payment_terms %}
-      <div class="meta-item"><span>Payment Terms:</span> <strong>{{ document.payment_terms }}</strong></div>
-    {% endif %}
+    </section>{% endif %}
+<footer class="page-footer">
+  <div class="footer-info">
+    {% if print.settings.company_name %}<div class="footer-business">{{ print.settings.company_name }}</div>{% endif %}
+    {% if print.settings.company_phone %}<div>{{ print.settings.company_phone }}</div>{% endif %}
+    {% if print.settings.company_email %}<div>{{ print.settings.company_email }}</div>{% endif %}
+    <div class="page-count"></div>
   </div>
-
-  <!-- LINE ITEMS -->
-  {% if line_items %}
-  <table class="items">
-    <thead>
-      <tr>
-        <th>#</th>
-        <th>Item / Description</th>
-        {% if not is_simple_line_type %}
-          <th>HSN</th>
-          <th>Qty</th>
-          <th>Rate</th>
-        {% endif %}
-        <th style="text-align:right">Amount (₹)</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for item in line_items %}
-      <tr>
-        <td>{{ forloop.counter }}</td>
-        <td>{{ item.name }}</td>
-        {% if not is_simple_line_type %}
-          <td>{{ item.hsn|default:"—" }}</td>
-          <td>{{ item.quantity|default:"—" }}</td>
-          <td>{{ item.rate|default:"—" }}</td>
-        {% endif %}
-        <td style="text-align:right">{{ item.amount }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% endif %}
-
-  <!-- TOTALS BOX -->
-  <div class="totals">
-    <div class="totals-box">
-      {% for charge in charges %}
-        <div class="totals-row">
-          <span>{{ charge.name }}</span><span>₹{{ charge.amount }}</span>
-        </div>
-      {% endfor %}
-      {% if document.discount %}
-        <div class="totals-row">
-          <span>Discount</span><span>− ₹{{ document.discount }}</span>
-        </div>
-      {% endif %}
-      {% for tax in taxes %}
-        <div class="totals-row">
-          <span>{{ tax.name }} ({{ tax.percentage }}%)</span><span>₹{{ tax.amount }}</span>
-        </div>
-      {% endfor %}
-      <div class="totals-row grand">
-        <span>Total</span><span>₹{{ grand_total }}</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- NOTES -->
-  {% if document.notes %}
-  <div class="notes-section">
-    <h4>Notes</h4>
-    <p>{{ document.notes }}</p>
-  </div>
-  {% endif %}
-
-  <!-- Bug #6: Signature block — bottom-right, only if sign_image is set -->
-  {% if sign_image %}
-  <div class="footer">
-    <div class="sign-block">
-      <img src="{{ sign_image }}" alt="Authorised Signature">
-      <p>Authorised Signatory</p>
-    </div>
-  </div>
-  {% endif %}
-
+  {% if print.sign_image or print.settings.signatory_name %}<div class="signature">
+    {% if print.sign_image %}<img src="{{ print.sign_image }}" alt="Authorised signature">{% endif %}
+    <div class="signature-label">{% if print.settings.signatory_name %}{{ print.settings.signatory_name }}<br>{% endif %}Authorised signatory</div>
+  </div>{% endif %}
+</footer>
+</article>
+{% endfor %}
 </body>
 </html>

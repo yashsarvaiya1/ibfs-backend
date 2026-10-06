@@ -8,11 +8,11 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.getenv('SECRET_KEY', 'fallback-dev-secret-key-change-in-production')
-DEBUG = os.getenv('DEBUG', 'True') == 'True'
+DEBUG = os.getenv('DEBUG', 'False') == 'True'
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 CSRF_TRUSTED_ORIGINS = os.getenv(
-    'CORS_ALLOWED_ORIGINS',
+    'CSRF_TRUSTED_ORIGINS',
     'http://localhost:4000,http://127.0.0.1:4000'
 ).split(',')
 
@@ -38,6 +38,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'shared.http.PrivateResponseMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -77,6 +78,9 @@ DATABASES = {
         'PASSWORD': os.getenv('DB_PASSWORD', ''),
         'HOST': os.getenv('DB_HOST', 'localhost'),
         'PORT': os.getenv('DB_PORT', '5432'),
+        'OPTIONS': {'connect_timeout':5},
+        'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE','60')),
+        'CONN_HEALTH_CHECKS': True,
     }
 }
 
@@ -110,6 +114,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.BasicAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
@@ -120,6 +125,7 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'shared.pagination.IBFSPageNumberPagination',
     'PAGE_SIZE': int(os.getenv('PAGE_SIZE', 20)),
+    'DEFAULT_THROTTLE_RATES': {'login':'10/min'},
 }
 
 CORS_ALLOWED_ORIGINS = os.getenv(
@@ -139,9 +145,9 @@ CACHES = {
     'default': {
         'BACKEND': os.getenv(
             'CACHE_BACKEND',
-            'django.core.cache.backends.locmem.LocMemCache',
+            'django.core.cache.backends.locmem.LocMemCache' if DEBUG else 'django.core.cache.backends.db.DatabaseCache',
         ),
-        'LOCATION': os.getenv('CACHE_LOCATION', 'ibfs-cache'),
+        'LOCATION': os.getenv('CACHE_LOCATION', 'ibfs-cache' if DEBUG else 'ibfs_cache'),
     }
 }
 
@@ -155,3 +161,24 @@ TEMP_PDF_ROOT        = BASE_DIR / 'media' / 'temp'
 TEMP_PDF_TTL_MINUTES = int(os.getenv('TEMP_PDF_TTL_MINUTES', 30))
 
 MEDIA_BASE_URL = os.getenv('MEDIA_BASE_URL', 'http://localhost:8000')
+
+# Browser sessions never expose passwords to JavaScript storage.
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SAMESITE = 'Lax'
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_AGE = 60 * 60 * 12
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
+
+if not DEBUG:
+    from django.core.exceptions import ImproperlyConfigured
+    if len(SECRET_KEY) < 50 or SECRET_KEY.startswith(('fallback-', 'replace-')):
+        raise ImproperlyConfigured('Set SECRET_KEY before starting production.')
+    SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'True') == 'True'
+    SECURE_REDIRECT_EXEMPT = [r'^health/?$']
+    SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS','31536000'))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = False
+    SECURE_HSTS_PRELOAD = False

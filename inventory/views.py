@@ -5,7 +5,9 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import Product, StockTransaction
-from .serializers import ProductSerializer, ProductListSerializer, StockTransactionSerializer
+from .serializers import ProductSerializer, ProductListSerializer, StockTransactionSerializer, StockAdjustmentSerializer
+from django.db import transaction
+from django.utils import timezone
 from accounting.services import _create_stxn, _parse_date
 
 
@@ -13,6 +15,12 @@ class ProductViewSet(viewsets.ModelViewSet):
     search_fields   = ['name', 'hsn_code']
     ordering_fields = ['name', 'current_stock', 'rate']
     ordering        = ['name']
+
+    def destroy(self, request, *args, **kwargs):
+        product = self.get_object()
+        product.is_active = False
+        product.save(update_fields=['is_active', 'updated_at'])
+        return Response(status=204)
 
     def get_serializer_class(self):
         return ProductListSerializer if self.action == 'list' else ProductSerializer
@@ -33,8 +41,17 @@ class ProductViewSet(viewsets.ModelViewSet):
         if params.get('is_active') is not None:
             qs = qs.filter(is_active=params['is_active'].lower() == 'true')
         if params.get('low_stock') == 'true':
-            qs = qs.filter(current_stock__lt=models.F('min_stock'))
+            qs = qs.filter(current_stock__lte=models.F('min_stock'))
         return qs
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        serializer.instance = Product.objects.select_for_update().get(pk=serializer.instance.pk)
+        target = serializer.validated_data.pop('current_stock', None)
+        product = serializer.save()
+        if target is not None and target != product.current_stock:
+            _create_stxn('actual', target-product.current_stock, product, None,
+                timezone.localdate(), notes='Stock reconciliation')
 
     @action(detail=True, methods=['post'])
     def adjust_stock(self, request, pk=None):
@@ -44,15 +61,11 @@ class ProductViewSet(viewsets.ModelViewSet):
         Per spec 6.3 — Adjust Stock method.
         """
         product = self.get_object()
-        stxn = _create_stxn(
-            type_    = 'actual',
-            quantity = Decimal(str(request.data['quantity'])),
-            product  = product,
-            document = None,
-            date     = _parse_date(request.data.get('date')),
-            rate     = request.data.get('rate'),
-            notes    = request.data.get('notes'),
-        )
+        command = StockAdjustmentSerializer(data=request.data)
+        command.is_valid(raise_exception=True)
+        data = command.validated_data
+        stxn = _create_stxn('actual', data['quantity'], product, None,
+            data.get('date', timezone.localdate()), data.get('rate'), data.get('notes'))
         return Response(
             StockTransactionSerializer(stxn, context={'request': request}).data,
             status=status.HTTP_201_CREATED,
@@ -65,9 +78,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         Per spec 6.3 — Direct Edit method.
         """
         product = self.get_object()
-        product.current_stock = Decimal(str(request.data['current_stock']))
-        product.save(update_fields=['current_stock', 'updated_at'])
-        return Response(ProductSerializer(product, context={'request': request}).data)
+        serializer = ProductSerializer(product, data=request.data, partial=True, context={'request':request})
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
 
     @action(detail=True, methods=['get'])
     def pending_moves(self, request, pk=None):
@@ -76,34 +90,24 @@ class ProductViewSet(viewsets.ModelViewSet):
         Per spec 6.2 — Product page stock movement section.
         """
         product = self.get_object()
-        records = StockTransaction.objects.filter(
-            product=product,
-            type='record',
-            document__is_active=True,
-        ).select_related('document', 'document__contact')
-
+        records = list(StockTransaction.objects.filter(product=product, type='record',
+            document__is_active=True).values('document_id').annotate(total=Sum('quantity')))
+        doc_ids = [row['document_id'] for row in records]
+        actuals = {row['document_id']:abs(row['total']) for row in StockTransaction.objects.filter(
+            product=product, type='actual', document_id__in=doc_ids).values('document_id').annotate(total=Sum('quantity'))}
+        from accounting.models import Document
+        documents = {doc.pk:doc for doc in Document.objects.filter(pk__in=doc_ids).select_related('contact')}
         result = []
-        for r in records:
-            actuals   = StockTransaction.objects.filter(
-                document=r.document,
-                product=product,
-                type='actual',
-            ).values_list('quantity', flat=True)
-            moved     = sum(actuals)
-            remaining = r.quantity - moved
-
-            if remaining != 0:
-                result.append({
-                    'document_id':   r.document_id,
-                    'doc_id':        r.document.doc_id if r.document else None,
-                    'doc_type':      r.document.type if r.document else None,
-                    'contact':       str(r.document.contact) if r.document and r.document.contact else None,
-                    'date':          r.document.date if r.document else None,
-                    'record_qty':    str(r.quantity),
-                    'moved_qty':     str(moved),
-                    'remaining_qty': str(remaining),
-                })
-        return Response(result)
+        for row in records:
+            doc = documents[row['document_id']]
+            expected = abs(row['total'])
+            moved = actuals.get(doc.pk, Decimal('0'))
+            result.append({'document_id':doc.pk, 'doc_id':doc.doc_id, 'doc_type':doc.type,
+                'contact':str(doc.contact) if doc.contact else None, 'date':doc.date,
+                'record_qty':str(expected), 'moved_qty':str(moved),
+                'remaining_qty':str(max(expected-moved, Decimal('0'))),
+                'direction':'in' if row['total'] > 0 else 'out'})
+        return Response(sorted(result, key=lambda row: (row['date'], row['document_id']), reverse=True))
 
     @action(detail=True, methods=['post'])
     def move_stock_from_product(self, request, pk=None):
@@ -114,7 +118,8 @@ class ProductViewSet(viewsets.ModelViewSet):
         product = self.get_object()
         from accounting.models import Document
         from accounting.services import process_move_stock
-        doc    = Document.objects.get(pk=request.data['document_id'])
+        from django.shortcuts import get_object_or_404
+        doc = get_object_or_404(Document, pk=request.data.get('document_id'), is_active=True)
         result = process_move_stock(doc, {
             'items': [{'product_id': product.pk, 'quantity': request.data['quantity']}],
             'date':  _parse_date(request.data.get('date')),
@@ -146,6 +151,16 @@ class ProductViewSet(viewsets.ModelViewSet):
 
 class StockTransactionViewSet(viewsets.ModelViewSet):
     serializer_class = StockTransactionSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if data['type'] != 'actual':
+            return Response({'error': 'Record stock is managed through documents.'}, status=400)
+        stxn = _create_stxn('actual', data['quantity'], data['product'],
+            data.get('document'), data['date'], data.get('rate'), data.get('notes'))
+        return Response(self.get_serializer(stxn).data, status=201)
     search_fields    = ['product__name', 'notes']
     ordering_fields  = ['date', 'quantity', 'created_at']
     ordering         = ['-date']
@@ -178,45 +193,56 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
                 )
         return qs
 
+    @transaction.atomic
     def update(self, request, *args, **kwargs):
         """
         Only actual s.txns can be edited directly.
         Record s.txns are managed via document edit → _sync_record_stxns.
         """
         stxn = self.get_object()
+        if stxn.document_id:
+            from accounting.models import Document
+            Document.objects.select_for_update().get(pk=stxn.document_id)
+        stxn = StockTransaction.objects.select_for_update().get(pk=stxn.pk)
         if stxn.type == 'record':
             return Response(
                 {'error': 'Record stock transactions are managed via document edit.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if 'quantity' in request.data:
-            new_qty = Decimal(str(request.data['quantity']))
+        serializer = self.get_serializer(stxn, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if 'quantity' in data:
+            new_qty = data['quantity']
             diff    = new_qty - stxn.quantity
-            stxn.product.current_stock += diff
-            stxn.product.save(update_fields=['current_stock', 'updated_at'])
+            Product.objects.filter(pk=stxn.product_id).update(current_stock=models.F('current_stock') + diff, updated_at=timezone.now())
             stxn.quantity = new_qty
-        if 'notes' in request.data:
-            stxn.notes = request.data['notes']
-        if 'date' in request.data:
-            stxn.date = _parse_date(request.data['date'])
-        if 'rate' in request.data:
-            stxn.rate = request.data['rate']
+        if 'notes' in data:
+            stxn.notes = data['notes']
+        if 'date' in data:
+            stxn.date = data['date']
+        if 'rate' in data:
+            stxn.rate = data['rate']
         stxn.save()
         return Response(StockTransactionSerializer(stxn, context={'request': request}).data)
 
+    @transaction.atomic
     def destroy(self, request, *args, **kwargs):
         """
         Only actual s.txns can be deleted directly.
         Reverses the stock change on delete.
         """
         stxn = self.get_object()
+        if stxn.document_id:
+            from accounting.models import Document
+            Document.objects.select_for_update().get(pk=stxn.document_id)
+        stxn = StockTransaction.objects.select_for_update().get(pk=stxn.pk)
         if stxn.type == 'record':
             return Response(
                 {'error': 'Record stock transactions are managed via document deletion.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        stxn.product.current_stock -= stxn.quantity
-        stxn.product.save(update_fields=['current_stock', 'updated_at'])
+        Product.objects.filter(pk=stxn.product_id).update(current_stock=models.F('current_stock') - stxn.quantity, updated_at=timezone.now())
         stxn.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -226,16 +252,13 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
         Standalone stock adjustment from the Stock Transactions page.
         Per spec 6.3 — Adjust Stock.
         """
-        product = Product.objects.get(pk=request.data['product'])
-        stxn = _create_stxn(
-            type_    = 'actual',
-            quantity = Decimal(str(request.data['quantity'])),
-            product  = product,
-            document = None,
-            date     = _parse_date(request.data.get('date')),
-            rate     = request.data.get('rate'),
-            notes    = request.data.get('notes'),
-        )
+        from rest_framework import serializers
+        product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.filter(is_active=True)).run_validation(request.data.get('product'))
+        command = StockAdjustmentSerializer(data=request.data)
+        command.is_valid(raise_exception=True)
+        data = command.validated_data
+        stxn = _create_stxn('actual', data['quantity'], product, None,
+            data.get('date', timezone.localdate()), data.get('rate'), data.get('notes'))
         return Response(
             StockTransactionSerializer(stxn, context={'request': request}).data,
             status=status.HTTP_201_CREATED,

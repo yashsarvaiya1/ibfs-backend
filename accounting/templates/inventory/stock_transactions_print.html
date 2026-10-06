@@ -46,7 +46,7 @@
     .run-nil { color: #888; }
 
     .row-opening td { background: #eef4ff; font-weight: bold; border-color: #c5d9f7; }
-    .row-record td  { opacity: 0.6; }
+    .row-record td  { background: #fffaf0; }
     .row-closing td { border-top: 2px solid #222; background: #f2f2f2; font-weight: bold; font-size: 11px; }
 
     .badge { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 8px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -83,15 +83,18 @@
   </div>
   {% endif %}
 
+  {% if not product and date_from or not product and date_to %}<p style="margin-bottom:10px">Period: {{ date_from|default:"—" }} to {{ date_to|default:"present" }}</p>{% endif %}
+  <p style="margin-bottom:10px;color:#555">Expected movements are shown in brackets (+ / -) and do not change physical stock.</p>
   <table>
     <thead>
       <tr>
         <th style="width:70px">Date</th>
         <th style="width:65px">Type</th>
+        {% if not product %}<th>Product</th>{% endif %}
         <th>Document</th>
         <th style="width:90px" class="r">Stock In</th>
         <th style="width:90px" class="r">Stock Out</th>
-        <th style="width:110px" class="r">Running Stock</th>
+        {% if product %}<th style="width:110px" class="r">Running Stock</th>{% endif %}
       </tr>
     </thead>
     <tbody>
@@ -99,8 +102,8 @@
       <tr class="row-opening">
         <td>—</td>
         <td colspan="2"><strong>Opening Stock</strong></td>
-        <td class="amt in">{% if opening_stock_pos %}{{ opening_stock }} {{ product.unit }}{% endif %}</td>
-        <td class="amt out">{% if not opening_stock_pos %}{{ opening_stock }} {{ product.unit }}{% endif %}</td>
+        <td></td>
+        <td></td>
         <td class="amt run">{{ opening_stock }} {{ product.unit }}</td>
       </tr>
       {% endif %}
@@ -109,26 +112,28 @@
       <tr {% if txn.type_raw == 'record' %}class="row-record"{% endif %}>
         <td style="font-weight:600;color:#555">{{ txn.date }}</td>
         <td><span class="badge badge-{{ txn.type_raw }}">{{ txn.type }}</span></td>
+        {% if not product %}<td>{{ txn.product_name }}</td>{% endif %}
         <td>
           {% if txn.doc_id != "—" %}<span style="font-weight:bold;color:#1d4ed8">{{ txn.doc_type }} #{{ txn.doc_id }}</span>{% endif %}
           {% if txn.rate != "—" %}<br><span style="font-size:9px;color:#555">₹{{ txn.rate }}/unit</span>{% endif %}
           {% if txn.notes != "—" %}<br><span style="font-size:9px;color:#777">{{ txn.notes }}</span>{% endif %}
         </td>
-        <td class="amt in">{% if txn.qty_in %}+{{ txn.quantity }} {{ product.unit }}{% endif %}</td>
-        <td class="amt out">{% if txn.qty_out %}−{{ txn.quantity }} {{ product.unit }}{% endif %}</td>
+        <td class="amt in">{% if txn.qty_in %}{% if txn.is_expected %}({% endif %}+{{ txn.quantity }}{% if txn.is_expected %}){% endif %} {{ txn.unit }}{% endif %}</td>
+        <td class="amt out">{% if txn.qty_out %}{% if txn.is_expected %}({% endif %}-{{ txn.quantity }}{% if txn.is_expected %}){% endif %} {{ txn.unit }}{% endif %}</td>
+        {% if product %}
         <td class="amt {% if txn.running_stock %}run{% else %}run-nil{% endif %}">
           {% if txn.running_stock %}{{ txn.running_stock }} {{ product.unit }}{% else %}—{% endif %}
         </td>
+        {% endif %}
       </tr>
       {% endfor %}
-    </tbody>
-
-    {% if transactions %}{% with last=transactions|last %}
+    {% if show_closing %}
     <tr class="row-closing">
       <td colspan="5" style="text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">Closing Stock</td>
-      <td class="amt run" style="font-size:12px">{% if last.running_stock %}{{ last.running_stock }} {{ product.unit }}{% endif %}</td>
+      <td class="amt run" style="font-size:12px">{{ closing_stock }} {{ product.unit }}</td>
     </tr>
-    {% endwith %}{% endif %}
+    {% endif %}
+    </tbody>
   </table>
 
 </body>

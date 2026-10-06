@@ -2,11 +2,15 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import SettingsViewSet, ContactViewSet, PaymentAccountViewSet
 
+from .auth import SessionViewSet
+
 router = DefaultRouter()
+router.register('session', SessionViewSet, basename='session')
 router.register('contacts', ContactViewSet,        basename='contacts')
 router.register('accounts', PaymentAccountViewSet, basename='accounts')
 
 urlpatterns = [
+    path('settings/print-preview/', SettingsViewSet.as_view({'get': 'print_preview'})),
     path('settings/', SettingsViewSet.as_view({
         'get':   'list',
         'post':  'create',

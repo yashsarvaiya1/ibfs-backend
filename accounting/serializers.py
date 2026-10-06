@@ -15,6 +15,9 @@ def _build_media_url(request, relative_path):
 
 
 class FinancialTransactionSerializer(serializers.ModelSerializer):
+    running_cf = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True, required=False)
+    running_balance = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True, required=False)
+    allocations = serializers.SerializerMethodField()
     document_type        = serializers.SerializerMethodField()
     is_document_deleted  = serializers.SerializerMethodField()
     contact_name         = serializers.SerializerMethodField()
@@ -25,9 +28,22 @@ class FinancialTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model  = FinancialTransaction
         fields = '__all__'
+        read_only_fields = ['monthly_cumulative_delta','transfer_group','is_reversed']
+
+    def validate(self, attrs):
+        document = attrs.get('document', self.instance.document if self.instance else None)
+        contact = attrs.get('contact', self.instance.contact if self.instance else None)
+        if document and contact and document.contact_id != contact.pk:
+            raise serializers.ValidationError({'document': 'Choose a document belonging to this contact.'})
+        return attrs
 
     def get_document_type(self, obj):
         return obj.document.type if obj.document else None
+
+    def get_allocations(self, obj):
+        return [{'document':row.document_id, 'doc_id':row.document.doc_id,
+                 'document_type':row.document.type, 'amount':str(row.amount)}
+                for row in obj.allocations.all()]
 
     def get_is_document_deleted(self, obj):
         # document_id check avoids any DB hit when document is null
@@ -71,23 +87,23 @@ class DocumentListSerializer(serializers.ModelSerializer):
         return obj.contact.company_name or obj.contact.contact_name
 
     def get_payment_status(self, obj):
-        NO_PAYMENT_TYPES = {'po', 'pi', 'quotation', 'challan', 'interest', 'expense'}
-        if obj.type in NO_PAYMENT_TYPES:
-            return None
-        # obj.transactions uses prefetch_related('transactions') set in the viewset
-        txns   = obj.transactions.all()
-        record = abs(sum(t.amount for t in txns if t.type == 'record'))
-        paid   = abs(sum(t.amount for t in txns if t.type == 'actual'))
-        return {
-            'remaining': str(record - paid),
-            'is_paid':   paid >= record,
-        }
+        from .payments import payment_status
+        return payment_status(obj)
 
 
 # ─── Detail serializer ────────────────────────────────────────────────────────
 
 class DocumentSerializer(serializers.ModelSerializer):
-    transactions         = FinancialTransactionSerializer(many=True, read_only=True)
+    calculated_totals = serializers.SerializerMethodField()
+
+    def get_calculated_totals(self, obj):
+        from .calculations import document_totals
+        try:
+            return document_totals({key: getattr(obj, key) for key in ('line_items', 'charges', 'taxes', 'discount', 'discount_percentage', 'tax_mode')}, obj.type)
+        except (ValueError, TypeError, ArithmeticError):
+            return None
+
+    transactions         = serializers.SerializerMethodField()
     payment_status       = serializers.SerializerMethodField()
     stock_status         = serializers.SerializerMethodField()
     attachment_urls_full = serializers.SerializerMethodField()
@@ -97,6 +113,13 @@ class DocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model  = Document
         fields = '__all__'
+
+    def get_transactions(self, obj):
+        transactions = {txn.pk:txn for txn in obj.transactions.all()}
+        for allocation in obj.payment_allocations.all():
+            transactions[allocation.payment_id] = allocation.payment
+        rows = sorted(transactions.values(), key=lambda txn: (txn.date, txn.created_at, txn.pk), reverse=True)
+        return FinancialTransactionSerializer(rows, many=True, context=self.context).data
 
     def get_attachment_urls_full(self, obj):
         request = self.context.get('request')
@@ -132,58 +155,9 @@ class DocumentSerializer(serializers.ModelSerializer):
         }
 
     def get_payment_status(self, obj):
-        NO_PAYMENT_TYPES = {'po', 'pi', 'quotation', 'challan', 'interest', 'expense'}
-        if obj.type in NO_PAYMENT_TYPES:
-            return None
-        txns   = obj.transactions.all()
-        record = abs(sum(t.amount for t in txns if t.type == 'record'))
-        paid   = abs(sum(t.amount for t in txns if t.type == 'actual'))
-        return {
-            'record':    str(record),
-            'paid':      str(paid),
-            'remaining': str(record - paid),
-            'is_paid':   paid >= record,
-        }
+        from .payments import payment_status
+        return payment_status(obj)
 
     def get_stock_status(self, obj):
-        """
-        BF-06 fix: replaced per-product loop queries with a single aggregation.
-        Was: 1 DB query per product inside the loop = N+1
-        Now: 1 query for all record s.txns + 1 aggregation for all actual s.txns = 2 total
-        """
-        from inventory.models import StockTransaction
-
-        NO_STOCK_TYPES = {
-            'po', 'pi', 'quotation', 'interest', 'expense',
-            'cash_payment_voucher', 'cash_receipt_voucher',
-        }
-        if obj.type in NO_STOCK_TYPES:
-            return None
-
-        records = StockTransaction.objects.filter(
-            document=obj, type='record'
-        ).select_related('product')
-        if not records.exists():
-            return None
-
-        # Single aggregation for all actual s.txns on this document (BF-06)
-        actuals_map = {
-            a['product_id']: abs(a['total'] or Decimal('0'))
-            for a in StockTransaction.objects.filter(
-                document=obj, type='actual'
-            ).values('product_id').annotate(total=Sum('quantity'))
-        }
-
-        result = []
-        for r in records:
-            record_qty = abs(r.quantity)
-            moved      = actuals_map.get(r.product_id, Decimal('0'))
-            result.append({
-                'product_id':    r.product_id,
-                'product_name':  r.product.name,
-                'record_qty':    str(record_qty),
-                'moved_qty':     str(moved),
-                'remaining_qty': str(record_qty - moved),
-                'is_moved':      moved >= record_qty,
-            })
-        return result
+        from .stock_status import document_stock_status
+        return document_stock_status(obj) or None

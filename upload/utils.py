@@ -2,7 +2,7 @@
 import io
 import os
 import uuid
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 from django.conf import settings
 
 ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
@@ -43,23 +43,40 @@ def process_upload(file, subfolder='documents'):
     is_image = content_type in ALLOWED_IMAGE_TYPES
 
     if is_image:
-        img = Image.open(file)
-
-        # Bug B fix: apply EXIF rotation before any processing
-        # This handles all 8 EXIF orientations (rotate 90/180/270, flip)
-        img = ImageOps.exif_transpose(img)
-
-        if img.mode in ('RGBA', 'P'):
-            img = img.convert('RGB')
+        try:
+            img = Image.open(file)
+            if img.width * img.height > 25_000_000:
+                raise ValueError('Image resolution is too large. Use an image below 25 megapixels.')
+            img = ImageOps.exif_transpose(img)
+            img.load()
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+            raise ValueError('This image could not be read. Upload a valid PNG, JPEG or WebP.') from exc
+        img.thumbnail((3000, 3000), Image.Resampling.LANCZOS)
         buffer = io.BytesIO()
-        quality = getattr(settings, 'UPLOAD_IMAGE_QUALITY', 75)
-        img.save(buffer, format='JPEG', quality=quality, optimize=True)
+        if subfolder == 'settings':
+            # Lossless branding keeps small text sharp and signatures transparent.
+            img = img.convert('RGBA' if 'A' in img.getbands() or 'transparency' in img.info else 'RGB')
+            img.save(buffer, format='PNG', optimize=True)
+            extension = '.png'
+        else:
+            if img.mode != 'RGB':
+                rgba = img.convert('RGBA')
+                background = Image.new('RGB', rgba.size, 'white')
+                background.paste(rgba, mask=rgba.getchannel('A'))
+                img = background
+            quality = getattr(settings, 'UPLOAD_IMAGE_QUALITY', 75)
+            img.save(buffer, format='JPEG', quality=quality, optimize=True)
+            extension = '.jpg'
         buffer.seek(0)
         file_data = buffer.read()
-        relative_path = _unique_path(subfolder, '.jpg')
+        relative_path = _unique_path(subfolder, extension)
     else:
         # PDF — pass through untouched
         file_data = file.read()
+        if subfolder == 'settings':
+            raise ValueError('Use a PNG, JPEG or WebP image for letterhead and signature.')
+        if not file_data.startswith(b'%PDF-'):
+            raise ValueError('This file is not a valid PDF.')
         relative_path = _unique_path(subfolder, '.pdf')
 
     return file_data, relative_path

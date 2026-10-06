@@ -28,8 +28,8 @@
     .entity-info .name { font-size: 14px; font-weight: bold; margin-bottom: 4px; }
     .entity-info .meta { color: #555; font-size: 10px; }
     .ob { display: inline-block; margin-left: 16px; font-size: 11px; font-weight: bold; }
-    .ob-dr { color: #c0392b; }
-    .ob-cr { color: #27ae60; }
+    .ob-dr { color: {% if account %}#222{% else %}#27ae60{% endif %}; }
+    .ob-cr { color: {% if account %}#222{% else %}#c0392b{% endif %}; }
 
     table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 10px; }
     thead tr { background: #f0f0f0; }
@@ -38,12 +38,14 @@
       letter-spacing: 0.04em; font-size: 9px; font-weight: bold; border: 1px solid #ccc;
     }
     td { padding: 6px 6px; border: 1px solid #ddd; vertical-align: top; }
+    thead { display: table-header-group; }
+    tr { break-inside: avoid; }
     tbody tr:nth-child(even) td { background: #fafafa; }
     .r   { text-align: right; }
     .amt { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; }
 
-    .cf-dr  { color: #c0392b; }
-    .cf-cr  { color: #27ae60; }
+    .cf-dr  { color: {% if account %}#222{% else %}#27ae60{% endif %}; }
+    .cf-cr  { color: {% if account %}#222{% else %}#c0392b{% endif %}; }
     .cf-nil { color: #888; }
 
     .row-opening td { background: #eef4ff; font-weight: bold; border-color: #c5d9f7; }
@@ -77,7 +79,7 @@
     <div class="company-name">{% if not header_image %}{{ settings.company_name|default:"" }}{% endif %}</div>
     <div class="report-title">
       <h1>{{ report_title }}</h1>
-      <div class="sub">Printed on {% now "d M Y" %}</div>
+      <div class="sub">{% if date_from or date_to %}Period: {{ date_from|date:"d M Y"|default:"Start" }} to {{ date_to|date:"d M Y"|default:"Present" }}<br>{% endif %}Printed on {% now "d M Y" %}</div>
     </div>
   </div>
 
@@ -88,10 +90,10 @@
       {% if contact.phone %}Ph: {{ contact.phone }}{% endif %}
       {% if contact.gstin %} &nbsp;|&nbsp; GSTIN: {{ contact.gstin }}{% endif %}
       {% if contact.address %} &nbsp;|&nbsp; {{ contact.address }}{% endif %}
-      {% if opening_balance_val and not opening_balance_zero %}
-        <span class="ob {% if opening_balance_pos %}ob-dr{% else %}ob-cr{% endif %}">
+      {% if opening_balance_val %}
+        <span class="ob {% if opening_balance_debit %}ob-dr{% else %}ob-cr{% endif %}">
           Opening Balance: ₹{{ opening_balance_val }}
-          {% if opening_balance_pos %}(Dr){% else %}(Cr){% endif %}
+          {% if not opening_balance_zero %}{% if opening_balance_debit %}(Dr){% else %}(Cr){% endif %}{% endif %}
         </span>
       {% endif %}
     </div>
@@ -105,7 +107,7 @@
       Type: {{ account.type|capfirst }}
       {% if account.account_number %} &nbsp;|&nbsp; A/C: •••• {{ account.account_number|slice:"-4:" }}{% endif %}
       {% if balance_before_period %}
-        <span class="ob cf-dr">Balance B/F: ₹{{ balance_before_period }}</span>
+        <span class="ob {% if balance_before_period_debit %}cf-dr{% else %}cf-cr{% endif %}">Balance B/F: ₹{{ balance_before_period }}{% if not balance_before_period_zero %} ({% if balance_before_period_debit %}Dr{% else %}Cr{% endif %}){% endif %}</span>
       {% endif %}
     </div>
   </div>
@@ -123,15 +125,15 @@
       </tr>
     </thead>
     <tbody>
-      {% if opening_balance_val and not opening_balance_zero %}
+      {% if opening_balance_val %}
       <tr class="row-opening">
         <td>—</td>
         <td><strong>{% if account %}Balance B/F{% else %}Opening Balance{% endif %}</strong></td>
-        <td class="amt cf-dr">{% if opening_balance_pos %}₹{{ opening_balance_val }}{% endif %}</td>
-        <td class="amt cf-cr">{% if not opening_balance_pos %}₹{{ opening_balance_val }}{% endif %}</td>
-        <td class="amt {% if opening_balance_pos %}cf-dr{% else %}cf-cr{% endif %}">
+        <td class="amt cf-dr">{% if not opening_balance_zero and opening_balance_debit %}₹{{ opening_balance_val }}{% endif %}</td>
+        <td class="amt cf-cr">{% if not opening_balance_zero and not opening_balance_debit %}₹{{ opening_balance_val }}{% endif %}</td>
+        <td class="amt {% if opening_balance_debit %}cf-dr{% else %}cf-cr{% endif %}">
           ₹{{ opening_balance_val }}
-          <span style="font-size:9px;font-weight:normal;margin-left:3px">{% if opening_balance_pos %}Dr{% else %}Cr{% endif %}</span>
+          <span style="font-size:9px;font-weight:normal;margin-left:3px">{% if not opening_balance_zero %}{% if opening_balance_debit %}Dr{% else %}Cr{% endif %}{% endif %}</span>
         </td>
       </tr>
       {% endif %}
@@ -149,27 +151,25 @@
           {% if txn.account != "—" and txn.account %}<br><span style="font-size:9px;color:#555">via {{ txn.account }}</span>{% endif %}
         </td>
         <td class="{% if txn.is_expense %}amt-expense{% else %}amt cf-dr{% endif %}">
-          {% if txn.is_expense %}₹{{ txn.amount_abs }}{% elif txn.amount_pos %}₹{{ txn.amount_abs }}{% endif %}
+          {% if txn.debit %}₹{{ txn.amount_abs }}{% endif %}
         </td>
-        <td class="amt cf-cr">{% if not txn.is_expense and not txn.amount_pos %}₹{{ txn.amount_abs }}{% endif %}</td>
-        <td class="amt {% if txn.running_cf_zero %}cf-nil{% elif txn.running_cf_positive %}cf-dr{% else %}cf-cr{% endif %}">
+        <td class="amt cf-cr">{% if txn.credit %}₹{{ txn.amount_abs }}{% endif %}</td>
+        <td class="amt {% if txn.running_cf_zero %}cf-nil{% elif txn.balance_debit %}cf-dr{% else %}cf-cr{% endif %}">
           {% if txn.running_cf %}₹{{ txn.running_cf }}
-            {% if not txn.running_cf_zero %}<span style="font-size:9px;font-weight:normal;margin-left:2px">{% if txn.running_cf_positive %}Dr{% else %}Cr{% endif %}</span>{% endif %}
+            {% if not txn.running_cf_zero %}<span style="font-size:9px;font-weight:normal;margin-left:2px">{% if txn.balance_debit %}Dr{% else %}Cr{% endif %}</span>{% endif %}
           {% endif %}
         </td>
       </tr>
       {% endfor %}
     </tbody>
-    {% if transactions %}{% with last=transactions|last %}
+    {% if closing_balance %}
     <tr class="row-closing">
       <td colspan="4" style="text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em">Closing Balance</td>
-      <td class="amt {% if last.running_cf_zero %}cf-nil{% elif last.running_cf_positive %}cf-dr{% else %}cf-cr{% endif %}" style="font-size:12px">
-        {% if last.running_cf %}₹{{ last.running_cf }}
-          {% if not last.running_cf_zero %}<span style="font-size:9px;font-weight:normal;margin-left:2px">{% if last.running_cf_positive %}Dr{% else %}Cr{% endif %}</span>{% endif %}
-        {% endif %}
+      <td class="amt {% if closing_balance_zero %}cf-nil{% elif closing_balance_debit %}cf-dr{% else %}cf-cr{% endif %}" style="font-size:12px">
+        ₹{{ closing_balance }}{% if not closing_balance_zero %}<span style="font-size:9px;font-weight:normal;margin-left:2px">{% if closing_balance_debit %}Dr{% else %}Cr{% endif %}</span>{% endif %}
       </td>
     </tr>
-    {% endwith %}{% endif %}
+    {% endif %}
   </table>
 
   {% else %}

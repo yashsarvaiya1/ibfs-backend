@@ -69,3 +69,15 @@ class ProductListSerializer(serializers.ModelSerializer):
 
     def get_image_url_full(self, obj):
         return _build_media_url(self.context.get('request'), obj.image_url)
+
+
+class StockAdjustmentSerializer(serializers.Serializer):
+    quantity = serializers.DecimalField(max_digits=15, decimal_places=2)
+    date = serializers.DateField(required=False)
+    rate = serializers.DecimalField(max_digits=15, decimal_places=2, min_value=0, required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+    def validate_quantity(self, value):
+        if not value:
+            raise serializers.ValidationError('Enter a nonzero quantity.')
+        return value
