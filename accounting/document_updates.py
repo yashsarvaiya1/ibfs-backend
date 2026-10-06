@@ -22,7 +22,7 @@ def _quantities(items):
     return result
 
 
-def sync_stock(document, previous_items, force=False):
+def sync_stock(document, previous_items, force=False, date_changed=False):
     sign = stock_direction(document.type, document.reference.type if document.reference else None)
     if sign is None:
         return
@@ -42,7 +42,13 @@ def sync_stock(document, previous_items, force=False):
         existing.filter(type='record').delete()
         for pid, qty in quantities.items():
             _create_stxn('record', sign * qty, products[pid], document, document.date)
-    elif force or quantities != _quantities(previous_items):
+    else:
+        # Automatic stock follows the document date. In record mode, actual
+        # delivery dates remain unchanged because those represent real movements.
+        if date_changed:
+            existing.filter(type='actual').update(date=document.date)
+        if not force and quantities == _quantities(previous_items):
+            return
         actuals = {row['product_id']: row['total'] for row in existing.filter(type='actual').values('product_id').annotate(total=Sum('quantity'))}
         all_products = {p.pk: p for p in Product.objects.filter(pk__in=set(quantities) | set(actuals))}
         for pid in sorted(all_products):
@@ -106,7 +112,7 @@ def update_document(document, payload, preserve_total=False):
         document.total_amount = totals['total']
     document.save()
     if calculation_changed or 'date' in data or 'reference' in data:
-        sync_stock(document, old_items, force='reference' in data)
+        sync_stock(document, old_items, force='reference' in data, date_changed=document.date != old_date)
     if document.type in FINANCIAL_SIGNS:
         records = list(document.transactions.filter(type='record').order_by('pk'))
         amount = FINANCIAL_SIGNS[document.type] * decimal_value(document.total_amount)

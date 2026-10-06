@@ -28,6 +28,28 @@ class DocumentEditTests(TestCase):
         self.assertEqual(self.product.current_stock, -7)
         self.assertFalse(StockTransaction.objects.filter(document=doc,type='record').exists())
 
+    def test_auto_stock_date_correction_follows_document_without_moving_cash(self):
+        doc = self.create(payment_account=self.account.pk)
+        cash = list(doc.transactions.filter(type='actual').values_list('pk', 'amount', 'date'))
+        update_document(doc, {'date': '2026-02-01'})
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.current_stock, -5)
+        self.assertEqual(str(doc.stock_transactions.get(type='actual').date), '2026-02-01')
+        self.assertEqual(str(doc.transactions.get(type='record').date), '2026-02-01')
+        self.assertEqual(list(doc.transactions.filter(type='actual').values_list('pk', 'amount', 'date')), cash)
+
+    def test_manual_delivery_date_and_quantity_survive_expected_stock_edit(self):
+        self.settings.auto_stock = False; self.settings.save()
+        doc = self.create()
+        process_move_stock(doc, {'date': '2026-01-02', 'items': [{'product_id': self.product.pk, 'quantity': 3}]})
+        actual = list(doc.stock_transactions.filter(type='actual').values_list('pk', 'quantity', 'date'))
+        update_document(doc, {'date': '2026-02-01', 'line_items': [self.line(7)]})
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.current_stock, -3)
+        self.assertEqual(list(doc.stock_transactions.filter(type='actual').values_list('pk', 'quantity', 'date')), actual)
+        self.assertEqual(doc.stock_transactions.get(type='record').quantity, -7)
+        self.assertEqual(str(doc.stock_transactions.get(type='record').date), '2026-02-01')
+
     def test_optional_tax_details_can_be_corrected_and_cleared_without_posting_again(self):
         from .commands import DocumentWriteSerializer, command_data
         doc = self.create(place_of_supply='Maharashtra (27)', reverse_charge=False)
