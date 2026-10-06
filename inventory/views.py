@@ -84,34 +84,24 @@ class ProductViewSet(viewsets.ModelViewSet):
         Per spec 6.2 — Product page stock movement section.
         """
         product = self.get_object()
-        records = StockTransaction.objects.filter(
-            product=product,
-            type='record',
-            document__is_active=True,
-        ).select_related('document', 'document__contact')
-
+        records = list(StockTransaction.objects.filter(product=product, type='record',
+            document__is_active=True).values('document_id').annotate(total=Sum('quantity')))
+        doc_ids = [row['document_id'] for row in records]
+        actuals = {row['document_id']:abs(row['total']) for row in StockTransaction.objects.filter(
+            product=product, type='actual', document_id__in=doc_ids).values('document_id').annotate(total=Sum('quantity'))}
+        from accounting.models import Document
+        documents = {doc.pk:doc for doc in Document.objects.filter(pk__in=doc_ids).select_related('contact')}
         result = []
-        for r in records:
-            actuals   = StockTransaction.objects.filter(
-                document=r.document,
-                product=product,
-                type='actual',
-            ).values_list('quantity', flat=True)
-            moved     = sum(actuals)
-            remaining = r.quantity - moved
-
-            if remaining != 0:
-                result.append({
-                    'document_id':   r.document_id,
-                    'doc_id':        r.document.doc_id if r.document else None,
-                    'doc_type':      r.document.type if r.document else None,
-                    'contact':       str(r.document.contact) if r.document and r.document.contact else None,
-                    'date':          r.document.date if r.document else None,
-                    'record_qty':    str(r.quantity),
-                    'moved_qty':     str(moved),
-                    'remaining_qty': str(remaining),
-                })
-        return Response(result)
+        for row in records:
+            doc = documents[row['document_id']]
+            expected = abs(row['total'])
+            moved = actuals.get(doc.pk, Decimal('0'))
+            result.append({'document_id':doc.pk, 'doc_id':doc.doc_id, 'doc_type':doc.type,
+                'contact':str(doc.contact) if doc.contact else None, 'date':doc.date,
+                'record_qty':str(expected), 'moved_qty':str(moved),
+                'remaining_qty':str(max(expected-moved, Decimal('0'))),
+                'direction':'in' if row['total'] > 0 else 'out'})
+        return Response(sorted(result, key=lambda row: (row['date'], row['document_id']), reverse=True))
 
     @action(detail=True, methods=['post'])
     def move_stock_from_product(self, request, pk=None):
