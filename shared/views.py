@@ -3,7 +3,8 @@ from decimal import Decimal
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Sum
+from django.db.models import Sum, OuterRef, Subquery, Value, DecimalField
+from django.db.models.functions import Coalesce
 from .models import Settings, Contact, PaymentAccount
 from .serializers import SettingsSerializer, ContactSerializer, PaymentAccountSerializer
 from django.http import HttpResponse
@@ -73,7 +74,9 @@ class ContactViewSet(viewsets.ModelViewSet):
     ordering         = ['contact_name']
 
     def get_queryset(self):
-        qs        = Contact.objects.all()
+        from accounting.ledger import cf_transactions
+        totals = cf_transactions().filter(contact_id=OuterRef('pk')).values('contact_id').annotate(total=Sum('amount')).values('total')
+        qs = Contact.objects.annotate(cf_delta=Coalesce(Subquery(totals), Value(0), output_field=DecimalField(max_digits=18, decimal_places=2)))
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
             qs = qs.filter(is_active=is_active.lower() == 'true')
@@ -116,7 +119,8 @@ class ContactViewSet(viewsets.ModelViewSet):
             FinancialTransaction.objects
             .filter(contact=contact)
             .select_related('document', 'payment_account')
-            .order_by('date', 'created_at')             # oldest → newest for ledger
+            .prefetch_related('allocations__document')
+            .order_by('date', 'created_at', 'pk')
         )
 
         # ── Filters (TV-02) ───────────────────────────────────────────────────
@@ -146,6 +150,9 @@ class ContactViewSet(viewsets.ModelViewSet):
                 .aggregate(total=Sum('amount'))['total'] or Decimal('0')
             )
             opening_balance_at = contact.opening_balance + pre_sum
+
+        from accounting.ledger import with_running_cf
+        qs = with_running_cf(qs, contact.opening_balance)
 
         # ── BF-02: proper pagination ──────────────────────────────────────────
         page = self.paginate_queryset(qs)
@@ -193,6 +200,11 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
         account.save(update_fields=['is_active', 'updated_at'])
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        qs = self.filter_queryset(self.get_queryset())
+        return Response({'count':qs.count(), 'total_balance':str(qs.aggregate(total=Sum('current_balance'))['total'] or Decimal('0'))})
+
     @action(detail=False, methods=['post'])
     def transfer(self, request):
         from accounting.services import process_transfer
@@ -215,8 +227,17 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
                 {'error': 'current_balance required.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        account.current_balance = balance
-        account.save(update_fields=['current_balance', 'updated_at'])
+        from django.db import transaction
+        from rest_framework import serializers
+        from accounting.services import _create_ftxn
+        value = serializers.DecimalField(max_digits=15, decimal_places=2).run_validation(balance)
+        with transaction.atomic():
+            account = PaymentAccount.objects.select_for_update().get(pk=account.pk)
+            delta = value - account.current_balance
+            if delta:
+                from django.utils import timezone
+                _create_ftxn('actual', delta, None, account, None, timezone.localdate(),
+                    request.data.get('notes') or 'Balance reconciliation')
         return Response(PaymentAccountSerializer(account).data)
 
     @action(detail=True, methods=['get'])
@@ -244,7 +265,8 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
             FinancialTransaction.objects
             .filter(payment_account=account)
             .select_related('document', 'contact')
-            .order_by('-date', '-created_at')           # TV-01: newest first
+            .prefetch_related('allocations__document')
+            .order_by('-date', '-created_at', '-pk')
         )
 
         date_from = params.get('date_from')

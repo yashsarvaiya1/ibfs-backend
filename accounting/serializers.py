@@ -15,6 +15,7 @@ def _build_media_url(request, relative_path):
 
 
 class FinancialTransactionSerializer(serializers.ModelSerializer):
+    running_cf = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True, required=False)
     allocations = serializers.SerializerMethodField()
     document_type        = serializers.SerializerMethodField()
     is_document_deleted  = serializers.SerializerMethodField()
