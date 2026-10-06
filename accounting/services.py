@@ -11,6 +11,8 @@ from shared.models import PaymentAccount, Settings, Contact
 from django.template.loader import render_to_string
 from django.core.cache import cache
 from django.conf import settings as django_settings
+from .calculations import document_totals
+from .workflows import FINANCIAL_SIGNS, STOCK_SIGNS, NON_POSTING_TYPES
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -485,15 +487,7 @@ def _create_stxn(type_, quantity, product, document=None, date=None, rate=None, 
 
 
 def _resolve_total(data):
-    """Computes total_amount from line_items + charges − discount + taxes."""
-    line_items = data.get('line_items', [])
-    subtotal   = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
-    charges    = sum(Decimal(str(c.get('amount', 0))) for c in data.get('charges', []))
-    discount   = Decimal(str(data.get('discount', 0)))
-    tax_amount = Decimal('0')
-    for tax in data.get('taxes', []):
-        tax_amount += (subtotal + charges - discount) * Decimal(str(tax['percentage'])) / 100
-    return subtotal + charges - discount + tax_amount
+    return document_totals(data, data.get('type'))['total']
 
 
 def _handle_stxns(doc, line_items, sign, app_settings, date):
@@ -517,28 +511,10 @@ def _handle_stxns(doc, line_items, sign, app_settings, date):
 
 # ─── Document Signs ───────────────────────────────────────────────────────────
 
-FTXN_RECORD_SIGN = {
-    'bill':    Decimal('1'),   # we owe them  → +ve
-    'invoice': Decimal('-1'),  # they owe us  → -ve
-    'cn':      Decimal('1'),   # we owe refund → +ve
-    'dn':      Decimal('-1'),  # they owe us   → -ve
-}
-
-STXN_SIGN = {
-    'bill':    Decimal('1'),   # stock IN
-    'invoice': Decimal('-1'),  # stock OUT
-    'cn':      Decimal('1'),   # return IN
-    'dn':      Decimal('-1'),  # return OUT
-}
-
-CHALLAN_STXN_SIGN = {
-    'bill':    Decimal('1'),
-    'invoice': Decimal('-1'),
-    'cn':      Decimal('1'),
-    'dn':      Decimal('-1'),
-}
-
-NO_TXN_TYPES = {'po', 'pi', 'quotation'}
+FTXN_RECORD_SIGN = FINANCIAL_SIGNS
+STXN_SIGN = STOCK_SIGNS
+CHALLAN_STXN_SIGN = STOCK_SIGNS
+NO_TXN_TYPES = NON_POSTING_TYPES
 
 
 # ─── Document Create ──────────────────────────────────────────────────────────
