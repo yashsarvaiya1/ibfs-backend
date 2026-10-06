@@ -1,62 +1,41 @@
-# upload/cron.py
+"""Conservative cleanup: no files are deleted if reference discovery fails."""
 import logging
-from datetime import datetime, timedelta
+import time
 from pathlib import Path
 from django.conf import settings
-from django.db import connection
 
-logger = logging.getLogger(__name__)
-
-ORPHAN_AGE_DAYS = 7
-
-# Every DB column that stores a media path — raw SQL to avoid circular imports
-DB_PATH_QUERIES = [
-    "SELECT image_url    FROM inventory_product  WHERE image_url IS NOT NULL",
-    "SELECT header_image FROM shared_settings    WHERE header_image IS NOT NULL",
-    "SELECT sign_image   FROM shared_settings    WHERE sign_image IS NOT NULL",
-    # attachment_urls is a JSONField array — unnest each element
-    "SELECT jsonb_array_elements_text(attachment_urls) FROM accounting_document "
-    "WHERE attachment_urls IS NOT NULL AND attachment_urls != '[]'::jsonb",
-]
+logger=logging.getLogger(__name__)
+ORPHAN_AGE_DAYS=7
 
 
 def _get_all_referenced_paths():
-    paths = set()
-    with connection.cursor() as cursor:
-        for query in DB_PATH_QUERIES:
-            try:
-                cursor.execute(query)
-                for (val,) in cursor.fetchall():
-                    if val:
-                        paths.add(val.strip())
-            except Exception as e:
-                logger.warning(f"IBFS cron query failed: {e}")
-    return paths
+    from inventory.models import Product
+    from shared.models import Settings
+    from accounting.models import Document
+    paths=set(Product.objects.exclude(image_url__isnull=True).values_list('image_url',flat=True))
+    for header,signature in Settings.objects.values_list('header_image','sign_image'):
+        paths.update(path for path in (header,signature) if path)
+    # Include archived documents: deleting a document must not destroy its evidence.
+    for attachments in Document.objects.values_list('attachment_urls',flat=True).iterator(chunk_size=500):
+        if not isinstance(attachments,list) or any(not isinstance(path,str) for path in attachments):
+            raise ValueError('Invalid stored attachment paths; cleanup aborted.')
+        paths.update(attachments)
+    return {path.strip() for path in paths if path}
 
 
 def cleanup_orphaned_uploads():
-    referenced  = _get_all_referenced_paths()
-    media_root  = Path(settings.MEDIA_ROOT)
-    upload_root = media_root / 'uploads'
-
-    if not upload_root.exists():
+    try:
+        referenced=_get_all_referenced_paths()
+    except Exception:
+        logger.exception('Upload cleanup aborted: could not read all references.')
         return
-
-    cutoff          = datetime.now() - timedelta(days=ORPHAN_AGE_DAYS)
-    deleted, kept   = 0, 0
-
-    for filepath in upload_root.rglob('*'):
-        if not filepath.is_file():
+    root=Path(settings.MEDIA_ROOT).resolve()
+    cutoff=time.time()-ORPHAN_AGE_DAYS*86400
+    deleted=0
+    for file in (root/'uploads').rglob('*'):
+        if file.is_symlink() or not file.is_file() or file.stat().st_mtime>=cutoff:
             continue
-        if datetime.fromtimestamp(filepath.stat().st_mtime) >= cutoff:
-            kept += 1
-            continue
-        relative = str(filepath.relative_to(media_root))
-        if relative not in referenced:
-            filepath.unlink()
-            deleted += 1
-            logger.info(f"IBFS cron: deleted orphan → {relative}")
-        else:
-            kept += 1
-
-    logger.info(f"IBFS cron done — deleted: {deleted}, kept: {kept}")
+        if file.relative_to(root).as_posix() not in referenced:
+            file.unlink()
+            deleted+=1
+    logger.info('Upload cleanup removed %s old unreferenced files.',deleted)

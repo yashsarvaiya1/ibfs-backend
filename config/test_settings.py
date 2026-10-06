@@ -1,4 +1,6 @@
 """Isolated local tests; never use this module for a deployment."""
+import os
+os.environ.setdefault("DEBUG", "True")
 from .settings import *  # noqa: F403
 
 DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}}

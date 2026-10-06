@@ -1,27 +1,11 @@
-# backend/Dockerfile
-FROM python:3.11-slim
-
-# Updated syntax: ENV KEY=VALUE
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
+FROM python:3.14-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PLAYWRIGHT_BROWSERS_PATH=/opt/playwright DEBUG=False
 WORKDIR /app
-
-# ... (keep the apt-get install block exactly as it was) ...
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libpq-dev \
-    # ... rest of the dependencies ...
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-RUN playwright install chromium
-RUN playwright install-deps chromium
-
-COPY . .
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt && playwright install --with-deps chromium
+RUN groupadd --gid 1000 ibfs && useradd --uid 1000 --gid ibfs --create-home ibfs
+COPY --chown=ibfs:ibfs . .
+RUN chmod +x entrypoint.sh && mkdir -p media staticfiles && chown -R ibfs:ibfs media staticfiles
+USER ibfs
+EXPOSE 8000
+ENTRYPOINT ["./entrypoint.sh"]
