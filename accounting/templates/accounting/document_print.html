@@ -92,12 +92,14 @@ tr { break-inside: avoid; }
       {% if print.consignee.phone %}<p>{{ print.consignee.phone }}</p>{% endif %}
     </div>{% endif %}
   </section>{% endif %}
-  {% if print.document.reference or print.document.due_date or print.document.payment_terms or print.document.place_of_supply or print.document.reverse_charge != None %}<section class="metadata">
+  {% if print.document.reference or print.document.due_date or print.document.payment_terms or print.document.place_of_supply or print.document.reverse_charge != None or print.document.supply_category or print.document.supplier_invoice_number %}<section class="metadata">
     {% if print.document.reference %}<div><span class="muted">Reference</span><strong>{{ print.document.reference.doc_id }}</strong></div>{% endif %}
     {% if print.document.due_date %}<div><span class="muted">{% if print.document.type == 'quotation' %}Valid until{% else %}Due date{% endif %}</span><strong>{{ print.document.due_date|date:"d M Y" }}</strong></div>{% endif %}
     {% if print.document.payment_terms %}<div><span class="muted">Payment terms</span><strong>{{ print.document.payment_terms }}</strong></div>{% endif %}
     {% if print.document.place_of_supply %}<div><span class="muted">Place of supply</span><strong>{{ print.document.place_of_supply }}</strong></div>{% endif %}
     {% if print.document.reverse_charge != None %}<div><span class="muted">Reverse charge</span><strong>{{ print.document.reverse_charge|yesno:"Yes,No" }}</strong></div>{% endif %}
+    {% if print.document.supply_category %}<div><span class="muted">Supply</span><strong>{{ print.document.get_supply_category_display }}</strong></div>{% endif %}
+    {% if print.document.supplier_invoice_number %}<div><span class="muted">Supplier invoice</span><strong>{{ print.document.supplier_invoice_number }}</strong></div>{% endif %}
   </section>{% endif %}
 </header>
 <div class="page-body">
@@ -109,7 +111,7 @@ tr { break-inside: avoid; }
       {% if not print.is_challan %}{% if not print.is_simple_line_type %}<th class="number" style="width:14%">Rate</th>{% endif %}<th class="number">Amount (INR)</th>{% endif %}
     </tr></thead>
     <tbody>{% for item in print.line_items %}<tr>
-      <td class="muted">{{ forloop.counter }}</td><td><div class="item-name">{{ item.name }}</div>{% if item.description %}<div class="item-description">{{ item.description }}</div>{% endif %}{% if item.is_discount %}<div class="muted">Discount</div>{% endif %}</td>
+      <td class="muted">{{ forloop.counter }}</td><td><div class="item-name">{{ item.name }}</div>{% if item.description %}<div class="item-description">{{ item.description }}</div>{% endif %}{% if item.is_discount %}<div class="muted">Discount</div>{% endif %}{% if item.supply_label %}<div class="item-description">{{ item.supply_label }}</div>{% endif %}{% if item.item_tax_details %}<div class="item-description">{% for tax in item.item_tax_details %}{{ tax.name }} {{ tax.percentage }}%{% if not forloop.last %} · {% endif %}{% endfor %}</div>{% endif %}</td>
       {% if not print.is_simple_line_type %}<td>{{ item.hsn }}</td><td class="number">{{ item.quantity_display }}{% if item.unit %} {{ item.unit }}{% endif %}</td>{% endif %}
       {% if not print.is_challan %}{% if not print.is_simple_line_type %}<td class="number">{{ item.rate_display }}</td>{% endif %}<td class="number">{% if item.is_discount %}-{% endif %}{{ item.amount_display }}</td>{% endif %}
     </tr>{% endfor %}</tbody>

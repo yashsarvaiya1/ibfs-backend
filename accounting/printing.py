@@ -6,6 +6,7 @@ from decimal import Decimal
 from django.conf import settings
 from .calculations import decimal_value, document_totals, money
 from .workflows import SIMPLE_LINE_TYPES
+from .models import Document
 
 
 def media_data_url(relative_path):
@@ -55,7 +56,7 @@ def amount_in_words(value):
 
 
 def document_context(document, app_settings, contact_display):
-    data = {key: getattr(document, key) for key in ('line_items', 'charges', 'taxes', 'discount')}
+    data = {key: getattr(document, key) for key in ('line_items', 'charges', 'taxes', 'discount', 'tax_mode')}
     items = []
     calculation_items = []
     for item in document.line_items or []:
@@ -67,10 +68,15 @@ def document_context(document, app_settings, contact_display):
         row['amount_display'] = format_money(amount) if amount is not None else ''
         row['rate_display'] = format_money(item['rate']) if item.get('rate') is not None else ''
         row['quantity_display'] = format(decimal_value(item['quantity']), 'f').rstrip('0').rstrip('.') if '.' in str(item.get('quantity', '')) else item.get('quantity', '')
+        if item.get('supply_category'):
+            row['supply_label'] = dict(Document._meta.get_field('supply_category').choices).get(item['supply_category'], str(item['supply_category']))
         row['is_discount'] = document.type == 'interest' and item.get('type') == 'discount'
         items.append(row)
     data['line_items'] = calculation_items
     totals = document_totals(data, document.type)
+    if document.tax_mode == 'item':
+        for row, detail in zip(items, totals['line_details']):
+            row['item_tax_details'] = [{**tax, 'amount_display': format_money(tax['amount'])} for tax in detail['taxes']]
     has_line_totals = bool(calculation_items) and all(item['amount'] is not None for item in calculation_items)
     # Fast entry and historical explicit totals remain authoritative.
     total = money(document.total_amount) if document.total_amount is not None else totals['total']

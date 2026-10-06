@@ -1,6 +1,7 @@
 # accounting/services.py
 from pathlib import Path
 import re
+import hashlib
 from decimal import Decimal
 from django.db import transaction
 from django.db.models import Sum, F, Q
@@ -43,7 +44,8 @@ def _contact_display(contact):
 def generate_document_pdf(document, request=None):
     app_settings = Settings.get()
     contacts = tuple(c.updated_at.isoformat() if c else '' for c in (document.contact, document.consignee))
-    cache_key = f'pdf_v3_{document.pk}_{document.updated_at.isoformat()}_{app_settings.updated_at.isoformat()}_{contacts}'
+    revision = f'{document.pk}_{document.updated_at.isoformat()}_{app_settings.updated_at.isoformat()}_{contacts}'
+    cache_key = 'pdf_v4_' + hashlib.sha256(revision.encode()).hexdigest()
     result = cache.get(cache_key)
     if result:
         return result
@@ -492,6 +494,9 @@ def process_document_create(doc_type, data, contact=None):
         discount        = data.get('discount', 0),
         charges         = data.get('charges', []),
         taxes           = data.get('taxes', []),
+        tax_mode = data.get('tax_mode', 'document'),
+        supply_category = data.get('supply_category'),
+        supplier_invoice_number = data.get('supplier_invoice_number'),
         date            = date,
         due_date        = _parse_date(data.get('due_date')) if data.get('due_date') else None,
         payment_terms   = data.get('payment_terms'),

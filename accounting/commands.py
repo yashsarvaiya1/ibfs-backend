@@ -20,7 +20,7 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Document
         fields = ['type', 'doc_id', 'contact', 'consignee', 'reference', 'line_items',
-            'total_amount', 'charges', 'taxes', 'discount', 'date', 'due_date',
+            'total_amount', 'charges', 'taxes', 'tax_mode', 'supply_category', 'supplier_invoice_number', 'discount', 'date', 'due_date',
             'payment_terms', 'place_of_supply', 'reverse_charge', 'attachment_urls', 'notes', 'payment_account', 'expected_updated_at']
         extra_kwargs = {'doc_id': {'required': False}, 'date': {'required': False}}
 
@@ -49,6 +49,10 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(str(exc)) from exc
             if row.get('type') not in (None, 'charge', 'discount'):
                 raise serializers.ValidationError('Choose charge or discount for interest lines.')
+            if 'taxes' in row:
+                row['taxes'] = self.validate_taxes(row['taxes'])
+            if 'supply_category' in row:
+                row['supply_category'] = serializers.ChoiceField(choices=Document._meta.get_field('supply_category').choices, allow_blank=True, allow_null=True).run_validation(row['supply_category'])
             rows.append(row)
         products = {p.pk: p for p in Product.objects.filter(pk__in=product_ids)}
         if product_ids - products.keys():
@@ -103,13 +107,27 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'total_amount': 'Enter a positive document amount.'})
         if attrs.get('discount', 0) < 0:
             raise serializers.ValidationError({'discount': 'Discount cannot be negative.'})
-        # A discount cannot turn an ordinary document into the opposite obligation.
-        if attrs.get('line_items') and attrs.get('type', self.instance.type if self.instance else '') != 'interest':
+        kind = attrs.get('type', self.instance.type if self.instance else '')
+        values = {field: attrs.get(field, getattr(self.instance, field, None) if self.instance else None)
+                  for field in ('line_items', 'charges', 'taxes', 'discount', 'tax_mode', 'supply_category')}
+        if values['tax_mode'] == 'item' and (kind not in ('bill', 'invoice', 'cn', 'dn', 'quotation', 'po', 'pi') or not values['line_items']):
+            raise serializers.ValidationError({'tax_mode': 'Per-item tax requires item details on a bill, invoice, note, quotation or order.'})
+        if values['tax_mode'] == 'item' and any(item.get('amount') is None for item in values['line_items'] or []):
+            raise serializers.ValidationError({'line_items': 'Every item needs an amount for per-item tax.'})
+        if values['line_items'] and kind != 'interest':
             from .calculations import document_totals
-            values = {field:attrs.get(field,getattr(self.instance,field,None) if self.instance else None)
-                for field in ('line_items','charges','taxes','discount')}
-            total = document_totals(values)['total']
-            serializers.DecimalField(max_digits=15,decimal_places=2,min_value=Decimal('0')).run_validation(total)
+            try:
+                totals = document_totals(values)
+            except (ValueError, TypeError, ArithmeticError) as exc:
+                raise serializers.ValidationError({'taxes': str(exc)}) from exc
+            serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal('0')).run_validation(totals['total'])
+            no_tax = ('nil_rated', 'exempt', 'non_gst')
+            for item in values['line_items']:
+                item_taxes = (item.get('taxes') or []) if values['tax_mode'] == 'item' else (values['taxes'] or [])
+                if (item.get('supply_category') or values['supply_category']) in no_tax and any(decimal_value(tax.get('percentage')) > 0 for tax in item_taxes):
+                    raise serializers.ValidationError({'line_items': 'Nil-rated, exempt and non-GST items cannot have positive tax rates. Use per-item tax for mixed classifications.'})
+            if values['supply_category'] in no_tax and totals['tax_total']:
+                raise serializers.ValidationError({'supply_category': 'This classification cannot include tax. Clear taxes or change the classification.'})
         return attrs
 
 

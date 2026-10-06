@@ -93,6 +93,15 @@ class DocumentListSerializer(serializers.ModelSerializer):
 # ─── Detail serializer ────────────────────────────────────────────────────────
 
 class DocumentSerializer(serializers.ModelSerializer):
+    calculated_totals = serializers.SerializerMethodField()
+
+    def get_calculated_totals(self, obj):
+        from .calculations import document_totals
+        try:
+            return document_totals({key: getattr(obj, key) for key in ('line_items', 'charges', 'taxes', 'discount', 'tax_mode')}, obj.type)
+        except (ValueError, TypeError, ArithmeticError):
+            return None
+
     transactions         = serializers.SerializerMethodField()
     payment_status       = serializers.SerializerMethodField()
     stock_status         = serializers.SerializerMethodField()

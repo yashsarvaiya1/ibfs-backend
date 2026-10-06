@@ -55,6 +55,8 @@ def sync_stock(document, previous_items, force=False):
 @transaction.atomic
 def update_document(document, payload, preserve_total=False):
     snapshot = Document.objects.get(pk=document.pk)
+    if not snapshot.is_active:
+        raise ValidationError({'document': 'Archived documents cannot be edited or reposted.'})
     before = DocumentWriteSerializer(snapshot, data=payload, partial=True)
     before.is_valid(raise_exception=True)
     new_contact = before.validated_data.get('contact', snapshot.contact)
@@ -97,9 +99,9 @@ def update_document(document, payload, preserve_total=False):
     account = data.pop('payment_account', None)
     for field, value in data.items():
         setattr(document, field, value)
-    calculation_changed = any(key in data for key in ('line_items', 'charges', 'taxes', 'discount'))
+    calculation_changed = any(key in data for key in ('line_items', 'charges', 'taxes', 'discount', 'tax_mode'))
     if calculation_changed and document.line_items and (not preserve_total or document.total_amount is None):
-        document.total_amount = document_totals({key: getattr(document, key) for key in ('line_items','charges','taxes','discount')}, document.type)['total']
+        document.total_amount = document_totals({key: getattr(document, key) for key in ('line_items','charges','taxes','discount','tax_mode')}, document.type)['total']
     document.save()
     if calculation_changed or 'date' in data or 'reference' in data:
         sync_stock(document, old_items, force='reference' in data)

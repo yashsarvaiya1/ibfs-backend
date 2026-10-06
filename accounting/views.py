@@ -47,12 +47,13 @@ class DocumentViewSet(viewsets.ModelViewSet):
         )
         params = self.request.query_params
 
-        # ── is_active — deleted filter ────────────────────────────────────────
+        # List filters do not hide archived read-only detail/print/history.
+        # Mutation actions can never select archived documents using query params.
         raw_active = params.get('is_active')
-        if raw_active not in (None, ''):
-            qs = qs.filter(is_active=raw_active.lower() == 'true')
-        else:
-            qs = qs.filter(is_active=True)      # default: hide deleted
+        if self.action == 'list':
+            qs = qs.filter(is_active=raw_active.lower() == 'true' if raw_active not in (None, '') else True)
+        elif self.request.method not in ('GET', 'HEAD', 'OPTIONS'):
+            qs = qs.filter(is_active=True)
 
         # ── Multi-type: ?type=bill,invoice OR ?type=bill ──────────────────────
         if params.get('type') not in (None, ''):
@@ -215,6 +216,30 @@ class DocumentViewSet(viewsets.ModelViewSet):
         doc = update_document(self.get_object(), {'line_items':request.data.get('line_items', [])}, preserve_total=True)
         return Response(DocumentSerializer(doc, context={'request': request}).data)
 
+    @action(detail=True, methods=['get'])
+    def history(self, request, pk=None):
+        from .reports import CADocumentPagination
+        document = self.get_object()
+        pagination = CADocumentPagination()
+        if request.query_params.get('revision'):
+            from django.shortcuts import get_object_or_404
+            revision_id = serializers.IntegerField(min_value=1).run_validation(request.query_params['revision'])
+            row = get_object_or_404(document.revisions, pk=revision_id)
+            return Response({'id': row.pk, 'recorded_at': row.recorded_at, 'event': row.event, 'snapshot': row.snapshot})
+        query = document.revisions.values('id', 'recorded_at', 'event', 'changed_fields', 'snapshot__doc_id', 'snapshot__date', 'snapshot__total_amount')
+        rows = pagination.paginate_queryset(query, request, view=self)
+        return pagination.get_paginated_response([{'id': row['id'], 'recorded_at': row['recorded_at'],
+            'event': row['event'], 'changed_fields': row['changed_fields'], 'doc_id': row['snapshot__doc_id'],
+            'date': row['snapshot__date'], 'total_amount': row['snapshot__total_amount']} for row in rows])
+
+    @action(detail=False, methods=['post'])
+    def preview_totals(self, request):
+        from .commands import DocumentWriteSerializer, command_data
+        from .calculations import document_totals
+        serializer = DocumentWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(document_totals(command_data(serializer), request.data.get('type')))
+
     # ── Reference Data ────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
     def reference_data(self, request, pk=None):
@@ -223,6 +248,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
             'line_items':    doc.line_items,
             'charges':       doc.charges,
             'taxes':         doc.taxes,
+            'tax_mode': doc.tax_mode,
+            'supply_category': doc.supply_category,
+            'supplier_invoice_number': doc.supplier_invoice_number,
             'consignee':     doc.consignee_id,
             'discount':      str(doc.discount),
             'payment_terms': doc.payment_terms,

@@ -155,7 +155,7 @@ def gst_document_row(doc):
             if any(not isinstance(item, dict) or item.get('amount') is None for item in doc.line_items):
                 raise ValueError('Missing saved line amount')
             totals = document_totals({'line_items': doc.line_items, 'charges': doc.charges,
-                                      'discount': doc.discount, 'taxes': doc.taxes}, doc.type)
+                                      'discount': doc.discount, 'taxes': doc.taxes, 'tax_mode': doc.tax_mode}, doc.type)
             taxable = totals['taxable_amount'] * sign
             values['taxable_amount'] = taxable
             if totals['taxable_amount'] < 0 or any(t['percentage'] < 0 or t['percentage'] > 100 for t in totals['taxes']):
@@ -200,6 +200,8 @@ def gst_document_row(doc):
         'id': doc.pk, 'doc_id': doc.doc_id, 'type': doc.type, 'date': doc.date.isoformat(),
         'contact': str(doc.contact) if doc.contact else '',
         'gstin': doc.contact.gstin if doc.contact else None,
+        'tax_mode': doc.tax_mode, 'supply_category': doc.supply_category,
+        'supplier_invoice_number': doc.supplier_invoice_number,
         'reference': doc.reference.doc_id if doc.reference else None,
         'place_of_supply': doc.place_of_supply, 'reverse_charge': doc.reverse_charge,
         'total_amount': str(doc.total_amount) if doc.total_amount is not None else None,
@@ -300,3 +302,54 @@ class ReportViewSet(viewsets.ViewSet):
         size = size_field.run_validation(request.query_params.get('page_size', 50))
         review_only = serializers.BooleanField().run_validation(request.query_params.get('review_only', False))
         return Response(gst_report(start, end, page=page, page_size=size, review_only=review_only))
+
+    @action(detail=False, methods=['get'])
+    def gst_export(self, request):
+        from .report_exports import csv_response, gst_csv_rows, report_pdf
+        start, end = period_for(request)
+        format = serializers.ChoiceField(choices=['csv', 'pdf']).run_validation(request.query_params.get('export_format', 'csv'))
+        review = serializers.BooleanField().run_validation(request.query_params.get('review_only', False))
+        if format == 'pdf':
+            return report_pdf(start, end, review_only=review)
+        return csv_response(gst_csv_rows(start, end, review), f'GST_Book_Register_{start}_{end}.csv')
+
+    @action(detail=False, methods=['get'])
+    def hsn(self, request):
+        from .report_exports import hsn_report
+        return Response(hsn_report(*period_for(request)))
+
+    @action(detail=False, methods=['get'])
+    def hsn_export(self, request):
+        from .report_exports import csv_response, hsn_csv_rows, hsn_report, report_pdf
+        start, end = period_for(request)
+        format = serializers.ChoiceField(choices=['csv', 'pdf']).run_validation(request.query_params.get('export_format', 'csv'))
+        if format == 'pdf': return report_pdf(start, end, kind='hsn')
+        return csv_response(hsn_csv_rows(hsn_report(start, end)), f'HSN_Book_Summary_{start}_{end}.csv')
+
+    @action(detail=False, methods=['get'])
+    def allocation_review(self, request):
+        from .report_exports import allocation_review
+        start, end = period_for(request)
+        page = serializers.IntegerField(min_value=1).run_validation(request.query_params.get('page', 1))
+        size = serializers.IntegerField(min_value=1, max_value=100).run_validation(request.query_params.get('page_size', 50))
+        return Response(allocation_review(start, end, page, size))
+
+    @action(detail=False, methods=['get'])
+    def comparison_template(self, request):
+        from .comparisons import BANK_COLUMNS, PURCHASE_COLUMNS
+        from .report_exports import csv_response
+        kind = serializers.ChoiceField(choices=['bank', 'purchase']).run_validation(request.query_params.get('kind', 'bank'))
+        return csv_response([BANK_COLUMNS if kind == 'bank' else PURCHASE_COLUMNS], f'{kind}_comparison_template.csv')
+
+    @action(detail=False, methods=['post'])
+    def compare_csv(self, request):
+        from .comparisons import BANK_COLUMNS, PURCHASE_COLUMNS, bank_comparison, purchase_comparison, read_csv
+        from shared.models import PaymentAccount
+        kind = serializers.ChoiceField(choices=['bank', 'purchase']).run_validation(request.data.get('kind'))
+        serializer = ReportPeriodSerializer(data=request.data); serializer.is_valid(raise_exception=True)
+        start, end = serializer.validated_data['date_from'], serializer.validated_data['date_to']
+        rows = read_csv(request.FILES.get('file'), BANK_COLUMNS if kind == 'bank' else PURCHASE_COLUMNS)
+        if kind == 'bank':
+            account = serializers.PrimaryKeyRelatedField(queryset=PaymentAccount.objects.filter(is_active=True)).run_validation(request.data.get('account'))
+            return Response(bank_comparison(rows, account, start, end))
+        return Response(purchase_comparison(rows, start, end))
