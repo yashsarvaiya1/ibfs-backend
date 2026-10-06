@@ -51,6 +51,13 @@ Both layouts share the same backend data and pagination. The amount-in-words box
 - [x] Visual checks for short, long, unbranded and branded bills / invoices, and bulk PDFs.
 - [x] Optional place of supply / reverse charge controls; unspecified values are omitted and explicit No is retained.
 
+## Added reporting and sharing scope
+
+- [x] WhatsApp text and number navigation, with authenticated download and manual PDF attachment.
+- [x] CA PDF packs by month/date range, optional document type, and document exclusions across all pages.
+- [x] April–March FY/month/custom GST book summary, separate reverse charge and note adjustments, with review flags and full-period totals.
+- [x] Keep these features read-only and preserve posting, settlement and challan stock ownership. See [reporting contract](REPORTS.md).
+
 ## Release boundaries
 
 Run focused checks after logical changes and commit each passing change with the existing `[FIX]` / `[IMP]` convention. Before a production release, back up and rehearse migrations against a copy of real data. Historical payments without a stored invoice reference cannot be assigned automatically; use the allocation editor after reviewing them. Changing credentials and deploying require actual hosting access and are not claimed as completed locally.
