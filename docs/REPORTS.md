@@ -57,3 +57,11 @@ Tax details optionally capture taxable/nil-rated/exempt/non-GST/export/import tr
 - Purchase: CA-prepared invoice CSVs (for example derived from GSTR-2B) match bills using supplier GSTIN, supplier's original invoice number and date, then compare taxable/component amounts. Internal IBFS numbers never substitute for missing supplier numbers. Agreement does not establish eligible ITC. Notes/amendments, filing-period timing and RCM payment need CA review.
 
 Results and unmatched book entries are shown separately, with document/payment links and an optional CSV download. No portal login, provider API, bank feed, return submission, IRN validation or automated posting is used.
+
+## Stock PDFs
+
+Inventory → Print report → Generate PDF → Save PDF downloads current quantities for all active products (or the current search/low-stock filter). Select products first to download only those product snapshots. The export covers the matching backend list, not just the visible page.
+
+Open a product → Ledger History → Print to choose optional inclusive dates and download its ledger. Stock history also offers product/type/date filters and Print history. Expected movements print as `(+5.00)` / `(-5.00)`; physical movements print as `+5.00` / `-5.00`. Only physical movements affect running/opening/closing stock. Period balances include all physical movements even when the displayed rows are further filtered, and closing stock remains visible when the final row is expected or the period is empty. The header's current stock is today's saved quantity; closing stock belongs to the selected period.
+
+Global history prints product names and each product's unit without a combined balance across products. Selecting several products for separate ledgers in one PDF is not implemented; the Inventory multi-selection export is a current-quantity snapshot.

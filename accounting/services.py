@@ -190,41 +190,6 @@ def generate_transactions_pdf(
 
 
 
-def generate_stock_transactions_pdf(stock_txns, request=None, report_title=None):
-    """
-    Stock transactions report PDF (ST-01).
-    Accepts any filtered queryset — respects all active filters.
-    """
-    app_settings = Settings.get()
-
-    rows = []
-    for stxn in stock_txns:
-        rows.append({
-            'date':     stxn.date,
-            'type':     stxn.get_type_display(),
-            'product':  stxn.product.name if stxn.product else '—',
-            'quantity': str(stxn.quantity),
-            'doc_id':   stxn.document.doc_id if stxn.document else '—',
-            'doc_type': stxn.document.get_type_display() if stxn.document else '—',
-            'rate':     str(stxn.rate) if stxn.rate else '—',
-            'notes':    stxn.notes or '—',
-        })
-
-    context = {
-        'settings':     app_settings,
-        'header_image': _build_media_url(request, app_settings.header_image),
-        'transactions': rows,
-        'report_title': report_title or 'Stock Transactions',
-        'printed_on':   timezone.now().date(),
-        'total_rows':   len(rows),
-    }
-
-    html_string = render_to_string('inventory/stock_transactions_print.html', context)
-    pdf_bytes   = _render_playwright_pdf(html_string)
-    filename    = f"StockTransactions_{timezone.now().date()}.pdf"
-    return (pdf_bytes, filename)
-
-
 def _render_playwright_pdf(html_string, letterhead=None):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
@@ -846,113 +811,66 @@ def generate_stock_list_pdf(products, request=None, low_stock_only=False):
     return (pdf_bytes, f"Inventory_{timezone.now().date()}.pdf")
 
 
-# ── Stock Transactions PDF (Product detail page) ───────────────────────────────
-def generate_stock_transactions_pdf(stock_txns, request=None, product=None, date_from=None, date_to=None):
-    from inventory.models import StockTransaction as StockTxnModel
-    from django.db.models import Sum, F, Q
+# ── Stock history PDF ─────────────────────────────────────────────────────────
+def _build_stock_history_context(stock_txns, product=None, date_from=None, date_to=None, request=None, report_title=None):
+    from inventory.models import StockTransaction
+    from django.db.models import Sum
 
-    app_settings  = Settings.get()
-
-    # Opening stock = current_stock minus all actuals on/after date_from
-    opening_stock = Decimal('0')
+    opening = Decimal('0')
+    closing = None
+    balances = {}
     if product:
+        actuals = StockTransaction.objects.filter(product=product, type='actual')
         if date_from:
-            after_sum = (
-                StockTxnModel.objects
-                .filter(product=product, type='actual', date__gte=date_from)
-                .aggregate(total=Sum('quantity'))['total'] or Decimal('0')
-            )
-            opening_stock = Decimal(str(product.current_stock)) - Decimal(str(after_sum))
-        else:
-            all_sum = (
-                StockTxnModel.objects
-                .filter(product=product, type='actual')
-                .aggregate(total=Sum('quantity'))['total'] or Decimal('0')
-            )
-            opening_stock = Decimal(str(product.current_stock)) - Decimal(str(all_sum))
-
-    # Sort ascending for running balance
-    sorted_txns = sorted(stock_txns, key=lambda t: (str(t.date), str(t.created_at)))
-    running = Decimal(str(opening_stock))
-    rows    = []
-
-    for stxn in sorted_txns:
-        qty       = Decimal(str(stxn.quantity))
-        is_actual = stxn.type == 'actual'
-        if is_actual:
-            running += qty
-        rows.append({
-            'date':          stxn.date,
-            'type':          stxn.get_type_display(),
-            'type_raw':      stxn.type,
-            'quantity':      str(abs(qty).quantize(Decimal('0.01'))),
-            'qty_in':        qty > 0,
-            'qty_out':       qty < 0,
-            'doc_id':        stxn.document.doc_id if stxn.document else '—',
-            'doc_type':      stxn.document.get_type_display() if stxn.document else '—',
-            'rate':          str(stxn.rate) if stxn.rate else '—',
-            'notes':         stxn.notes or '—',
-            'running_stock': str(running.quantize(Decimal('0.01'))) if is_actual else None,
-            'running_pos':   running > 0,
-        })
-
-    show_opening  = date_from is not None and opening_stock != Decimal('0')
-    opening_str   = str(opening_stock.quantize(Decimal('0.01'))) if show_opening else None
-
-    context = {
-        'settings':          app_settings,
-        'header_image':      _build_media_url(request, app_settings.header_image),
-        'transactions':      rows,
-        'product':           product,
-        'report_title':      f"Stock History — {product.name}" if product else "Stock Transactions",
-        'date_from':         date_from,
-        'date_to':           date_to,
-        'total_rows':        len(rows),
-        'show_opening':      show_opening,
-        'opening_stock':     opening_str,
-        'opening_stock_pos': opening_stock > Decimal('0'),
-    }
-    html_string = render_to_string('inventory/stock_transactions_print.html', context)
-    pdf_bytes   = _render_playwright_pdf(html_string)
-    filename    = (
-        f"Stock_{product.name.replace(' ', '_')}_{timezone.now().date()}.pdf"
-        if product else f"StockTransactions_{timezone.now().date()}.pdf"
-    )
-    return (pdf_bytes, filename)
-
-def generate_stock_txn_list_pdf(stock_txns, request=None, report_title=None):
-    """
-    Stock transactions report PDF (ST-01) — flat list, no product context.
-    Used from the global Stock Transactions page if needed.
-    """
-    app_settings = Settings.get()
+            actuals = actuals.filter(date__gte=date_from)
+        opening = Decimal(str(product.current_stock)) - (actuals.aggregate(total=Sum('quantity'))['total'] or Decimal('0'))
+        if date_to:
+            actuals = actuals.filter(date__lte=date_to)
+        running = opening
+        # Physical balances include all movements, even when the displayed list
+        # is filtered by type, document or search.
+        for movement in actuals.order_by('date', 'created_at', 'pk').values('id', 'quantity'):
+            running += movement['quantity']
+            balances[movement['id']] = str(running.quantize(Decimal('0.01')))
+        closing = str(running.quantize(Decimal('0.01')))
 
     rows = []
-    for stxn in stock_txns:
+    for txn in sorted(stock_txns, key=lambda t: (t.date, t.created_at, t.pk)):
+        qty = Decimal(str(txn.quantity))
         rows.append({
-            'date':     stxn.date,
-            'type':     stxn.get_type_display(),
-            'product':  stxn.product.name if stxn.product else '—',
-            'quantity': str(stxn.quantity),
-            'doc_id':   stxn.document.doc_id if stxn.document else '—',
-            'doc_type': stxn.document.get_type_display() if stxn.document else '—',
-            'rate':     str(stxn.rate) if stxn.rate else '—',
-            'notes':    stxn.notes or '—',
+            'date': txn.date, 'type': 'Expected' if txn.type == 'record' else 'Moved',
+            'type_raw': txn.type, 'is_expected': txn.type == 'record',
+            'product_name': txn.product.name, 'unit': txn.product.unit,
+            'quantity': str(abs(qty).quantize(Decimal('0.01'))),
+            'qty_in': qty > 0, 'qty_out': qty < 0,
+            'doc_id': txn.document.doc_id if txn.document else '—',
+            'doc_type': txn.document.get_type_display() if txn.document else '—',
+            'rate': str(txn.rate) if txn.rate is not None else '—',
+            'notes': txn.notes or '—',
+            'running_stock': balances.get(txn.pk) if product and txn.type == 'actual' else None,
         })
-
-    context = {
-        'settings':     app_settings,
-        'header_image': _build_media_url(request, app_settings.header_image),
-        'transactions': rows,
-        'report_title': report_title or 'Stock Transactions',
-        'printed_on':   timezone.now().date(),
-        'total_rows':   len(rows),
+    app_settings = Settings.get()
+    return {
+        'settings': app_settings, 'header_image': _build_media_url(request, app_settings.header_image),
+        'transactions': rows, 'product': product,
+        'report_title': report_title or (f'Stock History — {product.name}' if product else 'Stock Transactions'),
+        'date_from': date_from, 'date_to': date_to, 'total_rows': len(rows),
+        'show_opening': product is not None, 'show_closing': product is not None,
+        'opening_stock': str(opening.quantize(Decimal('0.01'))) if product else None,
+        'closing_stock': closing,
     }
 
-    html_string = render_to_string('inventory/stock_transactions_print.html', context)
-    pdf_bytes   = _render_playwright_pdf(html_string)
-    filename    = f"StockTransactions_{timezone.now().date()}.pdf"
-    return (pdf_bytes, filename)
+
+def generate_stock_transactions_pdf(stock_txns, request=None, product=None, date_from=None, date_to=None, report_title=None):
+    context = _build_stock_history_context(stock_txns, product, date_from, date_to, request, report_title)
+    html = render_to_string('inventory/stock_transactions_print.html', context)
+    filename = f"Stock_{product.name.replace(' ', '_')}_{timezone.localdate()}.pdf" if product else f'StockTransactions_{timezone.localdate()}.pdf'
+    return _render_playwright_pdf(html), filename
+
+
+def generate_stock_txn_list_pdf(stock_txns, request=None, report_title=None):
+    return generate_stock_transactions_pdf(stock_txns, request=request, report_title=report_title)
+
 
 @transaction.atomic
 def process_standalone_interest(contact, data):

@@ -74,6 +74,7 @@ Both layouts share the same backend data and pagination. The amount-in-words box
 - [x] Database-backed shared production cache provisioned at startup, compatible with existing Compose environments.
 - [x] Verified database/media backup bundles, checksums, accounting snapshots, isolated restore/migration rehearsal and host health/schedule commands.
 - [x] Project-specific frontend/backend READMEs and deployment/report/PDF/offline documentation.
+- [x] Stock report corrections: expected +/- movements in brackets, physical period closing independent of the last row, and global history product/unit columns without mixing product balances.
 
 ## VM handoff — skipped at the user's request
 

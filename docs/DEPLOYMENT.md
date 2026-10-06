@@ -62,3 +62,17 @@ The previously tracked frontend `.vne` is excluded from tracking and build conte
 The local operations check used isolated PostgreSQL 15 Compose projects: backup, manifest verification, fresh database/media restore and accounting snapshots before/after migrations passed. A separate upgrade rehearsal restored the previous code image with a saved legacy bill and applied candidate migrations 0010/0011 without changing the accounting snapshot. Restore readiness waits for the final TCP server, avoiding the image’s temporary initialization server. Production data and volumes have not been checked.
 
 The frontend's unpatched Next ESLint → fast-glob → micromatch → braces development chain was replaced with a private, narrow Node 24 glob adapter. The pinned Next plugin uses only `globSync` for root directories; the adapter rejects unsupported options. Clean `npm ci`, adapter/plugin integration checks, focused lint, TypeScript and the full audit passed with zero findings on 6 October 2026. The adapter is not a general replacement for fast-glob; recheck the plugin contract when upgrading Next.
+
+## Build and push images
+
+From the local frontend directory, replace the Docker Hub username below with your own account. Use a fresh release tag for later changes. These commands publish images; building code locally does not run them automatically.
+
+```sh
+IBFS_REGISTRY_USER=YOUR_DOCKERHUB_USERNAME
+IBFS_IMAGE_TAG=2026-10-06-stock
+docker login
+docker buildx build --platform linux/amd64 -t "$IBFS_REGISTRY_USER/ibfs-backend:$IBFS_IMAGE_TAG" --push ../backend
+docker buildx build --platform linux/amd64 -t "$IBFS_REGISTRY_USER/ibfs-frontend:$IBFS_IMAGE_TAG" --push .
+```
+
+Use `linux/arm64` for an ARM VM, or `linux/amd64,linux/arm64` to publish both architectures. Set the VM's private `.env` `BACKEND_IMAGE` and `FRONTEND_IMAGE` to those exact registry tags. After the release backup/rehearsal, run `docker compose pull backend frontend` and `docker compose up -d --no-build` on the VM. Keep the existing Compose project/volumes; never remove volumes for a code update.
