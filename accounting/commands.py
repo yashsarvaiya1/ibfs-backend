@@ -2,7 +2,7 @@
 from decimal import Decimal
 from rest_framework import serializers
 from rest_framework.exceptions import APIException
-from shared.models import PaymentAccount
+from shared.models import PaymentAccount, Contact
 from inventory.models import Product
 from .models import Document
 from .calculations import decimal_value, money
@@ -103,6 +103,13 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'total_amount': 'Enter a positive document amount.'})
         if attrs.get('discount', 0) < 0:
             raise serializers.ValidationError({'discount': 'Discount cannot be negative.'})
+        # A discount cannot turn an ordinary document into the opposite obligation.
+        if attrs.get('line_items') and attrs.get('type', self.instance.type if self.instance else '') != 'interest':
+            from .calculations import document_totals
+            values = {field:attrs.get(field,getattr(self.instance,field,None) if self.instance else None)
+                for field in ('line_items','charges','taxes','discount')}
+            total = document_totals(values)['total']
+            serializers.DecimalField(max_digits=15,decimal_places=2,min_value=Decimal('0')).run_validation(total)
         return attrs
 
 
@@ -144,4 +151,25 @@ class TransferCommandSerializer(serializers.Serializer):
     def validate(self, attrs):
         if attrs['from_account'].pk == attrs['to_account'].pk:
             raise serializers.ValidationError({'to_account':'Choose a different destination account.'})
+        return attrs
+
+
+class StandaloneInterestSerializer(serializers.Serializer):
+    contact = serializers.PrimaryKeyRelatedField(queryset=Contact.objects.filter(is_active=True),required=False,allow_null=True)
+    reference = serializers.PrimaryKeyRelatedField(queryset=Document.objects.filter(is_active=True),required=False,allow_null=True)
+    date = serializers.DateField(required=False)
+    toggle = serializers.ChoiceField(choices=['we_pay','we_receive'],default='we_receive')
+    line_items = serializers.JSONField()
+
+    def validate_line_items(self, value):
+        rows=DocumentWriteSerializer().validate_line_items(value)
+        if not rows or any(row.get('amount',0)<=0 for row in rows):
+            raise serializers.ValidationError('Add a positive charge or discount.')
+        return rows
+
+    def validate(self, attrs):
+        reference=attrs.get('reference')
+        contact=attrs.get('contact')
+        if reference and reference.contact_id and (not contact or reference.contact_id!=contact.pk):
+            raise serializers.ValidationError({'reference':'Choose a reference for this contact.'})
         return attrs

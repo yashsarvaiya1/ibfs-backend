@@ -2,7 +2,7 @@
 from collections import defaultdict
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Sum, Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from shared.models import Contact, Settings
@@ -54,18 +54,46 @@ def sync_stock(document, previous_items, force=False):
 
 @transaction.atomic
 def update_document(document, payload, preserve_total=False):
+    snapshot = Document.objects.get(pk=document.pk)
+    before = DocumentWriteSerializer(snapshot, data=payload, partial=True)
+    before.is_valid(raise_exception=True)
+    new_contact = before.validated_data.get('contact', snapshot.contact)
+    list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in
+        (snapshot.contact_id, new_contact.pk if new_contact else None) if pk]).order_by('pk'))
     document = Document.objects.select_for_update().get(pk=document.pk)
+    if document.updated_at != snapshot.updated_at:
+        raise EditConflict()
     serializer = DocumentWriteSerializer(document, data=payload, partial=True)
     serializer.is_valid(raise_exception=True)
     data = dict(serializer.validated_data)
-    expected = data.pop('expected_updated_at', None)
-    if expected and expected != document.updated_at:
-        raise EditConflict()
+    data.pop('expected_updated_at', None)
     old_items, old_date, old_contact = document.line_items, document.date, document.contact
     old_contact_id = document.contact_id
-    new_contact = data.get('contact', old_contact)
-    list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in (old_contact_id, new_contact.pk if new_contact else None) if pk]).order_by('pk'))
+    linked_payments = list(FinancialTransaction.objects.filter(Q(allocations__document=document)|Q(document=document),type='actual').distinct())
+    if new_contact != old_contact:
+        for payment in linked_payments:
+            other_documents = [row.document for row in payment.allocations.exclude(document=document).select_related('document')]
+            if any(other.type != 'interest' or other.reference_id != document.pk for other in other_documents):
+                raise ValidationError({'contact':'A payment still settles another document. Review its allocations before changing the contact.'})
+            if document.type not in FINANCIAL_SIGNS and other_documents:
+                raise ValidationError({'contact':'Change the contact on the linked bill or invoice first.'})
     affected = {(txn.contact_id, txn.date) for txn in document.transactions.all()}
+    if new_contact != old_contact:
+        for payment in linked_payments:
+            affected.add((payment.contact_id,payment.date))
+            payment.contact = new_contact
+            payment.save(update_fields=['contact','updated_at'])
+            if payment.document and payment.document.type in {'cash_payment_voucher','cash_receipt_voucher'}:
+                payment.document.contact = new_contact
+                payment.document.save(update_fields=['contact','updated_at'])
+            for allocation in payment.allocations.filter(document__type='interest').select_related('document'):
+                adjustment = allocation.document
+                affected |= {(row.contact_id,row.date) for row in adjustment.transactions.all()}
+                adjustment.contact = new_contact
+                adjustment.save(update_fields=['contact','updated_at'])
+                adjustment.transactions.update(contact=new_contact)
+                affected |= {(row.contact_id,row.date) for row in adjustment.transactions.all()}
+            affected.add((new_contact.pk if new_contact else None,payment.date))
     account = data.pop('payment_account', None)
     for field, value in data.items():
         setattr(document, field, value)
@@ -95,9 +123,11 @@ def update_document(document, payload, preserve_total=False):
             records[0].amount = sign * new_net
             records[0].date = document.date
             records[0].save()
-    elif document.type == 'expense':
+            from .payments import sync_interest_allocation
+            sync_interest_allocation(document,new_net)
+    elif document.type in {'expense','cash_payment_voucher','cash_receipt_voucher'}:
         actuals = list(document.transactions.filter(type='actual').order_by('pk'))
-        expected_amount = -decimal_value(document.total_amount)
+        expected_amount = (1 if document.type == 'cash_receipt_voucher' else -1) * decimal_value(document.total_amount)
         if actuals:
             txn = actuals[0]
             other_amount = sum((t.amount for t in actuals[1:]), Decimal('0'))
@@ -112,8 +142,11 @@ def update_document(document, payload, preserve_total=False):
                 deltas[new_account.pk] += new_amount
             for pk, delta in sorted(deltas.items()):
                 PaymentAccount.objects.filter(pk=pk).update(current_balance=F('current_balance')+delta, updated_at=timezone.now())
+            old_amount = txn.amount
             txn.amount, txn.date, txn.payment_account = new_amount, document.date, new_account
             txn.save()
+            from .payments import rescale_allocations
+            rescale_allocations(txn,old_amount)
         elif expected_amount:
             _create_ftxn('actual', expected_amount, document.contact, account, document, document.date, force_mcd_zero=True)
     document.transactions.update(contact=document.contact)

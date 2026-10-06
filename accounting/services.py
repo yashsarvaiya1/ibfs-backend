@@ -19,6 +19,7 @@ from .workflows import FINANCIAL_SIGNS, STOCK_SIGNS, NON_POSTING_TYPES, stock_mo
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _build_media_url(request, relative_path):
+    from .printing import media_data_url
     return media_data_url(relative_path)
 
 
@@ -678,7 +679,15 @@ def process_move_stock(document, data):
     from rest_framework.exceptions import ValidationError
     from .calculations import decimal_value
     from .stock_status import document_stock_status
+    snapshot = Document.objects.get(pk=document.pk)
+    contact_ids = set(snapshot.transactions.values_list('contact_id',flat=True))
+    contact_ids.update(FinancialTransaction.objects.filter(allocations__document=snapshot).values_list('contact_id',flat=True))
+    contact_ids.add(snapshot.contact_id)
+    list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in contact_ids if pk]).order_by('pk'))
     document = Document.objects.select_for_update().get(pk=document.pk)
+    if document.updated_at != snapshot.updated_at:
+        from .commands import EditConflict
+        raise EditConflict()
     if not document.is_active:
         raise ValidationError({'document':'This document has been deleted.'})
     date = _parse_date(data.get('date'))
@@ -725,11 +734,17 @@ def process_document_delete(document, strategy):
     if strategy not in {'revert', 'manual'}:
         from rest_framework.exceptions import ValidationError
         raise ValidationError({'strategy': 'Choose revert or manual.'})
+    snapshot = Document.objects.get(pk=document.pk)
+    contact_ids = set(snapshot.transactions.values_list('contact_id',flat=True))
+    contact_ids.update(FinancialTransaction.objects.filter(allocations__document=snapshot).values_list('contact_id',flat=True))
+    contact_ids.add(snapshot.contact_id)
+    list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in contact_ids if pk]).order_by('pk'))
     document = Document.objects.select_for_update().get(pk=document.pk)
+    if document.updated_at != snapshot.updated_at:
+        from .commands import EditConflict
+        raise EditConflict()
     if not document.is_active:
         return {'status': 'deleted', 'strategy': strategy}
-    contact_ids = document.transactions.exclude(contact=None).values_list('contact_id', flat=True).distinct()
-    list(Contact.objects.select_for_update().filter(pk__in=contact_ids).order_by('pk'))
     allocated_payments = FinancialTransaction.objects.filter(
         Q(document=document) | Q(allocations__document=document), type='actual').distinct()
     if strategy == 'revert':

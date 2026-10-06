@@ -83,3 +83,30 @@ def replace_allocations(payment, entries):
         payment.document = first
     payment.save()
     _recalculate_mcd(payment.contact, payment.date)
+
+
+def sync_interest_allocation(document, new_net):
+    """An adjustment edit redistributes its existing payment; cash never changes."""
+    from .models import PaymentAllocation
+    for allocation in document.payment_allocations.select_related('payment').all():
+        payment=allocation.payment
+        other=payment.allocations.exclude(pk=allocation.pk).select_related('document')
+        other_adjustments=sum((row.amount for row in other if row.document.type=='interest'),Decimal('0'))
+        other_principal=sum((abs(row.amount) for row in other
+            if row.document.type in FINANCIAL_SIGNS and row.document_id!=document.reference_id),Decimal('0'))
+        new_amount=money(min(new_net,max(abs(payment.amount)-other_adjustments-other_principal,Decimal('0'))))
+        difference=new_amount-allocation.amount
+        principal=next((row for row in other if row.document_id==document.reference_id),None)
+        if principal:
+            magnitude=max(abs(principal.amount)-difference,Decimal('0'))
+            direction=-FINANCIAL_SIGNS[principal.document.type]*(1 if payment.amount>0 else -1)
+            if magnitude:
+                principal.amount=direction*magnitude
+                principal.save(update_fields=['amount','updated_at'])
+            else:
+                principal.delete()
+        if new_amount:
+            allocation.amount=new_amount
+            allocation.save(update_fields=['amount','updated_at'])
+        else:
+            allocation.delete()

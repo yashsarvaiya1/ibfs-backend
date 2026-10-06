@@ -253,10 +253,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 {'error': 'enable_interest is disabled.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        contact_id = request.data.get('contact')
-        contact    = Contact.objects.get(pk=contact_id) if contact_id else None
-
-        result = process_standalone_interest(contact, request.data)
+        from .commands import StandaloneInterestSerializer
+        serializer=StandaloneInterestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data=command_data(serializer)
+        result = process_standalone_interest(serializer.validated_data.get('contact'), data)
         return Response(result, status=status.HTTP_201_CREATED)
 
 
@@ -347,6 +348,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         contact_ids = set(Document.objects.filter(pk__in=[row['document'] for row in entries]).values_list('contact_id', flat=True))
         contact_ids.add(payment.contact_id)
         list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in contact_ids if pk]).order_by('pk'))
+        if payment.document_id:
+            Document.objects.select_for_update().get(pk=payment.document_id)
         payment = FinancialTransaction.objects.select_for_update().get(pk=payment.pk)
         replace_allocations(payment, entries)
         return Response(self.get_serializer(payment).data)
@@ -425,6 +428,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         ftxn = self.get_object()
         if ftxn.contact_id:
             Contact.objects.select_for_update().get(pk=ftxn.contact_id)
+        if ftxn.document_id:
+            Document.objects.select_for_update().get(pk=ftxn.document_id)
         ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
         if ftxn.type != 'actual':
             return Response(
@@ -462,8 +467,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         ftxn.save()
         from .payments import rescale_allocations
         rescale_allocations(ftxn, old_amount)
-        if ftxn.document and ftxn.document.type == 'expense':
-            ftxn.document.total_amount = -sum((row.amount for row in ftxn.document.transactions.filter(type='actual')), Decimal('0'))
+        if ftxn.document and ftxn.document.type in {'expense','cash_payment_voucher','cash_receipt_voucher'}:
+            ftxn.document.total_amount = abs(sum((row.amount for row in ftxn.document.transactions.filter(type='actual')), Decimal('0')))
             ftxn.document.save(update_fields=['total_amount','updated_at'])
         _recalculate_mcd(ftxn.contact, ftxn.date)
         if old_date.month != ftxn.date.month or old_date.year != ftxn.date.year:
@@ -477,6 +482,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         ftxn = self.get_object()
         if ftxn.contact_id:
             Contact.objects.select_for_update().get(pk=ftxn.contact_id)
+        if ftxn.document_id:
+            Document.objects.select_for_update().get(pk=ftxn.document_id)
         ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
         if ftxn.type == 'record':
             return Response(
@@ -515,6 +522,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         doc = get_object_or_404(Document, pk=doc_id, is_active=True, type__in=HAS_BALANCE_TYPES) if doc_id else None
         list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in
             (ftxn.contact_id, doc.contact_id if doc else None) if pk]).order_by('pk'))
+        if ftxn.document_id:
+            Document.objects.select_for_update().get(pk=ftxn.document_id)
         ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
         adjustments = sum((row.amount for row in ftxn.allocations.filter(document__type='interest')), Decimal('0'))
         available = max(abs(ftxn.amount) - adjustments, Decimal('0'))

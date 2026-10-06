@@ -110,3 +110,36 @@ class PaymentFlowTests(TestCase):
         self.assertEqual(response.status_code,400,response.data)
         self.account.refresh_from_db()
         self.assertEqual(self.account.current_balance,1100)
+
+    def test_charge_edit_updates_principal_without_moving_cash(self):
+        result=self.pay(100,[{'name':'Charge','amount':20,'type':'charge'}])
+        response=self.client.patch(f"/api/documents/{result['interest_doc']}/",{'line_items':[{'name':'Charge','amount':30,'type':'charge'}]},format='json')
+        self.assertEqual(response.status_code,200,response.data)
+        self.assertEqual(float(payment_status(self.doc)['paid']),70)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.current_balance,1100)
+
+    def test_voucher_edit_updates_cash_and_invoice_allocation(self):
+        self.settings.enable_vouchers=True;self.settings.save()
+        result=process_send_receive(self.contact,{'amount':100,'payment_account':self.account.pk,'document':self.doc.pk,'date':'2026-01-02'},'receive')
+        payment=FinancialTransaction.objects.get(pk=result['ftxn'])
+        response=self.client.patch(f'/api/documents/{payment.document_id}/',{'total_amount':60},format='json')
+        self.assertEqual(response.status_code,200,response.data)
+        self.assertEqual(float(payment_status(self.doc)['paid']),60)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.current_balance,1060)
+
+    def test_contact_correction_updates_sole_linked_voucher(self):
+        self.settings.enable_vouchers=True;self.settings.save()
+        result=process_send_receive(self.contact,{'amount':100,'payment_account':self.account.pk,'document':self.doc.pk,'date':'2026-01-02'},'receive')
+        other=Contact.objects.create(contact_name='Correct customer',phone='456')
+        response=self.client.patch(f'/api/documents/{self.doc.pk}/',{'contact':other.pk},format='json')
+        self.assertEqual(response.status_code,200,response.data)
+        payment=FinancialTransaction.objects.get(pk=result['ftxn'])
+        self.assertEqual(payment.contact_id,other.pk)
+        self.assertEqual(payment.document.contact_id,other.pk)
+
+    def test_discount_cannot_make_invoice_total_negative(self):
+        response=self.client.post('/api/documents/',{'type':'invoice','contact':self.contact.pk,'date':'2026-01-01',
+            'line_items':[{'name':'Item','quantity':1,'rate':10,'amount':10}],'discount':20},format='json')
+        self.assertEqual(response.status_code,400,response.data)

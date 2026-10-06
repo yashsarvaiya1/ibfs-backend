@@ -89,7 +89,7 @@ class ConcurrentBalanceTests(TransactionTestCase):
                 barrier.wait(timeout=5)
                 _create_ftxn('actual', Decimal('25'), account=account_copy, date='2026-01-01')
             finally:
-                close_old_connections()
+                connection.close()
         with ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(pay, range(2)))
         account.refresh_from_db()

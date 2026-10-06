@@ -200,6 +200,9 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
         Record s.txns are managed via document edit → _sync_record_stxns.
         """
         stxn = self.get_object()
+        if stxn.document_id:
+            from accounting.models import Document
+            Document.objects.select_for_update().get(pk=stxn.document_id)
         stxn = StockTransaction.objects.select_for_update().get(pk=stxn.pk)
         if stxn.type == 'record':
             return Response(
@@ -230,6 +233,9 @@ class StockTransactionViewSet(viewsets.ModelViewSet):
         Reverses the stock change on delete.
         """
         stxn = self.get_object()
+        if stxn.document_id:
+            from accounting.models import Document
+            Document.objects.select_for_update().get(pk=stxn.document_id)
         stxn = StockTransaction.objects.select_for_update().get(pk=stxn.pk)
         if stxn.type == 'record':
             return Response(
