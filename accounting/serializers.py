@@ -15,6 +15,7 @@ def _build_media_url(request, relative_path):
 
 
 class FinancialTransactionSerializer(serializers.ModelSerializer):
+    allocations = serializers.SerializerMethodField()
     document_type        = serializers.SerializerMethodField()
     is_document_deleted  = serializers.SerializerMethodField()
     contact_name         = serializers.SerializerMethodField()
@@ -36,6 +37,11 @@ class FinancialTransactionSerializer(serializers.ModelSerializer):
 
     def get_document_type(self, obj):
         return obj.document.type if obj.document else None
+
+    def get_allocations(self, obj):
+        return [{'document':row.document_id, 'doc_id':row.document.doc_id,
+                 'document_type':row.document.type, 'amount':str(row.amount)}
+                for row in obj.allocations.all()]
 
     def get_is_document_deleted(self, obj):
         # document_id check avoids any DB hit when document is null
@@ -79,23 +85,14 @@ class DocumentListSerializer(serializers.ModelSerializer):
         return obj.contact.company_name or obj.contact.contact_name
 
     def get_payment_status(self, obj):
-        NO_PAYMENT_TYPES = {'po', 'pi', 'quotation', 'challan', 'interest', 'expense'}
-        if obj.type in NO_PAYMENT_TYPES:
-            return None
-        # obj.transactions uses prefetch_related('transactions') set in the viewset
-        txns   = obj.transactions.all()
-        record = abs(sum(t.amount for t in txns if t.type == 'record'))
-        paid   = abs(sum(t.amount for t in txns if t.type == 'actual'))
-        return {
-            'remaining': str(record - paid),
-            'is_paid':   paid >= record,
-        }
+        from .payments import payment_status
+        return payment_status(obj)
 
 
 # ─── Detail serializer ────────────────────────────────────────────────────────
 
 class DocumentSerializer(serializers.ModelSerializer):
-    transactions         = FinancialTransactionSerializer(many=True, read_only=True)
+    transactions         = serializers.SerializerMethodField()
     payment_status       = serializers.SerializerMethodField()
     stock_status         = serializers.SerializerMethodField()
     attachment_urls_full = serializers.SerializerMethodField()
@@ -105,6 +102,13 @@ class DocumentSerializer(serializers.ModelSerializer):
     class Meta:
         model  = Document
         fields = '__all__'
+
+    def get_transactions(self, obj):
+        transactions = {txn.pk:txn for txn in obj.transactions.all()}
+        for allocation in obj.payment_allocations.all():
+            transactions[allocation.payment_id] = allocation.payment
+        rows = sorted(transactions.values(), key=lambda txn: (txn.date, txn.created_at, txn.pk), reverse=True)
+        return FinancialTransactionSerializer(rows, many=True, context=self.context).data
 
     def get_attachment_urls_full(self, obj):
         request = self.context.get('request')
@@ -140,18 +144,8 @@ class DocumentSerializer(serializers.ModelSerializer):
         }
 
     def get_payment_status(self, obj):
-        NO_PAYMENT_TYPES = {'po', 'pi', 'quotation', 'challan', 'interest', 'expense'}
-        if obj.type in NO_PAYMENT_TYPES:
-            return None
-        txns   = obj.transactions.all()
-        record = abs(sum(t.amount for t in txns if t.type == 'record'))
-        paid   = abs(sum(t.amount for t in txns if t.type == 'actual'))
-        return {
-            'record':    str(record),
-            'paid':      str(paid),
-            'remaining': str(record - paid),
-            'is_paid':   paid >= record,
-        }
+        from .payments import payment_status
+        return payment_status(obj)
 
     def get_stock_status(self, obj):
         from .stock_status import document_stock_status

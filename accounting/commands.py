@@ -108,7 +108,40 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
 
 def command_data(serializer):
     data = dict(serializer.validated_data)
-    for field in ('contact', 'consignee', 'reference', 'payment_account'):
+    for field in ('contact', 'consignee', 'reference', 'payment_account', 'document'):
         if field in data:
             data[field] = data[field].pk if data[field] else None
     return data
+
+
+class PaymentCommandSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal('0.01'))
+    payment_account = serializers.PrimaryKeyRelatedField(queryset=PaymentAccount.objects.filter(is_active=True), required=False, allow_null=True)
+    document = serializers.PrimaryKeyRelatedField(queryset=Document.objects.filter(is_active=True), required=False, allow_null=True)
+    date = serializers.DateField(required=False)
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    is_expense = serializers.BooleanField(required=False, default=False)
+    line_items = serializers.JSONField(required=False, default=list)
+    interest_lines = serializers.JSONField(required=False, default=list)
+
+    def validate_line_items(self, value):
+        return DocumentWriteSerializer().validate_line_items(value)
+
+    def validate_interest_lines(self, value):
+        rows = DocumentWriteSerializer().validate_line_items(value)
+        for row in rows:
+            row.setdefault('type', 'charge')
+        return rows
+
+
+class TransferCommandSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=15, decimal_places=2, min_value=Decimal('0.01'))
+    from_account = serializers.PrimaryKeyRelatedField(queryset=PaymentAccount.objects.filter(is_active=True))
+    to_account = serializers.PrimaryKeyRelatedField(queryset=PaymentAccount.objects.filter(is_active=True))
+    date = serializers.DateField(required=False)
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+    def validate(self, attrs):
+        if attrs['from_account'].pk == attrs['to_account'].pk:
+            raise serializers.ValidationError({'to_account':'Choose a different destination account.'})
+        return attrs

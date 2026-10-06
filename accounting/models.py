@@ -80,3 +80,13 @@ class FinancialTransaction(BaseModel):
 
     def __str__(self):
         return f"{self.type} {self.amount}"
+
+
+class PaymentAllocation(BaseModel):
+    payment = models.ForeignKey(FinancialTransaction, on_delete=models.CASCADE, related_name='allocations')
+    document = models.ForeignKey(Document, on_delete=models.PROTECT, related_name='payment_allocations')
+    # Positive settles an obligation; negative reverses settlement (refund/discount).
+    amount = models.DecimalField(max_digits=15, decimal_places=2)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['payment', 'document'], name='unique_payment_document_allocation')]

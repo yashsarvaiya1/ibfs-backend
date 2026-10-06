@@ -1,12 +1,13 @@
 # accounting/views.py
 from decimal import Decimal
 from django.db import models as django_models
-from django.db.models import Q, Sum
+from django.db.models import Q, Sum, F, OuterRef, Subquery, DecimalField, Value
+from django.db.models.functions import Abs, Coalesce
 from django.http import HttpResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from .models import Document, FinancialTransaction
+from .models import Document, FinancialTransaction, PaymentAllocation
 from .serializers import (
     DocumentSerializer, DocumentListSerializer,
     FinancialTransactionSerializer,
@@ -23,7 +24,7 @@ from shared.models import Contact, PaymentAccount, Settings
 from inventory.models import StockTransaction, Product
 from django.db import transaction
 from .workflows import OUTGOING_TYPES
-from .commands import DocumentWriteSerializer, command_data
+from .commands import DocumentWriteSerializer, PaymentCommandSerializer, command_data
 from .document_updates import update_document
 
 HAS_BALANCE_TYPES = {'bill', 'invoice', 'cn', 'dn'}
@@ -42,7 +43,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         qs = (
             Document.objects
             .select_related('contact')          # ← remove .filter(is_active=True)
-            .prefetch_related('transactions')
+            .prefetch_related('transactions__allocations__document', 'payment_allocations__payment__allocations__document', 'payment_allocations__payment__document', 'payment_allocations__payment__payment_account', 'payment_allocations__payment__contact')
         )
         params = self.request.query_params
 
@@ -71,36 +72,24 @@ class DocumentViewSet(viewsets.ModelViewSet):
         if params.get('reference') not in (None, ''):
             qs = qs.filter(reference_id=params['reference'])
 
-        # ── BF-08: is_paid — restrict to balance-carrying types only ─────────
-        if params.get('is_paid') not in (None, ''):
-            want_paid = params['is_paid'].lower() == 'true'
-            qs = qs.filter(type__in=HAS_BALANCE_TYPES)
-
-            from decimal import Decimal
-
-            def _is_txn_settled(doc) -> bool:
-                txns   = doc.transactions.all()
-                record = abs(sum(t.amount for t in txns if t.type == 'record'))
-                paid   = abs(sum(t.amount for t in txns if t.type == 'actual'))
-                return record > 0 and paid >= record
-
-            if want_paid:
-                matched_ids = [doc.pk for doc in qs if doc.is_paid or _is_txn_settled(doc)]
-            else:
-                matched_ids = [doc.pk for doc in qs if not doc.is_paid and not _is_txn_settled(doc)]
-
-            qs = Document.objects.filter(pk__in=matched_ids)
-
-        if params.get('is_due') not in (None, ''):
-            if params['is_due'].lower() == 'true':
+        if params.get('is_paid') is not None or params.get('is_due') == 'true' or params.get('payment_status'):
+            decimal_field = DecimalField(max_digits=15, decimal_places=2)
+            records = FinancialTransaction.objects.filter(document_id=OuterRef('pk'),type='record').values('document_id').annotate(total=Sum('amount')).values('total')
+            allocations = PaymentAllocation.objects.filter(document_id=OuterRef('pk')).values('document_id').annotate(total=Sum('amount')).values('total')
+            qs = qs.filter(type__in=HAS_BALANCE_TYPES).annotate(
+                record_amount=Abs(Coalesce(Subquery(records),Value(0),output_field=decimal_field)),
+                paid_amount=Coalesce(Subquery(allocations),Value(0),output_field=decimal_field))
+            settled = Q(is_paid=True) | (Q(record_amount__gt=0) & Q(paid_amount__gte=F('record_amount')))
+            state = params.get('payment_status')
+            if params.get('is_paid') == 'true' or state == 'paid':
+                qs = qs.filter(settled)
+            elif params.get('is_paid') == 'false' or state in {'unpaid','partial','due'} or params.get('is_due') == 'true':
+                qs = qs.exclude(settled)
+            if state == 'partial':
+                qs = qs.filter(paid_amount__gt=0, paid_amount__lt=F('record_amount'))
+            if state == 'due' or params.get('is_due') == 'true':
                 from django.utils import timezone
-                today = timezone.localdate()
-                qs = qs.filter(
-                    type__in=HAS_BALANCE_TYPES,
-                    due_date__isnull=False,
-                    due_date__lt=today,
-                    is_paid=False,
-                )
+                qs = qs.filter(due_date__lt=timezone.localdate())
 
         return qs
 
@@ -166,76 +155,38 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        amount_raw     = Decimal(str(request.data['amount']))
-        account_id     = request.data.get('payment_account')
-        account        = PaymentAccount.objects.get(pk=account_id) if account_id else None
-        date           = _parse_date(request.data.get('date'))
-        notes          = request.data.get('notes')
-        interest_lines = request.data.get('interest_lines', [])
+        serializer = PaymentCommandSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = command_data(serializer)
+        amount_raw = data['amount']
+        account = serializer.validated_data.get('payment_account')
+        date = _parse_date(data.get('date'))
+        notes = data.get('notes')
+        interest_lines = data.get('interest_lines', [])
 
         direction  = 'send' if doc.type in OUTGOING_TYPES else 'receive'
         actual_amt = -amount_raw if direction == 'send' else amount_raw
         result     = {}
 
+        from .payments import allocate_payment, payment_status
         with transaction.atomic():
+            doc = Document.objects.select_for_update().get(pk=doc.pk)
+            interest_doc = None
+            net = Decimal('0')
             if interest_lines:
-                net = sum(
-                    Decimal(str(l['amount'])) if l.get('type') == 'charge'
-                    else -Decimal(str(l['amount']))
-                    for l in interest_lines
-                )
-                interest_record_amount = -net if direction == 'receive' else net
-                interest_doc = Document.objects.create(
-                    type         = 'interest',
-                    doc_id       = _next_doc_id('interest'),
-                    contact      = doc.contact,
-                    line_items   = interest_lines,
-                    total_amount = abs(net),
-                    date         = date,
-                    reference    = doc,
-                )
-                int_ftxn = _create_ftxn(
-                    'record', interest_record_amount,
-                    doc.contact, None, interest_doc, date,
-                )
-                result['interest_doc']  = interest_doc.pk
-                result['interest_ftxn'] = int_ftxn.pk
-
-            ftxn           = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes)
+                net = sum((Decimal(str(line['amount'])) * (1 if line.get('type') == 'charge' else -1) for line in interest_lines), Decimal('0'))
+                interest_doc = Document.objects.create(type='interest', doc_id=_next_doc_id('interest'),
+                    contact=doc.contact, line_items=interest_lines, total_amount=abs(net), date=date, reference=doc)
+                _create_ftxn('record', -net if direction == 'receive' else net,
+                    doc.contact, None, interest_doc, date)
+                result['interest_doc'] = interest_doc.pk
+            ftxn = _create_ftxn('actual', actual_amt, doc.contact, account, doc, date, notes, auto_allocate=False)
+            allocate_payment(ftxn, doc, max(amount_raw-net, Decimal('0')))
+            if interest_doc:
+                allocate_payment(ftxn, interest_doc, min(net, amount_raw))
             result['ftxn'] = ftxn.pk
-
-            # BF-04: auto mark paid when actuals >= records
-            MARK_PAID_TYPES = {'bill', 'invoice', 'cn', 'dn'}
-            if doc.type in MARK_PAID_TYPES and not doc.is_paid:
-                agg    = doc.transactions.aggregate(
-                    record_total=Sum('amount', filter=django_models.Q(type='record')),
-                    actual_total=Sum('amount', filter=django_models.Q(type='actual')),
-                )
-                record = abs(agg['record_total'] or Decimal('0'))
-                paid   = abs(agg['actual_total'] or Decimal('0'))
-                if record > 0 and paid >= record:
-                    doc.is_paid = True
-                    doc.save(update_fields=['is_paid', 'updated_at'])
-                    result['is_paid'] = True
-
-        return Response(result, status=status.HTTP_201_CREATED)
-
-
-        # BF-04
-        MARK_PAID_TYPES = {'bill', 'invoice', 'cn', 'dn'}
-        if doc.type in MARK_PAID_TYPES and not doc.is_paid:
-            agg    = doc.transactions.aggregate(
-                record_total=Sum('amount', filter=django_models.Q(type='record')),
-                actual_total=Sum('amount', filter=django_models.Q(type='actual')),
-            )
-            record = abs(agg['record_total'] or Decimal('0'))
-            paid   = abs(agg['actual_total'] or Decimal('0'))
-            if record > 0 and paid >= record:
-                doc.is_paid = True
-                doc.save(update_fields=['is_paid', 'updated_at'])
-                result['is_paid'] = True
-
-        return Response(result, status=status.HTTP_201_CREATED)
+            result['is_paid'] = bool((payment_status(doc) or {}).get('is_paid'))
+        return Response(result, status=201)
 
 
     # ── Move Stock ────────────────────────────────────────────────────────────
@@ -382,6 +333,24 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             data.get('payment_account'), data.get('document'), data['date'], data.get('notes'))
         return Response(self.get_serializer(ftxn).data, status=201)
 
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def allocate(self, request, pk=None):
+        from rest_framework.exceptions import ValidationError
+        from .payments import replace_allocations
+        payment = self.get_object()
+        if payment.type != 'actual' or (payment.document and payment.document.type == 'expense'):
+            raise ValidationError({'allocations':'Only ordinary payments can be allocated.'})
+        entries = request.data.get('allocations', [])
+        if not isinstance(entries, list) or any(not isinstance(row, dict) or not isinstance(row.get('document'), int) for row in entries):
+            raise ValidationError({'allocations':'Choose documents and amounts.'})
+        contact_ids = set(Document.objects.filter(pk__in=[row['document'] for row in entries]).values_list('contact_id', flat=True))
+        contact_ids.add(payment.contact_id)
+        list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in contact_ids if pk]).order_by('pk'))
+        payment = FinancialTransaction.objects.select_for_update().get(pk=payment.pk)
+        replace_allocations(payment, entries)
+        return Response(self.get_serializer(payment).data)
+
 
     def get_serializer_context(self):
         return {'request': self.request}
@@ -391,6 +360,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         qs = (
             FinancialTransaction.objects
             .select_related('document', 'contact', 'payment_account')
+            .prefetch_related('allocations__document')
             .all()
         )
         params       = self.request.query_params
@@ -490,6 +460,11 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             ftxn.notes = data['notes']
 
         ftxn.save()
+        from .payments import rescale_allocations
+        rescale_allocations(ftxn, old_amount)
+        if ftxn.document and ftxn.document.type == 'expense':
+            ftxn.document.total_amount = -sum((row.amount for row in ftxn.document.transactions.filter(type='actual')), Decimal('0'))
+            ftxn.document.save(update_fields=['total_amount','updated_at'])
         _recalculate_mcd(ftxn.contact, ftxn.date)
         if old_date.month != ftxn.date.month or old_date.year != ftxn.date.year:
             _recalculate_mcd(ftxn.contact, old_date)
@@ -528,11 +503,23 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
 
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def link_document(self, request, pk=None):
-        ftxn             = self.get_object()
-        ftxn.document_id = request.data.get('document')
-        ftxn.save(update_fields=['document', 'updated_at'])
-        return Response(FinancialTransactionSerializer(ftxn, context={'request': request}).data)
+        from rest_framework.exceptions import ValidationError
+        from django.shortcuts import get_object_or_404
+        from .payments import replace_allocations
+        ftxn = self.get_object()
+        if ftxn.type != 'actual' or (ftxn.document and ftxn.document.type == 'expense'):
+            raise ValidationError({'document':'Only ordinary payments can be linked to documents.'})
+        doc_id = request.data.get('document')
+        doc = get_object_or_404(Document, pk=doc_id, is_active=True, type__in=HAS_BALANCE_TYPES) if doc_id else None
+        list(Contact.objects.select_for_update().filter(pk__in=[pk for pk in
+            (ftxn.contact_id, doc.contact_id if doc else None) if pk]).order_by('pk'))
+        ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
+        adjustments = sum((row.amount for row in ftxn.allocations.filter(document__type='interest')), Decimal('0'))
+        available = max(abs(ftxn.amount) - adjustments, Decimal('0'))
+        replace_allocations(ftxn, [{'document':doc.pk, 'amount':available}] if doc and available else [])
+        return Response(self.get_serializer(ftxn).data)
 
 
     # ── Print Transactions PDF (TV-06) ────────────────────────────────────────

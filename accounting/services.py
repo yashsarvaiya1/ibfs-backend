@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import Sum, F
+from django.db.models import Sum, F, Q
 from django.utils import timezone
 from datetime import date as date_type
 from .models import Document, FinancialTransaction
@@ -359,7 +359,7 @@ def _recalculate_mcd(contact, date):
 def _create_ftxn(
     type_, amount, contact=None, account=None,
     document=None, date=None, notes=None,
-    force_mcd_zero=False,
+    force_mcd_zero=False, auto_allocate=True,
 ):
     """
     Creates a FinancialTransaction and handles all side effects.
@@ -388,6 +388,10 @@ def _create_ftxn(
         notes=notes,
         monthly_cumulative_delta=Decimal('0'),
     )
+
+    if type_ == 'actual' and auto_allocate:
+        from .payments import allocate_payment
+        allocate_payment(ftxn, document)
 
     if force_mcd_zero:
         if account:
@@ -534,6 +538,15 @@ def process_document_create(doc_type, data, contact=None):
 
 @transaction.atomic
 def process_send_receive(contact, data, direction):
+    from .commands import PaymentCommandSerializer, command_data
+    from rest_framework.exceptions import ValidationError
+    serializer = PaymentCommandSerializer(data=data)
+    serializer.is_valid(raise_exception=True)
+    data = command_data(serializer)
+    if data.get('document'):
+        linked = Document.objects.get(pk=data['document'])
+        if linked.contact_id and (not contact or linked.contact_id != contact.pk):
+            raise ValidationError({'document':'Choose a document belonging to this contact.'})
     app_settings   = Settings.get()
     amount_raw     = Decimal(str(data['amount']))
     actual_amount  = amount_raw if direction == 'receive' else -amount_raw
@@ -574,8 +587,11 @@ def process_send_receive(contact, data, direction):
             line_items   = data.get('line_items', []),
             total_amount = abs(actual_amount),
             date         = date,
+            reference    = doc_ref,
         )
 
+    interest_doc = None
+    net = Decimal('0')
     if interest_lines:
         net = sum(
             Decimal(str(l['amount'])) if l.get('type') == 'charge'
@@ -600,8 +616,17 @@ def process_send_receive(contact, data, direction):
 
     main_ftxn      = _create_ftxn(
         'actual', actual_amount, contact, account,
-        voucher_doc or doc_ref, date, data.get('notes'),
+        voucher_doc or doc_ref, date, data.get('notes'), auto_allocate=False,
     )
+    from .payments import allocate_payment
+    if doc_ref:
+        principal = max(amount_raw - net, Decimal('0'))
+        sign = FTXN_RECORD_SIGN.get(doc_ref.type)
+        if sign is not None:
+            compatible = (direction == 'send') == (sign > 0)
+            allocate_payment(main_ftxn, doc_ref, principal if compatible else -principal)
+    if interest_doc:
+        allocate_payment(main_ftxn, interest_doc, min(net, amount_raw))
     result['ftxn'] = main_ftxn.pk
     return result
 
@@ -611,6 +636,13 @@ def process_send_receive(contact, data, direction):
 @transaction.atomic
 def process_transfer(data):
     """Spec B2: Contra transfer between two payment accounts."""
+    from .commands import TransferCommandSerializer
+    serializer = TransferCommandSerializer(data=data)
+    serializer.is_valid(raise_exception=True)
+    data = dict(serializer.validated_data)
+    data['from_account'] = data['from_account'].pk
+    data['to_account'] = data['to_account'].pk
+    list(PaymentAccount.objects.select_for_update().filter(pk__in=[data['from_account'],data['to_account']]).order_by('pk'))
     amount   = Decimal(str(data['amount']))
     date     = _parse_date(data.get('date'))
     from_acc = PaymentAccount.objects.get(pk=data['from_account'])
@@ -697,6 +729,13 @@ def process_document_delete(document, strategy):
         return {'status': 'deleted', 'strategy': strategy}
     contact_ids = document.transactions.exclude(contact=None).values_list('contact_id', flat=True).distinct()
     list(Contact.objects.select_for_update().filter(pk__in=contact_ids).order_by('pk'))
+    allocated_payments = FinancialTransaction.objects.filter(
+        Q(document=document) | Q(allocations__document=document), type='actual').distinct()
+    if strategy == 'revert':
+        for payment in allocated_payments:
+            if payment.allocations.exclude(document=document).exists():
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({'strategy':'A payment also settles charges or another document. Keep transactions or adjust its allocation first.'})
     StockTransaction.objects.filter(document=document, type='record').delete()
 
     # Collect record contacts/dates before deletion
@@ -704,7 +743,7 @@ def process_document_delete(document, strategy):
     record_contact_dates = [(f.contact, f.date) for f in record_ftxns]
     document.transactions.filter(type='record').delete()
 
-    actual_ftxns = list(document.transactions.filter(type='actual').select_related('contact', 'payment_account'))
+    actual_ftxns = list(allocated_payments.select_related('contact', 'payment_account', 'document'))
     actual_stxns = list(StockTransaction.objects.filter(document=document, type='actual').select_related('product'))
 
     if strategy == 'revert':
@@ -718,6 +757,9 @@ def process_document_delete(document, strategy):
                 PaymentAccount.objects.filter(pk=ftxn.payment_account_id).update(current_balance=F('current_balance') - ftxn.amount, updated_at=timezone.now())
             contact = ftxn.contact
             date    = ftxn.date
+            if ftxn.document and ftxn.document_id != document.pk and ftxn.document.type in {'cash_payment_voucher','cash_receipt_voucher'}:
+                ftxn.document.is_active = False
+                ftxn.document.save(update_fields=['is_active','updated_at'])
             ftxn.delete()
             if document.type != 'expense':
                 _recalculate_mcd(contact, date)
@@ -732,6 +774,7 @@ def process_document_delete(document, strategy):
             if document.type != 'expense' and contact:
                 _recalculate_mcd(contact, date)
 
+    document.payment_allocations.all().delete()
     document.is_active = False
     document.save(update_fields=['is_active', 'updated_at'])
     return {'status': 'deleted', 'strategy': strategy}
@@ -775,7 +818,7 @@ def generate_stock_list_pdf(products, request=None, low_stock_only=False):
 # ── Stock Transactions PDF (Product detail page) ───────────────────────────────
 def generate_stock_transactions_pdf(stock_txns, request=None, product=None, date_from=None, date_to=None):
     from inventory.models import StockTransaction as StockTxnModel
-    from django.db.models import Sum, F
+    from django.db.models import Sum, F, Q
 
     app_settings  = Settings.get()
 
