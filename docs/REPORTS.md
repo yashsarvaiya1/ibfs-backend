@@ -19,11 +19,11 @@ APIs: `GET /api/reports/ca_documents/`, `POST /api/reports/ca_export/`. Both acc
 - Invoice: sales/output GST. Bill: purchase GST recorded in books.
 - IBFS CN: customer/sales return, reducing output GST. IBFS DN: supplier/purchase return, reducing purchase GST. This reflects the existing signed ledger/stock flow; it does not assume every statutory debit note is a purchase return. Notes require an active matching invoice/bill for the same contact and a consistent reverse-charge flag. Unlinked or conflicting notes go to review.
 - Quotation, PO and PI do not post. Challans move stock; payments and vouchers settle cash. None is counted again as GST.
-- Document-wide tax base is item amounts + charges − discount, using the existing Decimal rounding. Taxes are not reallocated to individual HSNs or guessed as mixed item rates.
+- Document-wide tax remains the default: item amounts + charges − discount, using Decimal rounding. Optional item mode applies each saved line’s rates after allocating document charges/discount proportionally in cents; rounded line taxes are aggregated by name/rate. The create/edit form previews those same backend calculations.
 - CGST, SGST, IGST, UTGST and cess are separate. Generic GST is retained without an invented split. Unknown tax labels are shown as other tax and excluded from GST. Reverse-charge documents are separate from normal sales/purchase totals.
 - Missing item amounts/fast-entry details, invalid calculations, total mismatches and conflicting components are excluded from normal totals with a reason. Missing GSTIN/place of supply and unspecified reverse charge are review flags; an unspecified flag is treated as normal in this book comparison, expressly pending review. Nil-rated/exempt/export classifications are not inferred from a zero tax amount.
 
-**Book GST difference** is normal output GST minus normal purchase GST. It is not eligible ITC, tax payable, a component-offset calculation, portal reconciliation or a GST return. Purchase GST must be checked against GSTR-2B and eligibility conditions; RCM payment/credit, amendments, import/export treatment and filing-period differences need CA review. Historical document edits are reflected in the current saved book data, not reproduced as filed-return snapshots.
+**Book GST difference** is normal output GST minus normal purchase GST. It is not eligible ITC, tax payable, a component-offset calculation, portal reconciliation or a GST return. Purchase GST must be checked against GSTR-2B and eligibility conditions; RCM payment/credit, amendments, import/export treatment and filing-period differences need CA review. Historical document edits are reflected in the current saved book data. Prospective saved versions show creates/edits and a known baseline on the first tracked legacy edit; they are not filed-return snapshots.
 
 Primary practice references checked for this implementation:
 
@@ -36,3 +36,24 @@ Primary practice references checked for this implementation:
 Document detail and print screens offer **Share on WhatsApp**. Choose a saved recipient or enter a number, review/edit the prepared text, download the authenticated PDF, then click **Open WhatsApp**. Attach the named file manually from Downloads and send when ready. This uses [WhatsApp click-to-chat](https://faq.whatsapp.com/5913398998672934/?locale=en_US), with no WABA integration, public PDF URL or automatic sending.
 
 Ten-digit numbers use India's country code; explicit international numbers use `+` or `00`. Invalid numbers cannot open a link. A ten-digit Indian number starting with `91` still receives the country code. The link opens directly from a user click, avoiding delayed popups. Amounts come from saved data; challans and missing amounts omit the total. Copy-message and download-again actions remain available.
+
+## GST/HSN exports and optional particulars
+
+The GST register exports the entire selected period to CSV or a landscape A4 PDF, including book totals and review reasons. `GET /api/reports/gst_export/` accepts the same period and optional review filter plus `export_format=csv|pdf`. Do not use DRF's reserved `format` query parameter. Numeric CSV values preserve their signs; text that could become spreadsheet formulas is escaped.
+
+`GET /api/reports/hsn/` groups saved HSN/SAC, unit, rate and explicit supply classification by sales/purchase/RCM bucket. `hsn_export/` downloads the whole summary as CSV/PDF. It does not invent missing codes, units, quantities or nil/exempt treatment. Invalid GST calculations appear in an excluded-document list. Shared document taxes/charges/discounts are allocated proportionally in cents for the HSN view, preserving document rounded tax totals; item mode uses its own line calculations. Unknown particulars are review flags. This is a CA-readable book summary, not a portal-upload JSON schema.
+
+Tax details optionally capture taxable/nil-rated/exempt/non-GST/export/import treatment at document or line level, plus a supplier's original invoice number. Line classifications override the document classification for HSN grouping. Nil-rated/exempt/non-GST lines cannot carry positive tax rates; mixed taxable/exempt lines use item mode. Export/import labels alone do not establish statutory treatment, refund entitlement or filing sections.
+
+## Allocation review
+
+`GET /api/reports/allocation_review/` lists actual payments with unallocated amounts or inconsistent saved allocations for the period. Open a payment to use the existing allocation editor. This changes allocation only when the user saves it; the report never guesses matches or creates cash movement.
+
+## Manual CSV comparisons
+
+**Compare CSV** is optional. Download a template, prepare the file and upload it for read-only review. `comparison_template/` and `compare_csv/` accept `kind=bank|purchase`; bank comparisons also require an account. Files are limited to 5 MB/5,000 rows and are not stored on the server. Dates use `YYYY-MM-DD`; amounts require explicit finite values with at most two decimals.
+
+- Bank: signed statement amount/date are compared to actual/transfer cash entries in the selected account. Incoming is positive, outgoing negative. A unique match is a candidate requiring reference review; repeated amounts/dates are ambiguous. No imported payment or reconciled-status claim is created.
+- Purchase: CA-prepared invoice CSVs (for example derived from GSTR-2B) match bills using supplier GSTIN, supplier's original invoice number and date, then compare taxable/component amounts. Internal IBFS numbers never substitute for missing supplier numbers. Agreement does not establish eligible ITC. Notes/amendments, filing-period timing and RCM payment need CA review.
+
+Results and unmatched book entries are shown separately, with document/payment links and an optional CSV download. No portal login, provider API, bank feed, return submission, IRN validation or automated posting is used.

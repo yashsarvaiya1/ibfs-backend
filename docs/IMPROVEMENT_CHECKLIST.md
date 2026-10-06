@@ -2,9 +2,9 @@
 
 Working branches: `refactor-improvements` in backend and frontend. No production deployment is included.
 
-Status reviewed on **6 October 2026**: all **36 tracked implementation items** below are complete and committed. This describes the agreed implementation scope, not every possible future accounting feature. Production release work and optional extensions remain explicitly unchecked below.
+Status reviewed on **6 October 2026**: the original **36 tracked implementation items** are complete, followed by the additional local extensions recorded below. Production VM work was explicitly skipped; full double-entry accounting and multi-company support were deferred. Completion here describes code and local verification, not a production release.
 
-Latest local validation: 79 backend tests passed, frontend production build passed, and desktop/mobile checks covered WhatsApp preparation, GST summaries and a 51-document CA PDF with exclusions across list pages. These checks used isolated test data; production data and hosting have not been validated.
+Latest local validation: 96 backend tests passed and the frontend production build passed. Desktop/mobile checks covered mixed-rate create/edit, encrypted offline PDF viewing/draft restoration, WhatsApp preparation, GST summaries and a 51-document CA PDF with exclusions across list pages. Both PDF templates passed short/multipage placeholder checks. The dependency audit has zero findings; focused new-module lint passed, while older modules retain lint debt. These checks used isolated test data; production data and hosting have not been validated.
 
 Preserve the existing simplified accounting contract: quotation / PO / PI do not post; bills and invoices establish obligations; optional automatic payments settle them; challans own stock when enabled; automatic stock remains optional. Extra controls should be optional rather than mandatory stages.
 
@@ -36,7 +36,7 @@ Preserve the existing simplified accounting contract: quotation / PO / PI do not
 
 ## Hosting and reliability — before final PDFs
 
-- [x] Supported runtimes, production dependency updates and reproducible builds. Development-tooling audit findings remain listed below.
+- [x] Supported runtimes, dependency updates and reproducible builds, including a tested narrow Node 24 lint glob adapter; full npm audit has zero findings.
 - [x] Runtime API configuration, PWA caching privacy and production build verification.
 - [x] Cookie authentication for the web, logout cache clearing and authenticated uploads.
 - [x] Production configuration validation, health checks and fail-fast startup.
@@ -62,36 +62,38 @@ Both layouts share the same backend data and pagination. The amount-in-words box
 - [x] April–March FY/month/custom GST book summary, separate reverse charge and note adjustments, with review flags and full-period totals.
 - [x] Keep these features read-only and preserve posting, settlement and challan stock ownership. See [reporting contract](REPORTS.md).
 
-## Release boundaries
+## Additional local improvements — complete
 
-Completed code and local checks do not mean a production release has been performed. Follow [deployment and recovery instructions](DEPLOYMENT.md).
+- [x] Optional per-item GST rates with backend Decimal previews, cent-exact charge/discount allocation, shared rates retained as the default and edit/conversion preservation.
+- [x] Explicit document/line supply classifications and supplier invoice numbers, with contradictory nil/exempt/non-GST tax validation.
+- [x] Full-period GST registers and HSN/SAC summaries in CSV/PDF, review flags, signed notes and formula-safe CSV text.
+- [x] Payment allocation review with direct access to the existing editor; no guessed historical matches.
+- [x] Optional bank-statement and CA-prepared purchase CSV comparisons, duplicate/mismatch/unmatched review and CSV download, with no book mutations.
+- [x] Prospective saved document versions and known legacy baseline; archived documents remain readable/printable while edit/reposting bypasses are blocked.
+- [x] Installed-PWA desktop/mobile offline workspace: explicitly saved encrypted PDFs and local draft CRUD, returning to the normal online form for posting.
+- [x] Database-backed shared production cache provisioned at startup, compatible with existing Compose environments.
+- [x] Verified database/media backup bundles, checksums, accounting snapshots, isolated restore/migration rehearsal and host health/schedule commands.
+- [x] Project-specific frontend/backend READMEs and deployment/report/PDF/offline documentation.
 
-### Remaining release and operational work
+## VM handoff — skipped at the user's request
 
-- [ ] Rotate deployment credentials exposed by the previously tracked frontend `.vne`; replace the actual VM environment. Removing the file from tracking did not rotate secrets or remove Git history.
-- [ ] Configure and verify production secrets, allowed hosts, trusted HTTPS origins, server-side API routing, TLS and session-cookie behavior on the actual host.
-- [ ] Verify media/static volume ownership for the non-root backend and retain the existing PostgreSQL 15 data volume. A database major-version upgrade is a separate task.
-- [ ] Take and verify a release database/media backup, preserve previous image tags, and rehearse restoration in isolated volumes.
-- [ ] Rehearse migrations against a restored copy of production data; compare document counts, contact/account balances, payment allocations and inventory before releasing.
-- [ ] Review historical payments/vouchers without enough stored document linkage using the allocation editor. Do not guess document matches from amounts alone.
-- [ ] Review historical GST flags: missing item amounts, generic tax labels, total mismatches, note references, supplier GSTIN, place of supply and reverse-charge fields. Correct confirmed source data without inventing missing details.
-- [ ] Deploy the frontend/backend changes and migrations to production.
-- [ ] Perform a production smoke check with test records: login/logout, create/edit/archive, conversion, payment/refund/allocation, transfer reversal, stock/challan movement, both PDF templates, WhatsApp preparation, CA selection and FY GST.
-- [ ] Install and verify scheduled maintenance and backups, encrypted off-host copies, retention policy and a recurring restore check.
-- [ ] Configure and verify health/failure monitoring for the application, disk usage, backups and maintenance jobs; use a shared throttle/cache backend if running multiple backend replicas.
-- [ ] Resolve the development-tooling dependency audit findings without an incompatible runtime/configuration downgrade. The 6 October 2026 frontend audit reports five high-severity findings in the Next ESLint → fast-glob → micromatch → braces dependency chain; these are not marked fixed.
+These require the actual host or production data and were not performed. Continue using the existing Compose/private `.env` method; defaults and examples are compatible. See [deployment and recovery instructions](DEPLOYMENT.md).
 
-### Optional extensions not implemented or required for this release
+- [ ] Rotate previously exposed deployment credentials and replace the actual VM environment.
+- [ ] Validate production secrets, hosts, HTTPS/CSRF/session behavior and reverse-proxy routing.
+- [ ] Verify non-root media/static ownership and retain the existing PostgreSQL 15 volume.
+- [ ] Take a production backup, rehearse candidate migrations against restored production data and compare balances/allocations/stock. The tools passed with isolated local PostgreSQL 15 data.
+- [ ] Review historical allocation/GST flags with confirmed source documents; missing details must not be invented.
+- [ ] Deploy images/migrations and run a production smoke check.
+- [ ] Install host schedules, encrypted off-host copies, retention and notifications; verify operational monitoring and recurring restore checks. Commands are provided, not installed remotely.
 
-These need a separate scope decision. They must preserve the simple daily flow; they are not unfinished parts of the CA PDF pack or manual WhatsApp share.
+## Explicitly deferred or excluded
 
-- [ ] Automated GSTR-2B import/matching, ITC eligibility/reversals and GST payment/filing reconciliation. Current GST is a document book summary, not an eligible-credit or payable-tax calculation.
-- [ ] Per-item/mixed GST rates, HSN-wise tax summaries, explicit nil-rated/exempt/export/import classifications and filed-period amendment history.
-- [ ] GST return submission and e-invoice/IRN integration through an agreed provider.
-- [ ] Bank feeds or statement-import reconciliation.
-- [ ] Full double-entry journals, trial balance, profit and loss and balance-sheet reporting, if the product scope expands beyond the existing simplified ledger contract.
-- [ ] Multi-company tenancy and associated company-specific data/access controls.
-- [ ] A packaged native desktop application/installer, if requested. Desktop browser layout and controls are complete; native packaging/offline desktop operation have not been implemented.
-- [ ] Replace the generated frontend README with project-specific local setup and links to the deployment/reporting documentation.
+- Full double-entry journals, trial balance, profit/loss and balance sheet: **deferred by user**; preserve current simplified accounting.
+- Multi-company tenancy: **deferred by user**.
+- GST filing/submission, e-invoice/IRN and other provider validation: **excluded by user**.
+- Automated portal GSTR-2B retrieval, bank feeds and third-party reconciliation APIs: **excluded**; local manual CSV comparisons are available.
+- Automated eligible-ITC/reversal/tax-payable decisions and filed-return amendment snapshots: **outside current scope**. Book versions and reports do not infer filing status.
+- Packaged native desktop installer: **deferred**; desktop browser/installed PWA and offline files/drafts are implemented.
 
-Continue using focused checks and the existing `[FIX]` / `[IMP]` commit convention for further changes.
+No remaining authorized local implementation item is intentionally deferred. Actual VM/data handoff and the explicitly deferred/excluded features above are not marked complete. Continue using focused checks and the existing `[FIX]` / `[IMP]` commit convention.
