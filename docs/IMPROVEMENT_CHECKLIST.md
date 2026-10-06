@@ -13,40 +13,43 @@ Preserve the existing simplified accounting contract: quotation / PO / PI do not
 - [x] Separate cash movement from settlement allocation; vouchers remain printable.
 - [x] Charges, discounts, refunds, split payments and payment edits affect settlement correctly.
 - [x] Partial / paid / due filters run before pagination and also apply to bulk print.
-- [ ] Authoritative balances and paginated ledgers; correct incoming / outgoing presentation.
-- [ ] Balance reconciliation leaves a transaction trail.
-- [ ] Validate adjustments and protect manual stock corrections.
+- [x] Authoritative balances and paginated ledgers; correct incoming / outgoing presentation.
+- [x] Balance reconciliation leaves a transaction trail.
+- [x] Validate adjustments and protect manual stock corrections.
+
+- [x] Paired account transfers can be reversed once without losing history.
 
 ## Controls, usability and desktop — next
 
 - [x] Optional allocation editor for one or multiple bills / invoices.
 - [x] Preserve discounts, clear optional fields and protect document drafts during editing.
 - [x] Repair authenticated printing and global move-stock actions.
-- [ ] Desktop navigation, wider workspace, usable desktop dialogs and mobile zoom.
-- [ ] Linked document stages and direct conversion with inherited data.
-- [ ] Pagination / search for all major lists and complete selector lookup.
-- [ ] Dedicated stock history with edit, deletion and print controls.
-- [ ] Business-timezone dates, useful load / error states and accessible actions.
+- [x] Desktop navigation, wider workspace, usable desktop dialogs and mobile zoom.
+- [x] Linked document stages and direct conversion with inherited data.
+- [x] Pagination / search for all major lists and complete selector lookup.
+- [x] Dedicated stock history with edit, deletion and print controls.
+- [x] Business-timezone dates, useful load / error states and accessible actions.
 
 ## Hosting and reliability — before final PDFs
 
-- [ ] Supported runtimes and patched dependency versions; reproducible builds.
-- [ ] Runtime API configuration, PWA caching privacy and production build verification.
-- [ ] Cookie authentication for the web, logout cache clearing and authenticated uploads.
-- [ ] Production configuration validation, health checks and fail-fast startup.
-- [ ] Safe upload cleanup, maintenance / backup instructions and deployment migration checklist.
+- [x] Supported runtimes and patched dependency versions; reproducible builds.
+- [x] Runtime API configuration, PWA caching privacy and production build verification.
+- [x] Cookie authentication for the web, logout cache clearing and authenticated uploads.
+- [x] Production configuration validation, health checks and fail-fast startup.
+- [x] Safe upload cleanup, maintenance / backup instructions and deployment migration checklist.
 
 ## Final PDF pass — last, per latest user instruction
 
-Existing rendering improvements are a foundation; this section is not finished yet.
+Both layouts share the same backend data and pagination. The amount-in-words box and totals breakdown repeat on every page. All summary values stay blank on continuation pages; values appear only on the sheet containing the final item(s).
 
-- [ ] Two user-selectable standard invoice / bill templates.
-- [ ] Print only business / contact / document values that exist; no invented data or default terms.
-- [ ] Ordinary short bill fits on one A4 page.
-- [ ] Overflow items continue with the same document top and bottom sections on every page.
-- [ ] Totals and final amount appear only where the items finish, on the last page.
-- [ ] Uploaded letterhead placement and transparent signature work in both templates.
-- [ ] Visual checks for short, long, unbranded and branded bills / invoices, and bulk PDFs.
+- [x] Two user-selectable standard invoice / bill templates.
+- [x] Print only business / contact / document values that exist; no invented data or default terms. Preview uses the latest saved document or an empty layout.
+- [x] Ordinary short bill fits on one A4 page.
+- [x] Overflow items continue with the same document top and bottom sections, signature, amount-in-words box and totals fields on every intermediate page.
+- [x] Numeric totals, final amount and amount-in-words values appear only where the items finish, on the last page; labels and spaces repeat on prior pages.
+- [x] Uploaded letterhead placement and transparent signature work in both templates.
+- [x] Visual checks for short, long, unbranded and branded bills / invoices, and bulk PDFs.
+- [x] Optional place of supply / reverse charge controls; unspecified values are omitted and explicit No is retained.
 
 ## Release boundaries
 

@@ -21,7 +21,7 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
         model = Document
         fields = ['type', 'doc_id', 'contact', 'consignee', 'reference', 'line_items',
             'total_amount', 'charges', 'taxes', 'discount', 'date', 'due_date',
-            'payment_terms', 'attachment_urls', 'notes', 'payment_account', 'expected_updated_at']
+            'payment_terms', 'place_of_supply', 'reverse_charge', 'attachment_urls', 'notes', 'payment_account', 'expected_updated_at']
         extra_kwargs = {'doc_id': {'required': False}, 'date': {'required': False}}
 
     def validate_line_items(self, value):

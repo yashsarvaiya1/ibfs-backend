@@ -12,7 +12,7 @@ The development branches are not deployed automatically. Back up and rehearse th
 6. Start the deployment. Startup waits for PostgreSQL, checks configuration, applies migrations and collects static files; any error stops the container. Create the initial administrator separately with `docker compose exec backend python manage.py createsuperuser`.
 7. Verify login, a document edit, a payment allocation, stock movement and PDF download using a test contact. Existing web users sign in once again because legacy browser-stored passwords are removed.
 
-New migrations add print settings, document stock ownership and payment allocation. Allocation backfill preserves cash and inventory. Historical vouchers or charge/discount payments without enough stored linkage require a manual allocation review; do not infer invoice matches from amounts alone.
+New migrations add print settings/template choice, optional document tax metadata, document stock ownership, payment allocation and paired transfer history. Allocation backfill preserves cash and inventory. Historical vouchers or charge/discount payments without enough stored linkage require a manual allocation review; do not infer invoice matches from amounts alone.
 
 ## Scheduled maintenance and backups
 

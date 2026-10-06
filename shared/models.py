@@ -19,6 +19,8 @@ class Settings(BaseModel):
     payment_details = models.TextField(blank=True, default='')
     print_terms = models.TextField(blank=True, default='')
     signatory_name = models.CharField(max_length=100, blank=True, default='')
+    print_template = models.CharField(max_length=10, default='modern',
+        choices=[('classic', 'Classic'), ('modern', 'Modern')])
     letterhead_mode = models.CharField(max_length=10, default='banner',
         choices=[('banner', 'Header banner'), ('page', 'Full-page letterhead')])
     letterhead_height_mm = models.PositiveSmallIntegerField(default=32)

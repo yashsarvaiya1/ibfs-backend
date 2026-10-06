@@ -40,6 +40,8 @@ class Document(BaseModel):
     date            = models.DateField()
     due_date        = models.DateField(null=True, blank=True)
     payment_terms   = models.CharField(max_length=255, blank=True, null=True)
+    place_of_supply = models.CharField(max_length=100, blank=True, null=True)
+    reverse_charge = models.BooleanField(blank=True, null=True, default=None)
     attachment_urls = models.JSONField(default=list, blank=True)
     notes           = models.TextField(blank=True, null=True)
     is_active       = models.BooleanField(default=True)

@@ -56,18 +56,26 @@ def amount_in_words(value):
 
 def document_context(document, app_settings, contact_display):
     data = {key: getattr(document, key) for key in ('line_items', 'charges', 'taxes', 'discount')}
-    totals = document_totals(data, document.type)
-    # Fast entry and historical explicit totals remain authoritative.
-    total = money(document.total_amount) if document.total_amount is not None else totals['total']
-    adjustment = money(total - totals['total']) if document.line_items else Decimal('0')
     items = []
+    calculation_items = []
     for item in document.line_items or []:
         row = dict(item)
-        row['amount_display'] = format_money(item.get('amount', 0))
+        amount = item.get('amount')
+        if amount is None and item.get('rate') is not None and item.get('quantity') is not None:
+            amount = decimal_value(item['rate']) * decimal_value(item['quantity'])
+        calculation_items.append({**item, 'amount': amount})
+        row['amount_display'] = format_money(amount) if amount is not None else ''
         row['rate_display'] = format_money(item['rate']) if item.get('rate') is not None else ''
         row['quantity_display'] = format(decimal_value(item['quantity']), 'f').rstrip('0').rstrip('.') if '.' in str(item.get('quantity', '')) else item.get('quantity', '')
         row['is_discount'] = document.type == 'interest' and item.get('type') == 'discount'
         items.append(row)
+    data['line_items'] = calculation_items
+    totals = document_totals(data, document.type)
+    has_line_totals = bool(calculation_items) and all(item['amount'] is not None for item in calculation_items)
+    # Fast entry and historical explicit totals remain authoritative.
+    total = money(document.total_amount) if document.total_amount is not None else totals['total']
+    has_total = document.total_amount is not None or has_line_totals
+    adjustment = money(total - totals['total']) if has_line_totals else Decimal('0')
     taxes = [{**tax, 'amount_display': format_money(tax['amount'])} for tax in totals['taxes']]
     charges = [{**charge, 'amount_display': format_money(charge.get('amount'))} for charge in document.charges or []]
     vendor = document.type in {'bill', 'po', 'dn'}
@@ -81,6 +89,8 @@ def document_context(document, app_settings, contact_display):
         'discount': format_money(totals['discount']), 'tax_total': format_money(totals['tax_total']),
         'grand_total': format_money(total), 'adjustment': format_money(adjustment),
         'has_adjustment': adjustment != 0, 'amount_in_words': amount_in_words(total),
+        'has_total': has_total,
+        'has_line_totals': has_line_totals,
         'doc_type_label': document.get_type_display(),
         'is_simple_line_type': document.type in SIMPLE_LINE_TYPES,
         'is_challan': document.type == 'challan', 'is_vendor_doc': vendor,

@@ -45,18 +45,14 @@ class SettingsViewSet(viewsets.ModelViewSet):
         from accounting.models import Document
         from accounting.services import _build_document_context, _render_playwright_pdf
         from django.template.loader import render_to_string
-        from django.utils import timezone
         kind = request.query_params.get('type', 'invoice')
         if kind not in {'invoice', 'bill'}:
             return Response({'error': 'Choose invoice or bill.'}, status=400)
         profile = self.get_object()
-        contact = Contact(contact_name='Sample customer' if kind == 'invoice' else 'Sample supplier',
-                          phone='9876543210', address='Sample address\nMumbai, Maharashtra')
-        doc = Document(type=kind, doc_id=f'PREVIEW-{kind.upper()}', contact=contact,
-            date=timezone.localdate(), line_items=[{'name': 'Sample product', 'hsn': '0000',
-            'quantity': 2, 'unit': 'pcs', 'rate': 100, 'amount': 200}], total_amount=236,
-            taxes=[{'name': 'Tax', 'percentage': 18}],
-            notes='Sample preview only. This is not a financial document.')
+        doc = Document.objects.filter(type=kind, is_active=True).select_related(
+            'contact', 'consignee', 'reference').order_by('-date', '-created_at').first()
+        if doc is None:
+            doc = Document(type=kind, doc_id='', date=None, total_amount=None)
         context = _build_document_context(doc, profile, request)
         html = render_to_string('accounting/document_print.html', {'documents': [context],
             'print_settings': profile,

@@ -43,7 +43,7 @@ def _contact_display(contact):
 def generate_document_pdf(document, request=None):
     app_settings = Settings.get()
     contacts = tuple(c.updated_at.isoformat() if c else '' for c in (document.contact, document.consignee))
-    cache_key = f'pdf_v2_{document.pk}_{document.updated_at.isoformat()}_{app_settings.updated_at.isoformat()}_{contacts}'
+    cache_key = f'pdf_v3_{document.pk}_{document.updated_at.isoformat()}_{app_settings.updated_at.isoformat()}_{contacts}'
     result = cache.get(cache_key)
     if result:
         return result
@@ -235,10 +235,15 @@ def _render_playwright_pdf(html_string, letterhead=None):
                 await document.fonts.ready;
                 await Promise.all([...document.images].map(image => image.decode().catch(() => {})));
             }""")
+            document_layout = page.locator('[data-document-layout]').count() > 0
+            if document_layout:
+                page.evaluate(Path(__file__).with_name('document_pagination.js').read_text())
+                # Pagination creates new image elements; decode the clones too.
+                page.evaluate('async () => { await Promise.all([...document.images].map(image => image.decode().catch(() => {}))); }')
             pdf_bytes = page.pdf(
                 format=django_settings.PLAYWRIGHT_PDF_FORMAT,
                 print_background=True, prefer_css_page_size=True,
-                display_header_footer=True, header_template='<span></span>',
+                display_header_footer=not document_layout, header_template='<span></span>',
                 footer_template='<div style="font:9px Arial;width:100%;text-align:center;color:#64748b;">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>',
             )
             if letterhead:
@@ -490,6 +495,8 @@ def process_document_create(doc_type, data, contact=None):
         date            = date,
         due_date        = _parse_date(data.get('due_date')) if data.get('due_date') else None,
         payment_terms   = data.get('payment_terms'),
+        place_of_supply = data.get('place_of_supply'),
+        reverse_charge = data.get('reverse_charge'),
         attachment_urls = data.get('attachment_urls', []),
         notes           = data.get('notes'),
     )

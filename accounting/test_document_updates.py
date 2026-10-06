@@ -28,6 +28,18 @@ class DocumentEditTests(TestCase):
         self.assertEqual(self.product.current_stock, -7)
         self.assertFalse(StockTransaction.objects.filter(document=doc,type='record').exists())
 
+    def test_optional_tax_details_can_be_corrected_and_cleared_without_posting_again(self):
+        from .commands import DocumentWriteSerializer, command_data
+        doc = self.create(place_of_supply='Maharashtra (27)', reverse_charge=False)
+        before = list(doc.transactions.values_list('pk', 'amount'))
+        serializer = DocumentWriteSerializer(doc, data={'place_of_supply': None, 'reverse_charge': None}, partial=True)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        update_document(doc, command_data(serializer))
+        doc.refresh_from_db()
+        self.assertIsNone(doc.place_of_supply)
+        self.assertIsNone(doc.reverse_charge)
+        self.assertEqual(list(doc.transactions.values_list('pk', 'amount')), before)
+
     def test_challan_keeps_inventory_responsibility_after_settings_change(self):
         self.settings.enable_challan=True; self.settings.save()
         doc = self.create()

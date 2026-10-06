@@ -2,7 +2,11 @@ import io
 import tempfile
 from pathlib import Path
 from datetime import date
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
+from django.template.loader import render_to_string
+from unittest.mock import patch
+from rest_framework.test import APIClient
+from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from PIL import Image
 from .models import Document
@@ -53,3 +57,59 @@ class DocumentPrintTests(SimpleTestCase):
         file = SimpleUploadedFile('bad.png', b'not an image', content_type='image/png')
         with self.assertRaises(ValueError):
             process_upload(file, 'settings')
+
+    def test_empty_preview_does_not_invent_business_or_amounts(self):
+        doc = Document(type='invoice', doc_id='', date=None, total_amount=None)
+        profile = Settings()
+        context = _build_document_context(doc, profile)
+        html = render_to_string('accounting/document_print.html', {'documents': [context], 'print_settings': profile})
+        self.assertFalse(context['has_total'])
+        for invented in ('Sample', 'Contact not specified', 'Rupees ', 'Date:', 'Authorised signatory', '0.00'):
+            self.assertNotIn(invented, html)
+
+    def test_missing_line_amount_is_derived_only_when_inputs_exist(self):
+        doc = Document(type='invoice', line_items=[{'name': 'Known', 'rate': 12, 'quantity': 2}, {'name': 'Unknown'}])
+        context = _build_document_context(doc, Settings())
+        self.assertEqual(context['line_items'][0]['amount_display'], '24.00')
+        self.assertEqual(context['line_items'][1]['amount_display'], '')
+        self.assertFalse(context['has_line_totals'])
+        self.assertFalse(context['has_total'])
+        doc.line_items = doc.line_items[:1]
+        context = _build_document_context(doc, Settings())
+        self.assertTrue(context['has_total'])
+        self.assertEqual(context['grand_total'], '24.00')
+
+    def test_prints_explicit_reverse_charge_no_without_defaulting_missing_values(self):
+        profile = Settings()
+        doc = Document(type='invoice', place_of_supply='Maharashtra (27)', reverse_charge=False)
+        html = render_to_string('accounting/document_print.html', {'documents': [_build_document_context(doc, profile)], 'print_settings': profile})
+        self.assertIn('Maharashtra (27)', html)
+        self.assertIn('Reverse charge</span><strong>No</strong>', html)
+
+
+class PrintPreviewTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(get_user_model().objects.create_user('print-review'))
+
+    @patch('accounting.services._render_playwright_pdf', return_value=b'%PDF-review')
+    def test_preview_uses_latest_saved_document(self, render):
+        Document.objects.create(type='invoice', doc_id='REAL-42', date=date(2026, 10, 6), total_amount=720)
+        response = self.client.get('/api/settings/print-preview/?type=invoice')
+        self.assertEqual(response.status_code, 200)
+        html = render.call_args.args[0]
+        self.assertIn('REAL-42', html)
+        self.assertIn('720.00', html)
+        self.assertNotIn('Sample', html)
+
+    @patch('accounting.services._render_playwright_pdf', return_value=b'%PDF-review')
+    def test_empty_preview_and_template_choice(self, render):
+        response = self.client.patch('/api/settings/', {'print_template': 'classic'}, format='json')
+        self.assertEqual(response.status_code, 200)
+        response = self.client.get('/api/settings/print-preview/?type=bill')
+        self.assertEqual(response.status_code, 200)
+        html = render.call_args.args[0]
+        self.assertIn('print-page classic', html)
+        self.assertNotIn('Rupees ', html)
+        self.assertNotIn('Sample', html)
+        self.assertEqual(self.client.patch('/api/settings/', {'print_template': 'invalid'}, format='json').status_code, 400)
