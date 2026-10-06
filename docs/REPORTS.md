@@ -79,3 +79,26 @@ The separate GST screen defaults to a month and continues to support any date ra
 Invoice-time discounts reduce taxable value and supply-related incidental charges enter it, consistent with [CGST Section 15](https://taxinformation.cbic.gov.in/content-page/explore-act/1000284/1000001). This discount input is for a discount recorded on that document. It does not reinterpret cash settlement adjustments as an automatic reduction in GST; post-supply discounts need their applicable credit-note/ITC conditions reviewed separately.
 
 Per-item discounts are stored with the existing JSON item details: currency `discount`, or optional `discount_percentage` for that item. Item amounts remain the gross quantity/rate value; each item discount is applied once to produce its net amount. The overall discount then applies to the remaining items subtotal, followed by charges and tax. Per-item GST and HSN allocations use these net values. PDFs show each item's net amount and its own discount detail. Items without discount fields retain their existing calculation. No extra migration is needed for item discount fields.
+
+## Ledgers and document edits
+
+IBFS keeps its existing signed balances. A negative contact balance is receivable (they owe us); a positive contact balance is payable (we owe them). Screen and PDF debit/credit columns interpret those signs consistently:
+
+| Entry | Contact ledger | Payment account ledger |
+| --- | --- | --- |
+| Invoice or debit note | Debit | No cash entry until payment |
+| Bill or credit note | Credit | No cash entry until payment |
+| Receipt / cash receipt voucher | Credit | Debit (money in) |
+| Payment / cash payment voucher | Debit | Credit (money out) |
+| Interest/charge we receive | Debit | No cash entry |
+| Interest/charge we pay | Credit | No cash entry |
+| Waiver while receiving | Credit | No cash entry |
+| Waiver while paying | Debit | No cash entry |
+| Expense payment | No contact debit/credit or balance change | Credit |
+| Account transfer | No contact debit/credit or balance change | Debit in destination, credit in source |
+
+A receipt of 80 plus a waiver of 20 settles an invoice of 100, while cash increases only by 80. A payment of 80 plus a waiver of 20 settles a bill of 100, while cash decreases only by 80. A charge of 20 with a payment/receipt of 100 allocates 80 to the original document and 20 to the charge. Waivers retain the existing `discount` API value for compatibility; document item discounts still use their existing tax-base calculations.
+
+Date ranges are inclusive and invalid ranges return validation errors. Opening and running balances use preceding transactions, including hidden rows and previous pages. Contact reports exclude expenses and transfers from the contact balance; account reports include both in the cash balance. Contact ledger prints include obligations even when automation is enabled. Prints query all matching entries rather than a loaded UI page. An empty period can still show its opening/closing balance.
+
+Editing a contact opening balance changes the starting balance only. Editing a financial document recalculates its obligation and settlement status; real cash payments remain intact. Expected stock is recalculated; automatic stock corrections update quantity and follow the corrected document date. Manual deliveries retain their actual quantities and dates. When challans own inventory, bills/invoices retain that responsibility split. Quotation/order edits remain non-posting.

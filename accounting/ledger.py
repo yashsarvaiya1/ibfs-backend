@@ -5,6 +5,34 @@ from django.db.models.functions import Coalesce
 from .models import FinancialTransaction
 
 
+def ledger_dates(params):
+    from rest_framework import serializers
+    start = serializers.DateField().run_validation(params['date_from']) if params.get('date_from') else None
+    end = serializers.DateField().run_validation(params['date_to']) if params.get('date_to') else None
+    if start and end and start > end:
+        raise serializers.ValidationError({'date_to': 'Choose an end date on or after the start date.'})
+    return start, end
+
+
+def account_opening_balance(account, start=None):
+    rows = FinancialTransaction.objects.filter(payment_account=account)
+    if start:
+        rows = rows.filter(date__gte=start)
+    movement = rows.aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    return account.current_balance - movement
+
+
+def with_running_account_balance(queryset, account):
+    prior = FinancialTransaction.objects.filter(payment_account_id=OuterRef('payment_account_id')).filter(
+        Q(date__lt=OuterRef('date')) |
+        Q(date=OuterRef('date'), created_at__lt=OuterRef('created_at')) |
+        Q(date=OuterRef('date'), created_at=OuterRef('created_at'), pk__lte=OuterRef('pk'))
+    ).values('payment_account_id').annotate(total=Sum('amount')).values('total')
+    field = DecimalField(max_digits=18, decimal_places=2)
+    return queryset.annotate(running_balance=Value(account_opening_balance(account), output_field=field) +
+        Coalesce(Subquery(prior), Value(Decimal('0')), output_field=field))
+
+
 def cf_transactions():
     return FinancialTransaction.objects.exclude(document__type='expense').exclude(type='contra')
 

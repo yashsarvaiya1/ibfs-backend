@@ -403,7 +403,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         params       = self.request.query_params
         app_settings = Settings.get()
 
-        if app_settings.auto_transaction and not params.get('include_records'):
+        if app_settings.auto_transaction and not params.get('include_records') and not (params.get('contact') and self.action == 'print'):
             qs = qs.exclude(type='record')
 
         if params.get('contact') not in (None, ''):
@@ -414,10 +414,12 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(document_id=params['document'])
         if params.get('doc_type') not in (None, ''):
             qs = qs.filter(document__type=params['doc_type'])
-        if params.get('date_from') not in (None, ''):
-            qs = qs.filter(date__gte=params['date_from'])
-        if params.get('date_to') not in (None, ''):
-            qs = qs.filter(date__lte=params['date_to'])
+        from .ledger import ledger_dates
+        date_from, date_to = ledger_dates(params)
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
         if params.get('document_type') not in (None, ''):
             qs = qs.filter(document__type=params['document_type'])
 
@@ -588,57 +590,16 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             except PaymentAccount.DoesNotExist:
                 pass
 
-        # ── Parse date_from ───────────────────────────────────────────────────
-        date_from = None
-        raw_df    = request.query_params.get('date_from')
-        if raw_df not in (None, ''):
-            try:
-                from datetime import date as date_type
-                date_from = date_type.fromisoformat(raw_df)
-            except Exception:
-                pass
-
-        # ── opening_balance_at — contact ledger ───────────────────────────────
-        opening_balance_at = None
-        raw_oba            = request.query_params.get('opening_balance_at')
-        if raw_oba not in (None, ''):
-            try:
-                opening_balance_at = Decimal(raw_oba)
-            except Exception:
-                pass
-        elif contact and is_ledger:
-            opening_balance_at = compute_opening_balance_for_print(contact, date_from)
-
-        # ── balance_before_period — account statement / account ledger ────────
-        balance_before_period = None
-        raw_bbp               = request.query_params.get('balance_before_period')
-        if raw_bbp not in (None, ''):
-            try:
-                balance_before_period = Decimal(raw_bbp)
-            except Exception:
-                pass
-        elif account:
-            if date_from:
-                # Balance just before the filtered window
-                after_sum = (
-                    FinancialTransaction.objects
-                    .filter(payment_account=account, date__gte=date_from)
-                    .aggregate(total=Sum('amount'))['total'] or Decimal('0')
-                )
-                balance_before_period = Decimal(str(account.current_balance)) - after_sum
-            else:
-                # No filter: balance before ALL txns = initial seeded balance
-                all_sum = (
-                    FinancialTransaction.objects
-                    .filter(payment_account=account)
-                    .aggregate(total=Sum('amount'))['total'] or Decimal('0')
-                )
-                balance_before_period = Decimal(str(account.current_balance)) - all_sum
-
-        # For account ledger view, pipe balance_before_period as opening_balance_at
-        # so generate_transactions_pdf can seed running_cf correctly
-        if is_ledger and account and balance_before_period is not None:
-            opening_balance_at = balance_before_period
+        from .ledger import ledger_dates, account_opening_balance, with_running_cf, with_running_account_balance
+        date_from, date_to = ledger_dates(request.query_params)
+        opening_balance_at = compute_opening_balance_for_print(contact, date_from) if contact else None
+        balance_before_period = account_opening_balance(account, date_from) if account else None
+        if is_ledger:
+            if account:
+                opening_balance_at = balance_before_period
+                qs = with_running_account_balance(qs, account)
+            elif contact:
+                qs = with_running_cf(qs, contact.opening_balance)
 
         try:
             pdf_bytes, filename = generate_transactions_pdf(
@@ -649,6 +610,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
                 is_ledger_view        = is_ledger,
                 account               = account,
                 balance_before_period = balance_before_period,
+                date_from = date_from, date_to = date_to,
             )
         except Exception as e:
             return Response(

@@ -94,6 +94,8 @@ def generate_transactions_pdf(
     report_title=None,
     account=None,
     balance_before_period=None,
+    date_from=None,
+    date_to=None,
 ):
     app_settings = Settings.get()
 
@@ -125,16 +127,22 @@ def generate_transactions_pdf(
             'account':    txn.payment_account.name if txn.payment_account else '—',
             'is_expense': is_expense,
             'is_contra':  is_contra,
+            'debit':      affects_cf and (txn.amount > 0 if account else txn.amount < 0),
+            'credit':     affects_cf and (txn.amount < 0 if account else txn.amount > 0),
         }
 
         if is_ledger_view and running_cf is not None:
             # Only advance running_cf for CF-affecting txns (matches frontend)
-            if affects_cf:
+            authoritative = getattr(txn, 'running_balance' if account else 'running_cf', None)
+            if authoritative is not None:
+                running_cf = authoritative
+            elif affects_cf:
                 running_cf += txn.amount
             # Always emit balance (expense rows show unchanged balance, same as frontend)
             row['running_cf']          = str(abs(running_cf).quantize(Decimal('0.01')))
             row['running_cf_positive'] = running_cf > 0
             row['running_cf_zero']     = running_cf == 0
+            row['balance_debit']       = running_cf > 0 if account else running_cf < 0
 
         rows.append(row)
 
@@ -168,10 +176,18 @@ def generate_transactions_pdf(
         'opening_balance_val':   ob_val,
         'opening_balance_pos':   ob_pos,
         'opening_balance_zero':  ob_zero,
+        'opening_balance_debit': (ob_pos if account else not ob_pos) if not ob_zero else False,
+        'date_from': date_from,
+        'date_to': date_to,
+        'closing_balance': str(abs(running_cf).quantize(Decimal('0.01'))) if running_cf is not None else None,
+        'closing_balance_zero': running_cf == 0,
+        'closing_balance_debit': (running_cf > 0 if account else running_cf < 0) if running_cf is not None else False,
         'balance_before_period': (
-            str(Decimal(str(balance_before_period)).quantize(Decimal('0.01')))
+            str(abs(Decimal(str(balance_before_period))).quantize(Decimal('0.01')))
             if balance_before_period is not None else None
         ),
+        'balance_before_period_debit': balance_before_period is not None and Decimal(str(balance_before_period)) > 0,
+        'balance_before_period_zero': balance_before_period is not None and Decimal(str(balance_before_period)) == 0,
     }
 
     html_string = render_to_string('accounting/transactions_print.html', context)

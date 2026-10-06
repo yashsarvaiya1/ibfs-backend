@@ -120,8 +120,8 @@ class ContactViewSet(viewsets.ModelViewSet):
         )
 
         # ── Filters (TV-02) ───────────────────────────────────────────────────
-        date_from = params.get('date_from')
-        date_to   = params.get('date_to')
+        from accounting.ledger import ledger_dates, cf_transactions
+        date_from, date_to = ledger_dates(params)
 
         if date_from:
             qs = qs.filter(date__gte=date_from)
@@ -139,10 +139,7 @@ class ContactViewSet(viewsets.ModelViewSet):
         opening_balance_at = contact.opening_balance
         if date_from:
             pre_sum = (
-                FinancialTransaction.objects
-                .filter(contact=contact, date__lt=date_from)
-                .exclude(document__type='expense')
-                .select_related('document')
+                cf_transactions().filter(contact=contact, date__lt=date_from)
                 .aggregate(total=Sum('amount'))['total'] or Decimal('0')
             )
             opening_balance_at = contact.opening_balance + pre_sum
@@ -269,17 +266,20 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
 
         account = self.get_object()
         params  = request.query_params
+        from accounting.ledger import ledger_dates, account_opening_balance, with_running_account_balance
 
         qs = (
             FinancialTransaction.objects
             .filter(payment_account=account)
-            .select_related('document', 'contact')
+            .select_related('document', 'contact', 'payment_account')
             .prefetch_related('allocations__document')
             .order_by('-date', '-created_at', '-pk')
         )
+        if params.get('view') == 'ledger':
+            qs = qs.order_by('date', 'created_at', 'pk')
+        qs = with_running_account_balance(qs, account)
 
-        date_from = params.get('date_from')
-        date_to   = params.get('date_to')
+        date_from, date_to = ledger_dates(params)
 
         if date_from:
             qs = qs.filter(date__gte=date_from)
@@ -292,14 +292,7 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
 
         # balance_before_period = current_balance − sum of txns from date_from onwards
         # so frontend can show the opening balance for the printed/viewed period
-        balance_before = account.current_balance
-        if date_from:
-            from_sum = (
-                FinancialTransaction.objects
-                .filter(payment_account=account, date__gte=date_from)
-                .aggregate(total=Sum('amount'))['total'] or Decimal('0')
-            )
-            balance_before = account.current_balance - from_sum
+        balance_before = account_opening_balance(account, date_from)
 
         page = self.paginate_queryset(qs)
         if page is not None:
