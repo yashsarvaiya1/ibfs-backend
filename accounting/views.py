@@ -23,6 +23,8 @@ from shared.models import Contact, PaymentAccount, Settings
 from inventory.models import StockTransaction, Product
 from django.db import transaction
 from .workflows import OUTGOING_TYPES
+from .commands import DocumentWriteSerializer, command_data
+from .document_updates import update_document
 
 HAS_BALANCE_TYPES = {'bill', 'invoice', 'cn', 'dn'}
 
@@ -119,76 +121,22 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
 
     def create(self, request, *args, **kwargs):
-        doc_type = request.data.get('type')
-        BLOCKED_DIRECT = {'cash_payment_voucher', 'cash_receipt_voucher'}
-        if doc_type in BLOCKED_DIRECT:
-            return Response(
-                {'error': f'{doc_type} can only be created via Send/Receive flow.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        contact_id = request.data.get('contact')
-        contact    = Contact.objects.get(pk=contact_id) if contact_id else None
-        doc        = process_document_create(doc_type, request.data, contact)
-        return Response(
-            DocumentSerializer(doc, context={'request': request}).data,
-            status=status.HTTP_201_CREATED,
-        )
+        serializer = DocumentWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = command_data(serializer)
+        doc_type = data['type']
+        if doc_type in {'cash_payment_voucher', 'cash_receipt_voucher', 'interest'}:
+            return Response({'error': 'Use the payment or interest action to create this document.'}, status=400)
+        feature = {'po':'enable_po', 'pi':'enable_pi', 'quotation':'enable_quotation',
+                   'challan':'enable_challan', 'cn':'enable_cn', 'dn':'enable_dn'}.get(doc_type)
+        if feature and not getattr(Settings.get(), feature):
+            return Response({'error': 'Enable this document type in Settings first.'}, status=400)
+        contact = serializer.validated_data.get('contact')
+        doc = process_document_create(doc_type, data, contact)
+        return Response(DocumentSerializer(doc, context={'request': request}).data, status=201)
 
-
-    @transaction.atomic
     def update(self, request, *args, **kwargs):
-        doc              = self.get_object()
-        old_total_amount = Decimal(str(doc.total_amount)) if doc.total_amount is not None else None
-        old_date         = doc.date
-        old_contact      = doc.contact      # ← capture before any mutation
-
-        # DI-01: editable doc_id — validate uniqueness before saving
-        if 'doc_id' in request.data:
-            new_doc_id = request.data['doc_id']
-            if new_doc_id != doc.doc_id:
-                if Document.objects.filter(doc_id=new_doc_id).exclude(pk=doc.pk).exists():
-                    return Response(
-                        {
-                            'error':    f'Document ID "{new_doc_id}" already exists.',
-                            'conflict': True,
-                        },
-                        status=status.HTTP_409_CONFLICT,
-                    )
-                doc.doc_id = new_doc_id
-
-        simple_fields = [
-            'notes', 'payment_terms', 'attachment_urls',
-            'charges', 'taxes', 'discount', 'total_amount',
-        ]
-        for field in simple_fields:
-            if field in request.data:
-                setattr(doc, field, request.data[field])
-
-        # ← contact change: resolve to object (or None if cleared)
-        if 'contact' in request.data:
-            contact_id  = request.data['contact']
-            doc.contact = Contact.objects.get(pk=contact_id) if contact_id else None
-
-        if 'consignee' in request.data:
-            doc.consignee_id = request.data['consignee']
-        if 'reference' in request.data:
-            doc.reference_id = request.data['reference']
-
-        if 'date' in request.data:
-            doc.date = _parse_date(request.data['date'])
-        if 'due_date' in request.data:
-            raw_due      = request.data['due_date']
-            doc.due_date = _parse_date(raw_due) if raw_due else None
-
-        new_line_items = request.data.get('line_items')
-        if new_line_items is not None:
-            doc.line_items = new_line_items
-            _sync_record_stxns(doc, new_line_items)
-
-        doc.save()
-        _sync_record_ftxns(doc, old_total_amount, old_date)
-        _sync_ftxn_contact(doc, old_contact)    # ← propagates contact change + MCD
-
+        doc = update_document(self.get_object(), request.data)
         return Response(DocumentSerializer(doc, context={'request': request}).data)
 
 
@@ -307,67 +255,14 @@ class DocumentViewSet(viewsets.ModelViewSet):
     # ── Stock Preview ─────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
     def stock_preview(self, request, pk=None):
-        doc     = self.get_object()
-        records = StockTransaction.objects.filter(
-            document=doc, type='record'
-        ).select_related('product')
-
-        if not records.exists():
-            return Response([])
-
-        actuals_map = {
-            a['product_id']: abs(a['total'] or Decimal('0'))
-            for a in StockTransaction.objects.filter(
-                document=doc, type='actual'
-            ).values('product_id').annotate(total=Sum('quantity'))
-        }
-
-        preview = []
-        for r in records:
-            record_qty = abs(r.quantity)
-            moved      = actuals_map.get(r.product_id, Decimal('0'))
-            remaining  = record_qty - moved
-            preview.append({
-                'product_id':    r.product_id,
-                'product_name':  r.product.name,
-                'record_qty':    str(record_qty),
-                'moved_qty':     str(moved),
-                'remaining_qty': str(max(remaining, Decimal('0'))),
-            })
-        return Response(preview)
-
+        from .stock_status import document_stock_status
+        return Response(document_stock_status(self.get_object()))
 
     # ── Add Details ───────────────────────────────────────────────────────────
     @action(detail=True, methods=['post'])
     def add_details(self, request, pk=None):
-        doc        = self.get_object()
-        line_items = request.data.get('line_items', [])
-
-        doc.line_items = line_items
-        if not doc.total_amount:
-            doc.total_amount = sum(Decimal(str(i.get('amount', 0))) for i in line_items)
-        doc.save(update_fields=['line_items', 'total_amount', 'updated_at'])
-
-        if doc.type == 'challan' and doc.reference:
-            sign = CHALLAN_STXN_SIGN.get(doc.reference.type, Decimal('1'))
-        else:
-            sign = STXN_SIGN.get(doc.type, Decimal('1'))
-
-        for item in line_items:
-            pid = item.get('product_id')
-            if not pid:
-                continue
-            try:
-                product = Product.objects.get(pk=pid)
-            except Product.DoesNotExist:
-                continue
-            if StockTransaction.objects.filter(document=doc, product=product).exists():
-                continue
-            qty = sign * Decimal(str(item.get('quantity', 0)))
-            _create_stxn('record', qty, product, doc, doc.date, item.get('rate'))
-
+        doc = update_document(self.get_object(), {'line_items':request.data.get('line_items', [])}, preserve_total=True)
         return Response(DocumentSerializer(doc, context={'request': request}).data)
-
 
     # ── Reference Data ────────────────────────────────────────────────────────
     @action(detail=True, methods=['get'])
@@ -465,90 +360,6 @@ class DocumentViewSet(viewsets.ModelViewSet):
         response = HttpResponse(pdf_bytes, content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
         return response
-
-
-# ─── _sync_record_stxns ───────────────────────────────────────────────────────
-
-
-def _sync_record_stxns(doc, new_line_items):
-    if doc.type == 'challan' and doc.reference:
-        sign = CHALLAN_STXN_SIGN.get(doc.reference.type, Decimal('1'))
-    else:
-        sign = STXN_SIGN.get(doc.type, Decimal('1'))
-
-    new_map = {
-        int(item['product_id']): Decimal(str(item.get('quantity', 0)))
-        for item in new_line_items
-        if item.get('product_id')
-    }
-
-    existing_records = StockTransaction.objects.filter(document=doc, type='record')
-    existing_map     = {r.product_id: r for r in existing_records}
-
-    for pid, stxn in existing_map.items():
-        if pid not in new_map:
-            stxn.delete()
-
-    for pid, qty in new_map.items():
-        signed_qty = sign * qty
-        if pid in existing_map:
-            stxn = existing_map[pid]
-            if stxn.quantity != signed_qty:
-                stxn.quantity = signed_qty
-                stxn.save(update_fields=['quantity', 'updated_at'])
-        else:
-            try:
-                product = Product.objects.get(pk=pid)
-            except Product.DoesNotExist:
-                continue
-            _create_stxn('record', signed_qty, product, doc, doc.date)
-
-
-# ─── _sync_record_ftxns ───────────────────────────────────────────────────────
-
-
-def _sync_record_ftxns(doc, old_total_amount, old_date):
-    try:
-        new_total_amount = Decimal(str(doc.total_amount)) if doc.total_amount is not None else None
-    except Exception:
-        new_total_amount = None
-
-    amount_changed = (
-        old_total_amount is not None
-        and new_total_amount is not None
-        and old_total_amount != new_total_amount
-    )
-    date_changed = (old_date != doc.date)
-
-    if not (amount_changed or date_changed):
-        return
-
-    record_ftxns = FinancialTransaction.objects.filter(document=doc, type='record')
-
-    for ftxn in record_ftxns:
-        update_fields = ['updated_at']
-
-        if amount_changed and new_total_amount is not None:
-            sign            = Decimal('1') if ftxn.amount >= 0 else Decimal('-1')
-            new_ftxn_amount = sign * new_total_amount
-            if ftxn.amount != new_ftxn_amount:
-                ftxn.amount = new_ftxn_amount
-                update_fields.append('amount')
-
-        if date_changed:
-            ftxn.date = doc.date
-            update_fields.append('date')
-
-        if len(update_fields) > 1:
-            ftxn.save(update_fields=update_fields)
-
-    if doc.contact_id:
-        _recalculate_mcd(doc.contact, doc.date)
-        if date_changed and (
-            old_date.month != doc.date.month
-            or old_date.year != doc.date.year
-        ):
-            _recalculate_mcd(doc.contact, old_date)
 
 
 # ─── FinancialTransaction ViewSet ─────────────────────────────────────────────

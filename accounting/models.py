@@ -43,6 +43,8 @@ class Document(BaseModel):
     attachment_urls = models.JSONField(default=list, blank=True)
     notes           = models.TextField(blank=True, null=True)
     is_active       = models.BooleanField(default=True)
+    stock_mode = models.CharField(max_length=10, null=True, blank=True,
+        choices=[('none', 'No stock'), ('record', 'Move stock later'), ('actual', 'Automatic stock')])
     # Manual paid flag — display only, no f.txn / balance effect
     is_paid         = models.BooleanField(default=False)
 

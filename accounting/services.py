@@ -13,7 +13,7 @@ from django.core.cache import cache
 from django.conf import settings as django_settings
 from .calculations import document_totals
 from .printing import document_context, media_data_url
-from .workflows import FINANCIAL_SIGNS, STOCK_SIGNS, NON_POSTING_TYPES
+from .workflows import FINANCIAL_SIGNS, STOCK_SIGNS, NON_POSTING_TYPES, stock_mode
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -443,7 +443,9 @@ def _handle_stxns(doc, line_items, sign, app_settings, date):
         except Product.DoesNotExist:
             continue
         qty      = sign * Decimal(str(item.get('quantity', 0)))
-        txn_type = 'actual' if app_settings.auto_stock else 'record'
+        txn_type = doc.stock_mode or ('actual' if app_settings.auto_stock else 'record')
+        if txn_type == 'none':
+            continue
         _create_stxn(txn_type, qty, product, doc, date, item.get('rate'))
 
 
@@ -464,10 +466,12 @@ def process_document_create(doc_type, data, contact=None):
     line_items   = data.get('line_items', [])
     total_amount = data.get('total_amount')
 
-    if not total_amount and line_items:
-        total_amount = _resolve_total(data)
+    if line_items and doc_type != 'challan':
+        total_amount = _resolve_total({**data, 'type': doc_type})
 
+    reference = Document.objects.filter(pk=data.get('reference')).first() if data.get('reference') else None
     doc = Document.objects.create(
+        stock_mode      = stock_mode(doc_type, app_settings, reference.type if reference else None),
         type            = doc_type,
         doc_id          = data.get('doc_id') or _next_doc_id(doc_type),
         contact         = contact,
@@ -638,49 +642,37 @@ def process_move_stock(document, data):
     """
     from inventory.models import StockTransaction, Product
 
-    date        = _parse_date(data.get('date'))
-    items       = data.get('items', [])
-    product_ids = [int(item['product_id']) for item in items]
-
-    if document.type == 'challan' and document.reference:
-        sign = CHALLAN_STXN_SIGN.get(document.reference.type, Decimal('1'))
-    else:
-        sign = STXN_SIGN.get(document.type, Decimal('1'))
-
-    # Single aggregation per type — no per-product queries (BF-06)
-    record_map = {
-        r['product_id']: abs(r['total'] or Decimal('0'))
-        for r in StockTransaction.objects.filter(
-            document=document, type='record', product_id__in=product_ids
-        ).values('product_id').annotate(total=Sum('quantity'))
-    }
-    actual_map = {
-        a['product_id']: abs(a['total'] or Decimal('0'))
-        for a in StockTransaction.objects.filter(
-            document=document, type='actual', product_id__in=product_ids
-        ).values('product_id').annotate(total=Sum('quantity'))
-    }
-    products = {p.pk: p for p in Product.objects.filter(pk__in=product_ids)}
-
+    from rest_framework.exceptions import ValidationError
+    from .calculations import decimal_value
+    from .stock_status import document_stock_status
+    document = Document.objects.select_for_update().get(pk=document.pk)
+    if not document.is_active:
+        raise ValidationError({'document':'This document has been deleted.'})
+    date = _parse_date(data.get('date'))
+    quantities = {}
+    for item in data.get('items', []):
+        try:
+            pid = int(item['product_id'])
+            quantity = decimal_value(item['quantity'])
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValidationError({'items':'Choose a product and a valid quantity.'}) from exc
+        if quantity <= 0:
+            raise ValidationError({'items':'Quantity must be greater than zero.'})
+        quantities[pid] = quantities.get(pid, Decimal('0')) + quantity
+    statuses = {row['product_id']:row for row in document_stock_status(document)}
+    if set(quantities) - statuses.keys():
+        raise ValidationError({'items':'Choose products with expected stock on this document.'})
+    products = {p.pk:p for p in Product.objects.filter(pk__in=quantities)}
     created = []
-    for item in items:
-        pid           = int(item['product_id'])
-        requested_qty = Decimal(str(item['quantity']))
-        product       = products.get(pid)
-        if not product:
+    for pid in sorted(quantities):
+        row = statuses[pid]
+        quantity = min(quantities[pid], Decimal(row['remaining_qty']))
+        if quantity <= 0:
             continue
-
-        record_qty  = record_map.get(pid, Decimal('0'))
-        actual_qty  = actual_map.get(pid, Decimal('0'))
-        remaining   = record_qty - actual_qty
-        qty_to_move = min(requested_qty, remaining)
-        if qty_to_move <= 0:
-            continue
-
-        stxn = _create_stxn('actual', sign * qty_to_move, product, document, date)
-        created.append({'product': pid, 'quantity': str(qty_to_move), 'stxn': stxn.pk})
-
-    return {'moved': created}
+        sign = Decimal('1') if row['direction'] == 'in' else Decimal('-1')
+        stxn = _create_stxn('actual', sign*quantity, products[pid], document, date)
+        created.append({'product':pid, 'quantity':str(quantity), 'stxn':stxn.pk})
+    return {'moved':created}
 
 
 # ─── Document Delete ──────────────────────────────────────────────────────────

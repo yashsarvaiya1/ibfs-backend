@@ -154,44 +154,5 @@ class DocumentSerializer(serializers.ModelSerializer):
         }
 
     def get_stock_status(self, obj):
-        """
-        BF-06 fix: replaced per-product loop queries with a single aggregation.
-        Was: 1 DB query per product inside the loop = N+1
-        Now: 1 query for all record s.txns + 1 aggregation for all actual s.txns = 2 total
-        """
-        from inventory.models import StockTransaction
-
-        NO_STOCK_TYPES = {
-            'po', 'pi', 'quotation', 'interest', 'expense',
-            'cash_payment_voucher', 'cash_receipt_voucher',
-        }
-        if obj.type in NO_STOCK_TYPES:
-            return None
-
-        records = StockTransaction.objects.filter(
-            document=obj, type='record'
-        ).select_related('product')
-        if not records.exists():
-            return None
-
-        # Single aggregation for all actual s.txns on this document (BF-06)
-        actuals_map = {
-            a['product_id']: abs(a['total'] or Decimal('0'))
-            for a in StockTransaction.objects.filter(
-                document=obj, type='actual'
-            ).values('product_id').annotate(total=Sum('quantity'))
-        }
-
-        result = []
-        for r in records:
-            record_qty = abs(r.quantity)
-            moved      = actuals_map.get(r.product_id, Decimal('0'))
-            result.append({
-                'product_id':    r.product_id,
-                'product_name':  r.product.name,
-                'record_qty':    str(record_qty),
-                'moved_qty':     str(moved),
-                'remaining_qty': str(record_qty - moved),
-                'is_moved':      moved >= record_qty,
-            })
-        return result
+        from .stock_status import document_stock_status
+        return document_stock_status(obj) or None
