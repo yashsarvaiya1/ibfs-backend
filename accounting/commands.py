@@ -14,6 +14,7 @@ class EditConflict(APIException):
 
 
 class DocumentWriteSerializer(serializers.ModelSerializer):
+    require_line_description = True
     discount_percentage = serializers.DecimalField(max_digits=7, decimal_places=4, min_value=Decimal('0'), max_value=Decimal('100'), required=False, allow_null=True)
     payment_account = serializers.PrimaryKeyRelatedField(queryset=PaymentAccount.objects.filter(is_active=True), required=False, allow_null=True)
     expected_updated_at = serializers.DateTimeField(required=False, write_only=True)
@@ -31,7 +32,7 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
         product_ids = set()
         rows = []
         for item in value:
-            if not isinstance(item, dict) or not str(item.get('name', '')).strip():
+            if not isinstance(item, dict) or (self.require_line_description and not str(item.get('name', '')).strip()):
                 raise serializers.ValidationError('Every line needs a description.')
             row = dict(item)
             try:
@@ -144,6 +145,11 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
         if values['discount_percentage'] is not None and not values['line_items']:
             raise serializers.ValidationError({'discount_percentage': 'Percentage discount requires item details.'})
         return attrs
+
+
+class DocumentTotalsPreviewSerializer(DocumentWriteSerializer):
+    """Calculate unfinished form rows without weakening document save validation."""
+    require_line_description = False
 
 
 def command_data(serializer):

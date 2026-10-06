@@ -234,9 +234,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def preview_totals(self, request):
-        from .commands import DocumentWriteSerializer, command_data
+        from .commands import DocumentTotalsPreviewSerializer, command_data
         from .calculations import document_totals
-        serializer = DocumentWriteSerializer(data=request.data)
+        serializer = DocumentTotalsPreviewSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         return Response(document_totals(command_data(serializer), request.data.get('type')))
 
