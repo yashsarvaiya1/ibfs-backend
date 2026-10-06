@@ -46,3 +46,5 @@ Keep the existing frontend Compose project and private `.env`, including its Pos
 - [Completed work, deferred scope and VM handoff](docs/IMPROVEMENT_CHECKLIST.md)
 
 Actual production migration, credential rotation, backups and deployment were skipped at the user's request. No GST filing, third-party validation, IRN generation or bank-feed integration is included.
+
+Detailed documents support amount or percentage discounts before GST, using the backend preview for displayed totals. Saved percentage discounts recalculate on item edits; the currency deduction is retained for existing posting/report logic. FY business activity and GST date-range reports are separate, each with PDF/CSV exports. See `docs/REPORTS.md` for their calculation basis. Startup applies the additive `0012_document_discount_percentage` migration automatically.

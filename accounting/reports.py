@@ -155,7 +155,7 @@ def gst_document_row(doc):
             if any(not isinstance(item, dict) or item.get('amount') is None for item in doc.line_items):
                 raise ValueError('Missing saved line amount')
             totals = document_totals({'line_items': doc.line_items, 'charges': doc.charges,
-                                      'discount': doc.discount, 'taxes': doc.taxes, 'tax_mode': doc.tax_mode}, doc.type)
+                                      'discount': doc.discount, 'discount_percentage': doc.discount_percentage, 'taxes': doc.taxes, 'tax_mode': doc.tax_mode}, doc.type)
             taxable = totals['taxable_amount'] * sign
             values['taxable_amount'] = taxable
             if totals['taxable_amount'] < 0 or any(t['percentage'] < 0 or t['percentage'] > 100 for t in totals['taxes']):
@@ -292,6 +292,21 @@ class ReportViewSet(viewsets.ViewSet):
             filename=f"CA_Documents_{filters['date_from']}_{filters['date_to']}.pdf")
         response['X-Document-Count'] = str(count)
         return response
+
+    @action(detail=False, methods=['get'])
+    def financial_year(self, request):
+        from .financial_year import financial_year_report
+        today = timezone.localdate()
+        year = serializers.IntegerField(min_value=1900, max_value=9998).run_validation(request.query_params.get('fy', today.year if today.month >= 4 else today.year - 1))
+        return Response(financial_year_report(year))
+
+    @action(detail=False, methods=['get'])
+    def financial_year_export(self, request):
+        from .financial_year import financial_year_export
+        today = timezone.localdate()
+        year = serializers.IntegerField(min_value=1900, max_value=9998).run_validation(request.query_params.get('fy', today.year if today.month >= 4 else today.year - 1))
+        format = serializers.ChoiceField(choices=['csv', 'pdf']).run_validation(request.query_params.get('export_format', 'pdf'))
+        return financial_year_export(year, format)
 
     @action(detail=False, methods=['get'])
     def gst(self, request):

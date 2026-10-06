@@ -65,3 +65,15 @@ Inventory → Print report → Generate PDF → Save PDF downloads current quant
 Open a product → Ledger History → Print to choose optional inclusive dates and download its ledger. Stock history also offers product/type/date filters and Print history. Expected movements print as `(+5.00)` / `(-5.00)`; physical movements print as `+5.00` / `-5.00`. Only physical movements affect running/opening/closing stock. Period balances include all physical movements even when the displayed rows are further filtered, and closing stock remains visible when the final row is expected or the period is empty. The header's current stock is today's saved quantity; closing stock belongs to the selected period.
 
 Global history prints product names and each product's unit without a combined balance across products. Selecting several products for separate ledgers in one PDF is not implemented; the Inventory multi-selection export is a current-quantity snapshot.
+
+## Separate financial-year business report
+
+`GET /api/reports/financial_year/?fy=2026` summarizes 1 April 2026 through 31 March 2027. It shows invoices less credit notes, bills less debit notes, expense documents, document counts and all twelve monthly activity rows. Document totals include tax; calculable pre-tax figures are shown separately and amount-only or inconsistent documents are listed for review. Actual account receipts/payments follow cash movement dates and exclude internal transfers, record-only entries, quotations, orders and challans. This is a business activity summary, not a profit/COGS calculation or a GST return. PDF/CSV exports use `/api/reports/financial_year_export/` with the same `fy` and `export_format=pdf|csv`.
+
+The separate GST screen defaults to a month and continues to support any date range (including a full FY). It accumulates recorded sales/purchase GST after credit/debit notes, with reverse charge, unclassified tax and review exclusions separately visible. Purchase tax is not automatically eligible ITC and book GST difference is not tax payable.
+
+## Invoice discounts and charges
+
+`discount` remains the saved currency deduction. Optional `discount_percentage` preserves a rate from 0 to 100; the backend calculates its deduction from the items subtotal, rounds it to cents, then applies charges and tax. Existing documents default to amount mode. Percentage mode requires item details; clearing the percentage selects amount mode. Changing items recalculates a saved percentage. Preview, posting, edits, PDFs and GST/HSN reports share this Decimal calculation. Document charges and discounts continue to be allocated proportionally across per-item taxable bases, conserving cents.
+
+Invoice-time discounts reduce taxable value and supply-related incidental charges enter it, consistent with [CGST Section 15](https://taxinformation.cbic.gov.in/content-page/explore-act/1000284/1000001). This discount input is for a discount recorded on that document. It does not reinterpret cash settlement adjustments as an automatic reduction in GST; post-supply discounts need their applicable credit-note/ITC conditions reviewed separately.
