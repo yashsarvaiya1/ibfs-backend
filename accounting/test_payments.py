@@ -143,3 +143,16 @@ class PaymentFlowTests(TestCase):
         response=self.client.post('/api/documents/',{'type':'invoice','contact':self.contact.pk,'date':'2026-01-01',
             'line_items':[{'name':'Item','quantity':1,'rate':10,'amount':10}],'discount':20},format='json')
         self.assertEqual(response.status_code,400,response.data)
+
+    def test_transfer_pair_reverses_once_and_keeps_history(self):
+        other=PaymentAccount.objects.create(name='Bank',type='bank',current_balance=0)
+        response=self.client.post('/api/accounts/transfer/',{'from_account':self.account.pk,'to_account':other.pk,'amount':100},format='json')
+        self.assertEqual(response.status_code,201,response.data)
+        payment=self.account.transactions.get(type='contra')
+        response=self.client.post(f'/api/transactions/{payment.pk}/reverse_transfer/',{},format='json')
+        self.assertEqual(response.status_code,200,response.data)
+        self.account.refresh_from_db();other.refresh_from_db()
+        self.assertEqual(self.account.current_balance,1000)
+        self.assertEqual(other.current_balance,0)
+        self.assertEqual(FinancialTransaction.objects.filter(type='contra').count(),4)
+        self.assertEqual(self.client.post(f'/api/transactions/{payment.pk}/reverse_transfer/',{},format='json').status_code,400)

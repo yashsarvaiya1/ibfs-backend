@@ -73,6 +73,8 @@ class FinancialTransaction(BaseModel):
         on_delete=models.SET_NULL, related_name="transactions",
     )
     notes                    = models.TextField(blank=True, null=True)
+    transfer_group = models.UUIDField(null=True,blank=True,db_index=True)
+    is_reversed = models.BooleanField(default=False)
     monthly_cumulative_delta = models.DecimalField(max_digits=15, decimal_places=2, default=0)
 
     class Meta:

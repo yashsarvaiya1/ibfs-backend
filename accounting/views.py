@@ -355,6 +355,11 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(payment).data)
 
 
+    @action(detail=True,methods=['post'])
+    def reverse_transfer(self,request,pk=None):
+        from .services import reverse_transfer
+        return Response(reverse_transfer(self.get_object()))
+
     def get_serializer_context(self):
         return {'request': self.request}
 

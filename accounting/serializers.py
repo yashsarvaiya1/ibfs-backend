@@ -27,7 +27,7 @@ class FinancialTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model  = FinancialTransaction
         fields = '__all__'
-        read_only_fields = ['monthly_cumulative_delta']
+        read_only_fields = ['monthly_cumulative_delta','transfer_group','is_reversed']
 
     def validate(self, attrs):
         document = attrs.get('document', self.instance.document if self.instance else None)

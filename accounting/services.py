@@ -648,8 +648,11 @@ def process_transfer(data):
     date     = _parse_date(data.get('date'))
     from_acc = PaymentAccount.objects.get(pk=data['from_account'])
     to_acc   = PaymentAccount.objects.get(pk=data['to_account'])
-    _create_ftxn('contra', -amount, None, from_acc, None, date)
-    _create_ftxn('contra',  amount, None, to_acc,   None, date)
+    import uuid
+    group=uuid.uuid4()
+    outgoing=_create_ftxn('contra', -amount, None, from_acc, None, date)
+    incoming=_create_ftxn('contra', amount, None, to_acc, None, date)
+    FinancialTransaction.objects.filter(pk__in=[outgoing.pk,incoming.pk]).update(transfer_group=group)
     return {'from': data['from_account'], 'to': data['to_account'], 'amount': str(amount)}
 
 
@@ -1001,3 +1004,25 @@ def _sync_ftxn_contact(doc, old_contact):
     if new_contact:
         for date in affected_dates:
             _recalculate_mcd(new_contact, date)
+
+
+@transaction.atomic
+def reverse_transfer(payment):
+    from rest_framework.exceptions import ValidationError
+    import uuid
+    if payment.type!='contra' or not payment.transfer_group:
+        raise ValidationError({'transfer':'This historical entry has no stored transfer pair. Use a balance reconciliation after reviewing both accounts.'})
+    snapshot=list(FinancialTransaction.objects.filter(transfer_group=payment.transfer_group))
+    list(PaymentAccount.objects.select_for_update().filter(pk__in=[row.payment_account_id for row in snapshot]).order_by('pk'))
+    rows=list(FinancialTransaction.objects.select_for_update(of=('self',)).filter(transfer_group=payment.transfer_group).select_related('payment_account'))
+    if len(rows)!=2 or any(row.is_reversed or row.type!='contra' or not row.payment_account for row in rows) or sum(row.amount for row in rows)!=0:
+        raise ValidationError({'transfer':'This transfer is already reversed or its pair is incomplete.'})
+    group=uuid.uuid4()
+    for row in rows:
+        reversal=_create_ftxn('contra',-row.amount,None,row.payment_account,None,timezone.localdate(),notes='Transfer reversal')
+        # A reversal is retained as history; it cannot itself be reversed repeatedly.
+        reversal.transfer_group=group
+        reversal.is_reversed=True
+        reversal.save(update_fields=['transfer_group','is_reversed','updated_at'])
+    FinancialTransaction.objects.filter(pk__in=[row.pk for row in rows]).update(is_reversed=True,updated_at=timezone.now())
+    return {'status':'reversed','transfer_group':str(payment.transfer_group)}
