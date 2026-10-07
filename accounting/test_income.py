@@ -80,7 +80,7 @@ class IncomeTests(TestCase):
         allocation = payment.allocations.get()
         for method in (self.client.patch, self.client.put):
             response = method(f'/api/transactions/{payment.pk}/', {
-                'document': income.pk, 'amount': 999, 'date': '2026-11-01',
+                'type': 'actual', 'document': income.pk, 'amount': 999, 'date': '2026-11-01',
                 'payment_account': self.other.pk, 'notes': 'Should not be saved',
             }, format='json')
             self.assertEqual(response.status_code, 400, response.data)
