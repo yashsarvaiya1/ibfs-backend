@@ -4,8 +4,8 @@ from decimal import Decimal
 from .models import Document, FinancialTransaction
 from .calculations import document_totals, money
 
-MEASURES = ('sales', 'sales_returns', 'purchases', 'purchase_returns', 'expenses', 'cash_received', 'cash_paid')
-DOC_MEASURES = {'invoice': 'sales', 'cn': 'sales_returns', 'bill': 'purchases', 'dn': 'purchase_returns', 'expense': 'expenses'}
+MEASURES = ('sales', 'sales_returns', 'purchases', 'purchase_returns', 'expenses', 'other_income', 'cash_received', 'cash_paid')
+DOC_MEASURES = {'invoice': 'sales', 'cn': 'sales_returns', 'bill': 'purchases', 'dn': 'purchase_returns', 'expense': 'expenses', 'income': 'other_income'}
 
 
 def financial_year_report(year):
@@ -39,7 +39,7 @@ def financial_year_report(year):
     def text(values):
         return {key: str(money(value)) for key, value in values.items()}
     return {'fy': year, 'date_from': start.isoformat(), 'date_to': end.isoformat(),
-            'basis': 'Active invoices less credit notes, bills less debit notes, and expense documents dated in Apr–Mar. Document values include tax. Cash follows actual bank/cash/UPI movement dates and excludes internal transfers. Orders, quotations and challans are excluded. This activity summary does not calculate profit, cost of goods sold or eligible ITC.',
+            'basis': 'Active invoices less credit notes, bills less debit notes, expense documents and separately recorded other income dated in Apr–Mar. Document values include tax. Other income is the receipt amount entered, not a calculated investment profit. Cash follows actual bank/cash/UPI movement dates and excludes internal transfers. Orders, quotations and challans are excluded. This activity summary does not calculate profit, cost of goods sold or eligible ITC.',
             'totals': text({**totals, 'net_sales': totals['sales'] - totals['sales_returns'], 'net_purchases': totals['purchases'] - totals['purchase_returns']}),
             'known_pre_tax': text({**base, 'net_sales': base['sales'] - base['sales_returns'], 'net_purchases': base['purchases'] - base['purchase_returns']}),
             'document_counts': counts, 'review': missing,
@@ -49,7 +49,7 @@ def financial_year_report(year):
 def financial_year_export(year, format):
     from .report_exports import csv_response
     report = financial_year_report(year)
-    labels = {'net_sales': 'Sales less credit notes (including tax)', 'net_purchases': 'Purchases less debit notes (including tax)', 'expenses': 'Expense documents (including tax)', 'cash_received': 'Cash received', 'cash_paid': 'Cash paid'}
+    labels = {'net_sales': 'Sales less credit notes (including tax)', 'net_purchases': 'Purchases less debit notes (including tax)', 'expenses': 'Expense documents (including tax)', 'other_income': 'Other income receipts', 'cash_received': 'Cash received', 'cash_paid': 'Cash paid'}
     if format == 'csv':
         rows = [['Financial year', f'{year}-{year + 1}'], ['Basis', report['basis']], ['Metric', 'Amount']]
         rows += [[label, Decimal(report['totals'][key])] for key, label in labels.items()]

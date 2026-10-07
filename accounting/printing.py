@@ -103,6 +103,6 @@ def document_context(document, app_settings, contact_display):
         'doc_type_label': document.get_type_display(),
         'is_simple_line_type': document.type in SIMPLE_LINE_TYPES,
         'is_challan': document.type == 'challan', 'is_vendor_doc': vendor,
-        'party_label': 'Supplier' if vendor else 'Bill to',
+        'party_label': 'Income source' if document.type == 'income' else 'Paid to' if document.type == 'expense' else 'Supplier' if vendor else 'Bill to',
         'business_label': 'Buyer' if vendor else 'Issued by',
     }

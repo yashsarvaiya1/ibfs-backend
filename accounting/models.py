@@ -18,6 +18,7 @@ class Document(BaseModel):
         ("cash_receipt_voucher", "Cash Receipt Voucher"),
         ("interest",             "Interest"),
         ("expense",              "Expense"),
+        ("income",               "Income"),
     ]
     type            = models.CharField(max_length=30, choices=TYPE_CHOICES)
     doc_id          = models.CharField(max_length=50, unique=True)

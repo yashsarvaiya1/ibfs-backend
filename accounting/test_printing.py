@@ -32,6 +32,14 @@ class DocumentPrintTests(SimpleTestCase):
         self.assertFalse(context['has_adjustment'])
         self.assertTrue(context['line_items'][1]['is_discount'])
 
+    def test_income_uses_source_and_simple_amount_columns(self):
+        doc = Document(type='income', line_items=[{'name': 'Salary', 'amount': 200}], total_amount=200)
+        context = _build_document_context(doc, Settings())
+        self.assertEqual(context['party_label'], 'Income source')
+        self.assertTrue(context['is_simple_line_type'])
+        self.assertEqual(context['grand_total'], '200.00')
+        self.assertFalse(context['has_adjustment'])
+
     def test_indian_grouping(self):
         self.assertEqual(format_money('1234567.89'), '12,34,567.89')
 

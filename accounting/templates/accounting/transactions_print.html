@@ -139,11 +139,12 @@
       {% endif %}
 
       {% for txn in transactions %}
-      <tr {% if txn.is_expense %}class="row-expense"{% endif %}>
+      <tr {% if txn.is_expense or txn.is_income %}class="row-expense"{% endif %}>
         <td style="font-weight:600;color:#555">{{ txn.date }}</td>
         <td>
           <span class="badge badge-{{ txn.type_raw|lower }}">{{ txn.type }}</span>
           {% if txn.is_expense %}<span class="badge badge-expense">expense</span>{% endif %}
+          {% if txn.is_income %}<span class="badge badge-record">income</span>{% endif %}
           {% if txn.doc_id != "—" %}
             <span style="margin-left:4px;font-weight:bold;color:#1d4ed8">{{ txn.doc_type }} #{{ txn.doc_id }}</span>
           {% endif %}

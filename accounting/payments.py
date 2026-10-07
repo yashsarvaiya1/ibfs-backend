@@ -48,6 +48,9 @@ def replace_allocations(payment, entries):
     from rest_framework.exceptions import ValidationError
     from .models import Document
     from .services import _recalculate_mcd
+    from .workflows import CASH_ONLY_TYPES
+    if payment.document and payment.document.type in CASH_ONLY_TYPES:
+        raise ValidationError({'allocations': 'Income and expenses cannot settle party documents.'})
     documents = {doc.pk:doc for doc in Document.objects.filter(pk__in=[row['document'] for row in entries],
         is_active=True, type__in=FINANCIAL_SIGNS)}
     if len(documents) != len(entries):

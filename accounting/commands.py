@@ -120,6 +120,22 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
             # Legacy clients explicitly entering a currency discount select amount mode.
             attrs['discount_percentage'] = None
         kind = attrs.get('type', self.instance.type if self.instance else '')
+        if kind == 'income':
+            account = attrs.get('payment_account')
+            if (not self.instance and not account) or ('payment_account' in attrs and not account):
+                raise serializers.ValidationError({'payment_account': 'Choose the account that received this income.'})
+            if reference:
+                raise serializers.ValidationError({'reference': 'Income is a direct receipt, not a document settlement.'})
+            lines = attrs.get('line_items', self.instance.line_items if self.instance else [])
+            from .calculations import document_totals
+            amount = document_totals({'line_items': lines})['total'] if lines else attrs.get('total_amount', self.instance.total_amount if self.instance else None)
+            if amount is None or amount <= 0:
+                raise serializers.ValidationError({'total_amount': 'Enter a positive income amount.'})
+            for field in ('taxes', 'charges', 'discount', 'discount_percentage'):
+                if attrs.get(field, getattr(self.instance, field, None) if self.instance else None):
+                    raise serializers.ValidationError({field: 'Income records the cash received. Use an invoice for a taxable sale.'})
+            if any(line.get('taxes') or line.get('discount') or line.get('discount_percentage') for line in lines):
+                raise serializers.ValidationError({'line_items': 'Income lines contain a description and the amount received.'})
         values = {field: attrs.get(field, getattr(self.instance, field, None) if self.instance else None)
                   for field in ('line_items', 'charges', 'taxes', 'discount', 'discount_percentage', 'tax_mode', 'supply_category')}
         if values['tax_mode'] == 'item' and (kind not in ('bill', 'invoice', 'cn', 'dn', 'quotation', 'po', 'pi') or not values['line_items']):

@@ -3,6 +3,7 @@ from decimal import Decimal
 from django.db.models import Q, Sum, OuterRef, Subquery, Value, DecimalField
 from django.db.models.functions import Coalesce
 from .models import FinancialTransaction
+from .workflows import CASH_ONLY_TYPES
 
 
 def ledger_dates(params):
@@ -34,7 +35,7 @@ def with_running_account_balance(queryset, account):
 
 
 def cf_transactions():
-    return FinancialTransaction.objects.exclude(document__type='expense').exclude(type='contra')
+    return FinancialTransaction.objects.exclude(document__type__in=CASH_ONLY_TYPES).exclude(type='contra')
 
 
 def with_running_cf(queryset, opening_balance):

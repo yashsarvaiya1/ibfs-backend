@@ -23,7 +23,7 @@ from .services import (
 from shared.models import Contact, PaymentAccount, Settings
 from inventory.models import StockTransaction, Product
 from django.db import transaction
-from .workflows import OUTGOING_TYPES
+from .workflows import OUTGOING_TYPES, CASH_ONLY_TYPES
 from .commands import DocumentWriteSerializer, PaymentCommandSerializer, command_data
 from .document_updates import update_document
 
@@ -149,7 +149,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def record_payment(self, request, pk=None):
         doc     = self.get_object()
-        BLOCKED = {'challan', 'po', 'pi', 'quotation', 'interest', 'expense'}
+        BLOCKED = {'challan', 'po', 'pi', 'quotation', 'interest', *CASH_ONLY_TYPES}
         if doc.type in BLOCKED:
             return Response(
                 {'error': f'record_payment not allowed for {doc.type}.'},
@@ -369,7 +369,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         from rest_framework.exceptions import ValidationError
         from .payments import replace_allocations
         payment = self.get_object()
-        if payment.type != 'actual' or (payment.document and payment.document.type == 'expense'):
+        if payment.type != 'actual' or (payment.document and payment.document.type in CASH_ONLY_TYPES):
             raise ValidationError({'allocations':'Only ordinary payments can be allocated.'})
         entries = request.data.get('allocations', [])
         if not isinstance(entries, list) or any(not isinstance(row, dict) or not isinstance(row.get('document'), int) for row in entries):
@@ -443,11 +443,11 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
             tokens = [t.strip() for t in raw_types.split(',') if t.strip()]
             q = Q()
             for token in tokens:
-                if token == 'expense':
-                    q |= Q(type='actual', document__type='expense')
+                if token in CASH_ONLY_TYPES:
+                    q |= Q(type='actual', document__type=token)
                 elif token == 'actual':
                     # Settled = actual but NOT expense-linked
-                    q |= Q(type='actual') & ~Q(document__type='expense')
+                    q |= Q(type='actual') & ~Q(document__type__in=CASH_ONLY_TYPES)
                 else:
                     q |= Q(type=token)
             qs = qs.filter(q)
@@ -467,6 +467,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         if ftxn.document_id:
             Document.objects.select_for_update().get(pk=ftxn.document_id)
         ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
+        if ftxn.document and ftxn.document.type == 'income':
+            return Response({'error': 'Edit the income document to keep its receipt and details consistent.'}, status=400)
         if ftxn.type != 'actual':
             return Response(
                 {'error': 'Only actual transactions can be edited directly.'},
@@ -521,6 +523,8 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         if ftxn.document_id:
             Document.objects.select_for_update().get(pk=ftxn.document_id)
         ftxn = FinancialTransaction.objects.select_for_update().get(pk=ftxn.pk)
+        if ftxn.document and ftxn.document.type == 'income':
+            return Response({'error': 'Delete the income document to reverse or retain its receipt.'}, status=400)
         if ftxn.type == 'record':
             return Response(
                 {'error': 'Record transactions are managed via document deletion.'},
@@ -552,7 +556,7 @@ class FinancialTransactionViewSet(viewsets.ModelViewSet):
         from django.shortcuts import get_object_or_404
         from .payments import replace_allocations
         ftxn = self.get_object()
-        if ftxn.type != 'actual' or (ftxn.document and ftxn.document.type == 'expense'):
+        if ftxn.type != 'actual' or (ftxn.document and ftxn.document.type in CASH_ONLY_TYPES):
             raise ValidationError({'document':'Only ordinary payments can be linked to documents.'})
         doc_id = request.data.get('document')
         doc = get_object_or_404(Document, pk=doc_id, is_active=True, type__in=HAS_BALANCE_TYPES) if doc_id else None
