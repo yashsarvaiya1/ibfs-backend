@@ -8,7 +8,7 @@ from rest_framework.test import APIClient
 from shared.models import Contact, PaymentAccount, Settings
 from inventory.models import Product, StockTransaction
 from .models import Document, FinancialTransaction, PaymentAllocation
-from .services import process_document_create
+from .services import process_document_create, _create_ftxn
 from .payments import payment_status
 from .financial_year import financial_year_report
 from .reports import gst_report
@@ -49,15 +49,54 @@ class IncomeTests(TestCase):
         self.account.refresh_from_db(); self.assertEqual(self.account.current_balance, 1400)
 
     def test_optional_contact_and_income_filters(self):
-        self.create(contact=None)
+        without_contact = self.create(contact=None)
         with_contact = self.create()
-        response = self.client.get('/api/transactions/', {'types': 'income'})
-        self.assertEqual(response.data['count'], 2)
-        self.assertEqual(self.client.get('/api/transactions/', {'types': 'actual'}).data['count'], 0)
-        self.assertEqual(self.client.get('/api/documents/', {'type': 'income'}).data['count'], 2)
+        ordinary_contact = Contact.objects.create(contact_name='Customer', phone='789')
+        invoice = process_document_create('invoice', {'date': '2026-10-01', 'total_amount': 100}, ordinary_contact)
+        payment = _create_ftxn('actual', Decimal('25'), ordinary_contact, self.other, invoice, date(2026, 10, 2))
+        expense = self.create(type='expense', contact=None, payment_account=self.other.pk,
+                              line_items=[{'name': 'Office costs', 'amount': 10}])
+        income_ids = {without_contact.transactions.get().pk, with_contact.transactions.get().pk}
+        def result_ids(url, params):
+            response = self.client.get(url, params)
+            self.assertEqual(response.status_code, 200, response.data)
+            ids = {row['id'] for row in response.data['results']}
+            self.assertEqual(response.data['count'], len(ids))
+            return ids
+        self.assertEqual(result_ids('/api/transactions/', {'types': 'income'}), income_ids)
+        self.assertEqual(result_ids('/api/transactions/', {'types': 'actual'}), {payment.pk})
+        self.assertEqual(result_ids('/api/transactions/', {'types': 'income,actual'}), income_ids | {payment.pk})
+        self.assertEqual(result_ids('/api/transactions/', {'types': 'expense'}), {expense.transactions.get().pk})
+        self.assertEqual(result_ids('/api/documents/', {'type': 'income'}), {without_contact.pk, with_contact.pk})
+        self.assertEqual(result_ids('/api/documents/', {'type': 'invoice'}), {invoice.pk})
         self.assertEqual(self.client.get(f'/api/contacts/{self.contact.pk}/ledger/').data['results'][0]['running_cf'], '-100.00')
         self.assertEqual(self.client.get(f'/api/accounts/{self.account.pk}/transactions/', {'view': 'ledger'}).data['results'][-1]['running_balance'], '1400.00')
         self.assertEqual(with_contact.contact_id, self.contact.pk)
+
+    def test_existing_payment_cannot_be_relinked_to_income_by_put_or_patch(self):
+        income = self.create()
+        invoice = process_document_create('invoice', {'date': '2026-10-01', 'total_amount': 100}, self.contact)
+        payment = _create_ftxn('actual', Decimal('25'), self.contact, self.account, invoice, date(2026, 10, 2))
+        allocation = payment.allocations.get()
+        for method in (self.client.patch, self.client.put):
+            response = method(f'/api/transactions/{payment.pk}/', {
+                'document': income.pk, 'amount': 999, 'date': '2026-11-01',
+                'payment_account': self.other.pk, 'notes': 'Should not be saved',
+            }, format='json')
+            self.assertEqual(response.status_code, 400, response.data)
+            self.assertIn('document', response.data)
+            payment.refresh_from_db(); allocation.refresh_from_db()
+            self.assertEqual((payment.document_id, payment.amount, payment.payment_account_id, payment.date),
+                             (invoice.pk, Decimal('25'), self.account.pk, date(2026, 10, 2)))
+            self.assertEqual(allocation.amount, Decimal('25'))
+            self.assertEqual(income.transactions.count(), 1)
+            self.account.refresh_from_db(); self.other.refresh_from_db()
+            self.assertEqual((self.account.current_balance, self.other.current_balance), (1225, 50))
+        response = self.client.delete(f'/api/documents/{income.pk}/', {'strategy': 'revert'}, format='json')
+        self.assertEqual(response.status_code, 204)
+        self.assertTrue(FinancialTransaction.objects.filter(pk=payment.pk).exists())
+        self.assertTrue(PaymentAllocation.objects.filter(pk=allocation.pk).exists())
+        self.account.refresh_from_db(); self.assertEqual(self.account.current_balance, 1025)
 
     def test_edits_move_receipt_between_accounts_and_contacts_without_duplicate_posting(self):
         doc = self.create()
