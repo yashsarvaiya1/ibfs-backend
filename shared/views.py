@@ -182,11 +182,15 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
     ordering         = ['name']
 
     def get_queryset(self):
-        qs        = PaymentAccount.objects.all()
+        qs        = PaymentAccount.objects.annotate(transaction_total=Sum('transactions__amount'))
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
             qs = qs.filter(is_active=is_active.lower() == 'true')
         return qs
+
+    def perform_create(self, serializer):
+        opening = serializer.validated_data.pop('opening_balance', None)
+        serializer.save(**({'current_balance': opening} if opening is not None else {}))
 
     def perform_update(self, serializer):
         from django.db import transaction
@@ -194,7 +198,12 @@ class PaymentAccountViewSet(viewsets.ModelViewSet):
         from django.utils import timezone
         with transaction.atomic():
             serializer.instance = PaymentAccount.objects.select_for_update().get(pk=serializer.instance.pk)
+            opening = serializer.validated_data.pop('opening_balance', None)
             target = serializer.validated_data.pop('current_balance', None)
+            if opening is not None:
+                from accounting.ledger import account_opening_balance
+                delta = opening - account_opening_balance(serializer.instance)
+                serializer.instance.current_balance += delta
             account = serializer.save()
             if target is not None and target != account.current_balance:
                 _create_ftxn('actual', target-account.current_balance, None, account, None,

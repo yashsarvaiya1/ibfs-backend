@@ -84,7 +84,23 @@ class ContactSerializer(serializers.ModelSerializer):
 
 
 
+class AccountOpeningBalanceField(serializers.DecimalField):
+    def get_attribute(self, instance):
+        from accounting.ledger import account_opening_balance
+        if hasattr(instance, 'transaction_total'):
+            from decimal import Decimal
+            return instance.current_balance - (instance.transaction_total or Decimal('0'))
+        return account_opening_balance(instance)
+
+
 class PaymentAccountSerializer(serializers.ModelSerializer):
+    opening_balance = AccountOpeningBalanceField(max_digits=15, decimal_places=2, required=False)
+
+    def validate(self, attrs):
+        if 'opening_balance' in attrs and 'current_balance' in attrs:
+            raise serializers.ValidationError('Change the opening balance or reconcile the current balance separately.')
+        return attrs
+
     class Meta:
         model  = PaymentAccount
         fields = '__all__'
