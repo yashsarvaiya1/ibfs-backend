@@ -33,7 +33,7 @@ class FinancialTransactionSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         document = attrs.get('document', self.instance.document if self.instance else None)
         contact = attrs.get('contact', self.instance.contact if self.instance else None)
-        if not self.instance and document and document.type == 'income':
+        if document and document.type == 'income':
             raise serializers.ValidationError({'document': 'Income already has its cash receipt. Edit the income document instead.'})
         if document and contact and document.contact_id != contact.pk:
             raise serializers.ValidationError({'document': 'Choose a document belonging to this contact.'})
