@@ -135,9 +135,9 @@ def update_document(document, payload, preserve_total=False):
             records[0].save()
             from .payments import sync_interest_allocation
             sync_interest_allocation(document,new_net)
-    elif document.type in {'expense','cash_payment_voucher','cash_receipt_voucher'}:
+    elif document.type in {'expense','income','cash_payment_voucher','cash_receipt_voucher'}:
         actuals = list(document.transactions.filter(type='actual').order_by('pk'))
-        expected_amount = (1 if document.type == 'cash_receipt_voucher' else -1) * decimal_value(document.total_amount)
+        expected_amount = (1 if document.type in {'income', 'cash_receipt_voucher'} else -1) * decimal_value(document.total_amount)
         if actuals:
             txn = actuals[0]
             other_amount = sum((t.amount for t in actuals[1:]), Decimal('0'))

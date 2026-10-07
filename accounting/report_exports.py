@@ -127,7 +127,7 @@ def report_pdf(start, end, *, kind='gst', review_only=False):
 def allocation_review(start, end, page, size):
     # Expenses/contra transfers have no bill/invoice settlement purpose.
     payments = (FinancialTransaction.objects.filter(type='actual', date__range=(start, end))
-                .exclude(document__type='expense').select_related('document', 'contact', 'payment_account')
+                .exclude(document__type__in=('expense', 'income')).select_related('document', 'contact', 'payment_account')
                 .prefetch_related('allocations__document').order_by('date', 'pk'))
     rows, count = [], 0
     for payment in payments.iterator(chunk_size=500):

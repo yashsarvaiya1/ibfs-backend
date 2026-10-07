@@ -14,7 +14,7 @@ from django.core.cache import cache
 from django.conf import settings as django_settings
 from .calculations import document_totals
 from .printing import document_context, media_data_url
-from .workflows import FINANCIAL_SIGNS, STOCK_SIGNS, NON_POSTING_TYPES, stock_mode
+from .workflows import FINANCIAL_SIGNS, STOCK_SIGNS, NON_POSTING_TYPES, CASH_ONLY_TYPES, stock_mode
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -80,8 +80,8 @@ def compute_opening_balance_for_print(contact, date_from=None) -> Decimal:
     if date_from is None:
         return base
 
-    delta = FinancialTransaction.objects.filter(contact=contact, date__lt=date_from).exclude(
-        document__type='expense').exclude(type='contra').aggregate(total=Sum('amount'))['total'] or Decimal('0')
+    from .ledger import cf_transactions
+    delta = cf_transactions().filter(contact=contact, date__lt=date_from).aggregate(total=Sum('amount'))['total'] or Decimal('0')
     return base + delta
 
 
@@ -111,8 +111,9 @@ def generate_transactions_pdf(
     for txn in transactions:
         # Mirror frontend ContactLedger logic exactly
         is_expense = txn.document is not None and txn.document.type == 'expense'
+        is_income = txn.document is not None and txn.document.type == 'income'
         is_contra  = txn.type == 'contra'
-        affects_cf = bool(account) or (not is_expense and not is_contra)
+        affects_cf = bool(account) or (not is_expense and not is_income and not is_contra)
 
         row = {
             'date':       txn.date,
@@ -126,6 +127,7 @@ def generate_transactions_pdf(
             'amount_pos': txn.amount >= 0,
             'account':    txn.payment_account.name if txn.payment_account else '—',
             'is_expense': is_expense,
+            'is_income': is_income,
             'is_contra':  is_contra,
             'debit':      affects_cf and (txn.amount > 0 if account else txn.amount < 0),
             'credit':     affects_cf and (txn.amount < 0 if account else txn.amount > 0),
@@ -282,6 +284,7 @@ def _next_doc_id(doc_type):
         'cash_receipt_voucher':'CRV',
         'interest':            'INT',
         'expense':             'EXP',
+        'income':              'INC',
     }
     prefix = prefix_map.get(doc_type, 'DOC')
 
@@ -330,8 +333,8 @@ def _recalculate_mcd(contact, date):
 
     running = Decimal('0')
     for t in txns:
-        is_expense = t.document is not None and t.document.type == 'expense'
-        if is_expense:
+        cash_only = t.document is not None and t.document.type in CASH_ONLY_TYPES
+        if cash_only or t.type == 'contra':
             if t.monthly_cumulative_delta != Decimal('0'):
                 t.monthly_cumulative_delta = Decimal('0')
                 t.save(update_fields=['monthly_cumulative_delta'])
@@ -500,14 +503,14 @@ def process_document_create(doc_type, data, contact=None):
             _handle_stxns(doc, line_items, CHALLAN_STXN_SIGN[ref.type], app_settings, date)
         return doc
 
-    if doc_type == 'expense':
+    if doc_type in CASH_ONLY_TYPES:
         account_id = data.get('payment_account')
         account    = PaymentAccount.objects.get(pk=account_id) if account_id else None
         if total_amount:
             _create_ftxn(
-                'actual', -Decimal(str(total_amount)),
+                'actual', (1 if doc_type == 'income' else -1) * Decimal(str(total_amount)),
                 contact, account, doc, date,
-                force_mcd_zero=True,
+                force_mcd_zero=True, auto_allocate=False,
             )
         return doc
 
@@ -542,6 +545,8 @@ def process_send_receive(contact, data, direction):
     data = command_data(serializer)
     if data.get('document'):
         linked = Document.objects.get(pk=data['document'])
+        if linked.type in CASH_ONLY_TYPES:
+            raise ValidationError({'document': 'Income and expenses do not need settlement. Edit the document to correct its cash entry.'})
         if linked.contact_id and (not contact or linked.contact_id != contact.pk):
             raise ValidationError({'document':'Choose a document belonging to this contact.'})
     app_settings   = Settings.get()
@@ -764,7 +769,7 @@ def process_document_delete(document, strategy):
     if strategy == 'revert':
         # BF-07: Recalculate MCD for record txn months after their deletion
         for contact, date in record_contact_dates:
-            if document.type != 'expense' and contact:
+            if document.type not in CASH_ONLY_TYPES and contact:
                 _recalculate_mcd(contact, date)
 
         for ftxn in actual_ftxns:
@@ -776,7 +781,7 @@ def process_document_delete(document, strategy):
                 ftxn.document.is_active = False
                 ftxn.document.save(update_fields=['is_active','updated_at'])
             ftxn.delete()
-            if document.type != 'expense':
+            if document.type not in CASH_ONLY_TYPES:
                 _recalculate_mcd(contact, date)
 
         for stxn in actual_stxns:
@@ -786,7 +791,7 @@ def process_document_delete(document, strategy):
     elif strategy == 'manual':
         # Actual f.txns stay intact — only recalculate for record txn months
         for contact, date in record_contact_dates:
-            if document.type != 'expense' and contact:
+            if document.type not in CASH_ONLY_TYPES and contact:
                 _recalculate_mcd(contact, date)
 
     document.payment_allocations.all().delete()

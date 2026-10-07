@@ -68,7 +68,7 @@ Global history prints product names and each product's unit without a combined b
 
 ## Separate financial-year business report
 
-`GET /api/reports/financial_year/?fy=2026` summarizes 1 April 2026 through 31 March 2027. It shows invoices less credit notes, bills less debit notes, expense documents, document counts and all twelve monthly activity rows. Document totals include tax; calculable pre-tax figures are shown separately and amount-only or inconsistent documents are listed for review. Actual account receipts/payments follow cash movement dates and exclude internal transfers, record-only entries, quotations, orders and challans. This is a business activity summary, not a profit/COGS calculation or a GST return. PDF/CSV exports use `/api/reports/financial_year_export/` with the same `fy` and `export_format=pdf|csv`.
+`GET /api/reports/financial_year/?fy=2026` summarizes 1 April 2026 through 31 March 2027. It shows invoices less credit notes, bills less debit notes, expense documents, separately recorded Other income, document counts and all twelve monthly activity rows. Document totals include tax; calculable pre-tax figures are shown separately and amount-only or inconsistent documents are listed for review. Actual account receipts/payments follow cash movement dates and exclude internal transfers, record-only entries, quotations, orders and challans. This is a business activity summary, not a profit/COGS calculation or a GST return. PDF/CSV exports use `/api/reports/financial_year_export/` with the same `fy` and `export_format=pdf|csv`.
 
 The separate GST screen defaults to a month and continues to support any date range (including a full FY). It accumulates recorded sales/purchase GST after credit/debit notes, with reverse charge, unclassified tax and review exclusions separately visible. Purchase tax is not automatically eligible ITC and book GST difference is not tax payable.
 
@@ -94,11 +94,17 @@ IBFS keeps its existing signed balances. A negative contact balance is receivabl
 | Interest/charge we pay | Credit | No cash entry |
 | Waiver while receiving | Credit | No cash entry |
 | Waiver while paying | Debit | No cash entry |
+| Income receipt | No contact debit/credit or balance change | Debit |
 | Expense payment | No contact debit/credit or balance change | Credit |
 | Account transfer | No contact debit/credit or balance change | Debit in destination, credit in source |
 
 A receipt of 80 plus a waiver of 20 settles an invoice of 100, while cash increases only by 80. A payment of 80 plus a waiver of 20 settles a bill of 100, while cash decreases only by 80. A charge of 20 with a payment/receipt of 100 allocates 80 to the original document and 20 to the charge. Waivers retain the existing `discount` API value for compatibility; document item discounts still use their existing tax-base calculations.
 
-Date ranges are inclusive and invalid ranges return validation errors. Opening and running balances use preceding transactions, including hidden rows and previous pages. Contact reports exclude expenses and transfers from the contact balance; account reports include both in the cash balance. Contact ledger prints include obligations even when automation is enabled. Prints query all matching entries rather than a loaded UI page. An empty period can still show its opening/closing balance.
+Date ranges are inclusive and invalid ranges return validation errors. Opening and running balances use preceding transactions, including hidden rows and previous pages. Contact reports exclude income, expenses and transfers from the contact balance; account reports include both in the cash balance. Contact ledger prints include obligations even when automation is enabled. Prints query all matching entries rather than a loaded UI page. An empty period can still show its opening/closing balance.
 
 Editing a contact opening balance changes the starting balance only. Editing a financial document recalculates its obligation and settlement status; real cash payments remain intact. Expected stock is recalculated; automatic stock corrections update quantity and follow the corrected document date. Manual deliveries retain their actual quantities and dates. When challans own inventory, bills/invoices retain that responsibility split. Quotation/order edits remain non-posting.
+
+
+Income documents record cash receipts that are not sale invoices. They appear in CA document bundles and FY Other income, and their cash entry appears once in Cash received. They do not enter sales GST/HSN or settlement/allocation review. Optional contacts identify the receipt source without changing party balances; account ledgers show money in on the debit side. Income is edited/deleted through the document so the cash entry stays consistent.
+
+Account opening-balance edits recalculate current and historical ledger standings without inserting an adjustment transaction. Existing payments, transfers and allocations remain intact. Reconcile balance and Adjust remain separate controls for recording an actual correction, interest or charge.

@@ -47,8 +47,17 @@ Keep the existing frontend Compose project and private `.env`, including its Pos
 
 Actual production migration, credential rotation, backups and deployment were skipped at the user's request. No GST filing, third-party validation, IRN generation or bank-feed integration is included.
 
-Detailed documents support amount or percentage discounts before GST, using the backend preview for displayed totals. Saved percentage discounts recalculate on item edits; the currency deduction is retained for existing posting/report logic. FY business activity and GST date-range reports are separate, each with PDF/CSV exports. See `docs/REPORTS.md` for their calculation basis. Startup applies the additive `0012_document_discount_percentage` migration automatically.
+Detailed documents support amount or percentage discounts before GST, using the backend preview for displayed totals. Saved percentage discounts recalculate on item edits; the currency deduction is retained for existing posting/report logic. FY business activity and GST date-range reports are separate, each with PDF/CSV exports. See `docs/REPORTS.md` for their calculation basis. Startup applies the additive `0012_document_discount_percentage` and `0013_income_document_type` migrations automatically.
 
 `POST /api/documents/preview_totals/` accepts unfinished item descriptions for live form calculations. It uses the same numeric, tax and discount validation as document writes and does not create documents. Description requirements remain enforced for actual document saves.
 
 Contact opening-balance edits feed the live ledger balance without rewriting transactions or moving cash. Contact/account PDF ledgers use authoritative running balances and the correct debit/credit side for each entity. Account transaction responses include `running_balance`; `view=ledger` returns chronological rows. Document date corrections also update automatic stock dates; manually recorded delivery dates remain intact. See [ledger signs and document edits](docs/REPORTS.md#ledgers-and-document-edits).
+
+
+## Income and opening balances
+
+Income is a direct receipt for salary, bonuses or other non-sale income. Choose the receiving account and enter descriptions/amounts; the contact is an optional source. It creates one actual cash entry regardless of transaction automation, with no contact debt, allocation, stock movement or GST posting. Edit or delete the income document to correct/reverse the cash entry, or retain cash with the existing keep-transactions deletion option. Use invoices for taxable sales. FY reports list these receipts separately as Other income; the cash received measure includes them once. Investment amounts are entered by the user, not calculated gains or tax advice.
+
+Accounts expose a writable `opening_balance` calculated from current balance less recorded movements. Editing it rebases the account and historical running balances without adding a cash transaction. Reconcile balance and Adjust still record real adjustments. Contacts retain the existing signed opening balance (negative receivable, positive payable). Opening changes do not rewrite invoice allocations or cash settlements.
+
+The frontend includes Income in Quick Actions, Settings and Light/Dark/System in the header (including mobile), compact document forms with optional notes/attachments and sticky save controls, and animated session/request/action feedback. No Compose port or environment changes are required for this release.

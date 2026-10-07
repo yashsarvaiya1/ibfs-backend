@@ -12,7 +12,8 @@ FINANCIAL_SIGNS = {
 }
 STOCK_SIGNS = dict(FINANCIAL_SIGNS)
 NON_POSTING_TYPES = {'po', 'pi', 'quotation'}
-SIMPLE_LINE_TYPES = {'interest', 'expense', 'cash_payment_voucher', 'cash_receipt_voucher'}
+CASH_ONLY_TYPES = {'expense', 'income'}
+SIMPLE_LINE_TYPES = {'interest', *CASH_ONLY_TYPES, 'cash_payment_voucher', 'cash_receipt_voucher'}
 OUTGOING_TYPES = {'bill', 'cn', 'cash_payment_voucher'}
 
 
